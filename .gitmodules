@@ -1,0 +1,9 @@
+[submodule "lib/immutable/openzeppelin-contracts"]
+	path = lib/immutable/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts.git
+[submodule "lib/mutable/yield-claim-nft"]
+	path = lib/mutable/yield-claim-nft
+	url = https://github.com/Behodler/yield-claim-nft.git
+[submodule "lib/mutable/pauser"]
+	path = lib/mutable/pauser
+	url = https://github.com/Behodler/pauser.git
