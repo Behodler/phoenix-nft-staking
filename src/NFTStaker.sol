@@ -192,38 +192,74 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         emit Pulled(inflow, rewardBudget, rewardRate, windowEnd);
     }
 
-    /// @dev Stub for the accrual settle step. Wired up properly in Phase 3.
+    /// @dev Settles per-share accrual from `lastRewardTime` up to `min(now, windowEnd)`
+    ///      under the current `rewardRate`. Decrements `rewardBudget` by the
+    ///      amount accrued and clamps to `rewardBudget` to guarantee clean depletion.
     function _updatePool() internal {
         if (block.timestamp <= lastRewardTime) return;
         if (totalStaked == 0) {
             lastRewardTime = uint64(block.timestamp);
             return;
         }
-        // Phase 3 fills in the accrual maths.
+        uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
+        uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
+        uint256 reward = elapsed * rewardRate;
+        if (reward > rewardBudget) reward = rewardBudget;
+        if (reward > 0) {
+            rewardBudget -= reward;
+            accRewardPerShare += (reward * ACC_PRECISION) / totalStaked;
+        }
+        lastRewardTime = uint64(block.timestamp);
     }
 
     // ---------------------------------------------------------------------
-    // User entrypoints (stubbed)
+    // User entrypoints
     // ---------------------------------------------------------------------
 
-    function stake(
-        uint256 /*amount*/
-    )
-        external
-    {
-        revert("not impl");
+    function stake(uint256 amount) external {
+        require(amount > 0, "NFTStaker: zero stake");
+        _updatePool();
+        UserInfo storage user = users[msg.sender];
+        if (user.amount > 0) {
+            uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+            if (pending > 0) {
+                rewardToken.safeTransfer(msg.sender, pending);
+                emit Claimed(msg.sender, pending);
+            }
+        }
+        stakedToken.safeTransferFrom(msg.sender, address(this), stakedId, amount, "");
+        user.amount += amount;
+        totalStaked += amount;
+        user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
+        emit Staked(msg.sender, amount);
     }
 
-    function unstake(
-        uint256 /*amount*/
-    )
-        external
-    {
-        revert("not impl");
+    function unstake(uint256 amount) external {
+        require(amount > 0, "NFTStaker: zero unstake");
+        UserInfo storage user = users[msg.sender];
+        require(user.amount >= amount, "NFTStaker: insufficient stake");
+        _updatePool();
+        uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+        if (pending > 0) {
+            rewardToken.safeTransfer(msg.sender, pending);
+            emit Claimed(msg.sender, pending);
+        }
+        user.amount -= amount;
+        totalStaked -= amount;
+        user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
+        stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
+        emit Unstaked(msg.sender, amount);
     }
 
     function claim() external {
-        revert("not impl");
+        _updatePool();
+        UserInfo storage user = users[msg.sender];
+        uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+        if (pending > 0) {
+            rewardToken.safeTransfer(msg.sender, pending);
+            user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
+            emit Claimed(msg.sender, pending);
+        }
     }
 
     function emergencyWithdraw() external {
@@ -231,20 +267,24 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     // ---------------------------------------------------------------------
-    // Views (stubbed)
+    // Views
     // ---------------------------------------------------------------------
 
-    function pendingReward(
-        address /*user*/
-    )
-        external
-        view
-        returns (uint256)
-    {
-        revert("not impl");
+    function pendingReward(address account) external view returns (uint256) {
+        UserInfo memory user = users[account];
+        uint256 acc = accRewardPerShare;
+        if (block.timestamp > lastRewardTime && totalStaked > 0) {
+            uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
+            uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
+            uint256 reward = elapsed * rewardRate;
+            if (reward > rewardBudget) reward = rewardBudget;
+            acc += (reward * ACC_PRECISION) / totalStaked;
+        }
+        return (user.amount * acc) / ACC_PRECISION - user.rewardDebt;
     }
 
     function currentRewardRate() external view returns (uint256) {
-        revert("not impl");
+        if (block.timestamp >= windowEnd) return 0;
+        return rewardRate;
     }
 }
