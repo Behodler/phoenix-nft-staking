@@ -3,13 +3,21 @@ pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {
+    ReentrancyGuard
+} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {
+    SafeERC20
+} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
-import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import {
+    ERC1155Holder
+} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {IPausable} from "pauser/interfaces/IPausable.sol";
-import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
+import {
+    IBalancerPoolerMintDebtHook
+} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
 
 /// @title  NFTStaker
 /// @notice Masterchef-style staking pool for a single ERC1155 token ID.
@@ -18,7 +26,13 @@ import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/V2/interfaces/IBalanc
 ///         by `pull()`-ing accrued mint debt from the configured dispatcher
 ///         hook plus owner top-ups. See `docs/design.md` (in the
 ///         product-owner repo) for the full design rationale.
-contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausable {
+contract NFTStaker is
+    Ownable,
+    Pausable,
+    ReentrancyGuard,
+    ERC1155Holder,
+    IPausable
+{
     using SafeERC20 for IERC20;
 
     // ---------------------------------------------------------------------
@@ -64,7 +78,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     // Accrual state
     // ---------------------------------------------------------------------
 
-    uint64 public lastRewardTime;
+    uint256 public lastRewardTime;
     uint256 public totalStaked;
     uint256 public accRewardPerShare;
 
@@ -83,12 +97,25 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     event Unstaked(address indexed user, uint256 amount);
     event Claimed(address indexed user, uint256 amount);
     event EmergencyWithdrawn(address indexed user, uint256 amount);
-    event Pulled(uint256 inflow, uint256 newBudget, uint256 newRate, uint256 newWindowEnd);
-    event ToppedUp(address indexed from, uint256 amount, uint256 newBudget, uint256 newRate);
+    event Pulled(
+        uint256 inflow,
+        uint256 newBudget,
+        uint256 newRate,
+        uint256 newWindowEnd
+    );
+    event ToppedUp(
+        address indexed from,
+        uint256 amount,
+        uint256 newBudget,
+        uint256 newRate
+    );
     event WindowDurationChanged(uint256 previous, uint256 next);
     event DispatcherHookChanged(address indexed previous, address indexed next);
     event StakedIdChanged(uint256 previous, uint256 next);
-    event PauserChanged(address indexed previousPauser, address indexed newPauser);
+    event PauserChanged(
+        address indexed previousPauser,
+        address indexed newPauser
+    );
 
     // ---------------------------------------------------------------------
     // Modifiers
@@ -99,15 +126,20 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         _;
     }
 
-    // ---------------------------------------------------------------------
-    // Constructor
-    // ---------------------------------------------------------------------
-
-    constructor(IERC1155 _stakedToken, uint256 _stakedId, IERC20 _rewardToken, address _initialOwner)
-        Ownable(_initialOwner)
-    {
-        require(address(_stakedToken) != address(0), "NFTStaker: zero staked token");
-        require(address(_rewardToken) != address(0), "NFTStaker: zero reward token");
+    constructor(
+        IERC1155 _stakedToken,
+        uint256 _stakedId,
+        IERC20 _rewardToken,
+        address _initialOwner
+    ) Ownable(_initialOwner) {
+        require(
+            address(_stakedToken) != address(0),
+            "NFTStaker: zero staked token"
+        );
+        require(
+            address(_rewardToken) != address(0),
+            "NFTStaker: zero reward token"
+        );
         stakedToken = _stakedToken;
         stakedId = _stakedId;
         rewardToken = _rewardToken;
@@ -135,7 +167,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     // Owner setters (stubbed)
     // ---------------------------------------------------------------------
 
-    function setDispatcherHook(IBalancerPoolerMintDebtHook newHook) external onlyOwner {
+    function setDispatcherHook(
+        IBalancerPoolerMintDebtHook newHook
+    ) external onlyOwner {
         emit DispatcherHookChanged(address(dispatcherHook), address(newHook));
         dispatcherHook = newHook;
     }
@@ -147,7 +181,10 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     function setWindowDuration(uint256 newDuration) external onlyOwner {
-        require(newDuration >= MIN_WINDOW && newDuration <= MAX_WINDOW, "NFTStaker: window out of bounds");
+        require(
+            newDuration >= MIN_WINDOW && newDuration <= MAX_WINDOW,
+            "NFTStaker: window out of bounds"
+        );
         // Settle accrual under the OLD rate before mutating the schedule.
         _updatePool();
         emit WindowDurationChanged(windowDuration, newDuration);
@@ -198,7 +235,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     function _updatePool() internal {
         if (block.timestamp <= lastRewardTime) return;
         if (totalStaked == 0) {
-            lastRewardTime = uint64(block.timestamp);
+            lastRewardTime = block.timestamp;
             return;
         }
         uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
@@ -209,7 +246,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
             rewardBudget -= reward;
             accRewardPerShare += (reward * ACC_PRECISION) / totalStaked;
         }
-        lastRewardTime = uint64(block.timestamp);
+        lastRewardTime = block.timestamp;
     }
 
     // ---------------------------------------------------------------------
@@ -221,13 +258,21 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         _syncBudget();
         UserInfo storage user = users[msg.sender];
         if (user.amount > 0) {
-            uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+            uint256 pending = (user.amount * accRewardPerShare) /
+                ACC_PRECISION -
+                user.rewardDebt;
             if (pending > 0) {
                 pending = _safePay(pending);
                 if (pending > 0) emit Claimed(msg.sender, pending);
             }
         }
-        stakedToken.safeTransferFrom(msg.sender, address(this), stakedId, amount, "");
+        stakedToken.safeTransferFrom(
+            msg.sender,
+            address(this),
+            stakedId,
+            amount,
+            ""
+        );
         user.amount += amount;
         totalStaked += amount;
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
@@ -239,7 +284,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         UserInfo storage user = users[msg.sender];
         require(user.amount >= amount, "NFTStaker: insufficient stake");
         _syncBudget();
-        uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+        uint256 pending = (user.amount * accRewardPerShare) /
+            ACC_PRECISION -
+            user.rewardDebt;
         if (pending > 0) {
             pending = _safePay(pending);
             if (pending > 0) emit Claimed(msg.sender, pending);
@@ -247,14 +294,22 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         user.amount -= amount;
         totalStaked -= amount;
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
-        stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
+        stakedToken.safeTransferFrom(
+            address(this),
+            msg.sender,
+            stakedId,
+            amount,
+            ""
+        );
         emit Unstaked(msg.sender, amount);
     }
 
     function claim() external nonReentrant whenNotPaused {
         _syncBudget();
         UserInfo storage user = users[msg.sender];
-        uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+        uint256 pending = (user.amount * accRewardPerShare) /
+            ACC_PRECISION -
+            user.rewardDebt;
         if (pending > 0) {
             uint256 paid = _safePay(pending);
             user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
@@ -288,7 +343,13 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         user.amount = 0;
         user.rewardDebt = 0;
         totalStaked -= amount;
-        stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
+        stakedToken.safeTransferFrom(
+            address(this),
+            msg.sender,
+            stakedId,
+            amount,
+            ""
+        );
         emit EmergencyWithdrawn(msg.sender, amount);
     }
 
@@ -300,7 +361,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         UserInfo memory user = users[account];
         uint256 acc = accRewardPerShare;
         if (block.timestamp > lastRewardTime && totalStaked > 0) {
-            uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
+            uint256 end = block.timestamp < windowEnd
+                ? block.timestamp
+                : windowEnd;
             uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
             uint256 reward = elapsed * rewardRate;
             if (reward > rewardBudget) reward = rewardBudget;
@@ -312,5 +375,45 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     function currentRewardRate() external view returns (uint256) {
         if (block.timestamp >= windowEnd) return 0;
         return rewardRate;
+    }
+
+    /// @notice Tokens currently owed to stakers: accrued rewards not yet
+    ///         claimed, including in-flight accrual since `lastRewardTime`.
+    ///         Derived from the invariant
+    ///         `balance == rewardBudget + totalDebt` (plus bounded
+    ///         floor-division dust in protocol's favor).
+    function totalDebt() external view returns (uint256) {
+        uint256 budget = rewardBudget;
+        if (block.timestamp > lastRewardTime && totalStaked > 0) {
+            uint256 end = block.timestamp < windowEnd
+                ? block.timestamp
+                : windowEnd;
+            uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
+            uint256 reward = elapsed * rewardRate;
+            if (reward > budget) reward = budget;
+            budget -= reward;
+        }
+        uint256 balance = rewardToken.balanceOf(address(this));
+        return balance > budget ? balance - budget : 0;
+    }
+
+    /// @notice All phUSD the pool controls: held balance plus phUSD still
+    ///         claimable from the dispatcher hook via `pull()`.
+    function totalBudget() external view returns (uint256) {
+        uint256 pending = address(dispatcherHook) == address(0)
+            ? 0
+            : dispatcherHook.mintDebt();
+        return rewardToken.balanceOf(address(this)) + pending;
+    }
+
+    /// @notice Seconds of emissions remaining at the current `rewardRate`,
+    ///         counting both on-contract budget and pending hook mint debt.
+    ///         Returns 0 when the rate is zero.
+    function runwaySeconds() external view returns (uint256) {
+        if (rewardRate == 0) return 0;
+        uint256 pending = address(dispatcherHook) == address(0)
+            ? 0
+            : dispatcherHook.mintDebt();
+        return (rewardBudget + pending) / rewardRate;
     }
 }

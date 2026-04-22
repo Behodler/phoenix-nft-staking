@@ -1,6 +1,8 @@
 @openzeppelin/contracts/=lib/immutable/openzeppelin-contracts/contracts/
 yield-claim-nft/=lib/mutable/yield-claim-nft/src/
 pauser/=lib/mutable/pauser/src/
-forge-std/=lib/mutable/pauser/lib/forge-std/src/
+erc4626-tests/=lib/immutable/openzeppelin-contracts/lib/erc4626-tests/
+forge-std/=lib/mutable/yield-claim-nft/lib/forge-std/src/
+halmos-cheatcodes/=lib/immutable/openzeppelin-contracts/lib/halmos-cheatcodes/src/
 immutable/=lib/immutable/
 mutable/=lib/mutable/
