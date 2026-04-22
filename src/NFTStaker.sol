@@ -218,7 +218,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
 
     function stake(uint256 amount) external {
         require(amount > 0, "NFTStaker: zero stake");
-        _updatePool();
+        _syncBudget();
         UserInfo storage user = users[msg.sender];
         if (user.amount > 0) {
             uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
@@ -238,7 +238,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         require(amount > 0, "NFTStaker: zero unstake");
         UserInfo storage user = users[msg.sender];
         require(user.amount >= amount, "NFTStaker: insufficient stake");
-        _updatePool();
+        _syncBudget();
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
             rewardToken.safeTransfer(msg.sender, pending);
@@ -252,7 +252,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     function claim() external {
-        _updatePool();
+        _syncBudget();
         UserInfo storage user = users[msg.sender];
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
