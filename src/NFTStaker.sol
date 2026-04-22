@@ -135,44 +135,71 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     // Owner setters (stubbed)
     // ---------------------------------------------------------------------
 
-    function setDispatcherHook(
-        IBalancerPoolerMintDebtHook /*newHook*/
-    )
-        external
-        onlyOwner
-    {
-        revert("not impl");
+    function setDispatcherHook(IBalancerPoolerMintDebtHook newHook) external onlyOwner {
+        emit DispatcherHookChanged(address(dispatcherHook), address(newHook));
+        dispatcherHook = newHook;
     }
 
-    function setStakedId(
-        uint256 /*newId*/
-    )
-        external
-        onlyOwner
-    {
-        revert("not impl");
+    function setStakedId(uint256 newId) external onlyOwner {
+        require(totalStaked == 0, "NFTStaker: stake outstanding");
+        emit StakedIdChanged(stakedId, newId);
+        stakedId = newId;
     }
 
-    function setWindowDuration(
-        uint256 /*newDuration*/
-    )
-        external
-        onlyOwner
-    {
-        revert("not impl");
+    function setWindowDuration(uint256 newDuration) external onlyOwner {
+        require(newDuration >= MIN_WINDOW && newDuration <= MAX_WINDOW, "NFTStaker: window out of bounds");
+        // Settle accrual under the OLD rate before mutating the schedule.
+        _updatePool();
+        emit WindowDurationChanged(windowDuration, newDuration);
+        windowDuration = newDuration;
+        // Reset the active window/rate against the existing budget.
+        windowEnd = block.timestamp + newDuration;
+        rewardRate = newDuration == 0 ? 0 : rewardBudget / newDuration;
     }
 
-    function topUp(
-        uint256 /*amount*/
-    )
-        external
-        onlyOwner
-    {
-        revert("not impl");
+    function topUp(uint256 amount) external onlyOwner {
+        require(amount > 0, "NFTStaker: zero topUp");
+        // Settle accrual at OLD rate before mutating the schedule.
+        _updatePool();
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        rewardBudget += amount;
+        windowEnd = block.timestamp + windowDuration;
+        rewardRate = rewardBudget / windowDuration;
+        emit ToppedUp(msg.sender, amount, rewardBudget, rewardRate);
     }
 
+    /// @notice Public wrapper for the implicit `_syncBudget()` performed at the
+    ///         start of every user action. Useful for keepers and for tests.
     function pullAndRefresh() external {
-        revert("not impl");
+        _syncBudget();
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal funding mechanics
+    // ---------------------------------------------------------------------
+
+    function _syncBudget() internal {
+        // Always settle accrual under the OLD rate before mutating anything.
+        _updatePool();
+        if (address(dispatcherHook) == address(0)) return;
+        uint256 pre = rewardToken.balanceOf(address(this));
+        dispatcherHook.pull();
+        uint256 inflow = rewardToken.balanceOf(address(this)) - pre;
+        if (inflow == 0) return;
+        rewardBudget += inflow;
+        windowEnd = block.timestamp + windowDuration;
+        rewardRate = rewardBudget / windowDuration;
+        emit Pulled(inflow, rewardBudget, rewardRate, windowEnd);
+    }
+
+    /// @dev Stub for the accrual settle step. Wired up properly in Phase 3.
+    function _updatePool() internal {
+        if (block.timestamp <= lastRewardTime) return;
+        if (totalStaked == 0) {
+            lastRewardTime = uint64(block.timestamp);
+            return;
+        }
+        // Phase 3 fills in the accrual maths.
     }
 
     // ---------------------------------------------------------------------
