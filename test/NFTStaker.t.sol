@@ -5,7 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {NFTStaker} from "../src/NFTStaker.sol";
 import {IPausable} from "pauser/interfaces/IPausable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract NFTStakerTest is Test {
     NFTStaker internal staker;
@@ -13,12 +14,17 @@ contract NFTStakerTest is Test {
     address internal pauser = address(0xBEEF);
     address internal stranger = address(0xCAFE);
 
+    // Dummy non-zero placeholder addresses for the staked / reward tokens — Phase
+    // 1 only needs the constructor to accept them; later phases use proper mocks.
+    address internal stakedTokenAddr = address(0x1155);
+    address internal rewardTokenAddr = address(0x20);
+    uint256 internal initialStakedId = 1;
+
     function setUp() public {
-        vm.prank(deployer);
-        staker = new NFTStaker();
+        staker = new NFTStaker(IERC1155(stakedTokenAddr), initialStakedId, IERC20(rewardTokenAddr), deployer);
     }
 
-    function testConstructorSetsOwnerToMsgSender() public view {
+    function testConstructorSetsOwnerToInitialOwner() public view {
         assertEq(staker.owner(), deployer);
     }
 
