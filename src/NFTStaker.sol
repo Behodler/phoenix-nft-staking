@@ -216,7 +216,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     // User entrypoints
     // ---------------------------------------------------------------------
 
-    function stake(uint256 amount) external {
+    function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero stake");
         _syncBudget();
         UserInfo storage user = users[msg.sender];
@@ -234,7 +234,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         emit Staked(msg.sender, amount);
     }
 
-    function unstake(uint256 amount) external {
+    function unstake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero unstake");
         UserInfo storage user = users[msg.sender];
         require(user.amount >= amount, "NFTStaker: insufficient stake");
@@ -251,7 +251,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         emit Unstaked(msg.sender, amount);
     }
 
-    function claim() external {
+    function claim() external nonReentrant whenNotPaused {
         _syncBudget();
         UserInfo storage user = users[msg.sender];
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
