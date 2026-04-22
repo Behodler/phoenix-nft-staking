@@ -5,14 +5,10 @@ import {Test} from "forge-std/Test.sol";
 import {NFTStaker} from "../src/NFTStaker.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {
-    IBalancerPoolerMintDebtHook
-} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
+import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
-import {
-    MockBalancerPoolerMintDebtHook
-} from "./mocks/MockBalancerPoolerMintDebtHook.sol";
+import {MockBalancerPoolerMintDebtHook} from "./mocks/MockBalancerPoolerMintDebtHook.sol";
 
 contract NFTStakerSustainabilityTest is Test {
     NFTStaker internal staker;
@@ -30,9 +26,7 @@ contract NFTStakerSustainabilityTest is Test {
     function setUp() public {
         nft = new MockERC1155();
         phUSD = new MockERC20("phUSD", "phUSD");
-        staker = new NFTStaker(
-            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner
-        );
+        staker = new NFTStaker(IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
 
         BUDGET = staker.windowDuration() * RATE;
         phUSD.mint(owner, BUDGET);
@@ -60,10 +54,7 @@ contract NFTStakerSustainabilityTest is Test {
         staker.setDispatcherHook(IBalancerPoolerMintDebtHook(address(hook)));
 
         hook.setPendingMint(12_345);
-        assertEq(
-            staker.totalBudget(),
-            phUSD.balanceOf(address(staker)) + 12_345
-        );
+        assertEq(staker.totalBudget(), phUSD.balanceOf(address(staker)) + 12_345);
     }
 
     // ---------- totalDebt ----------
@@ -140,19 +131,14 @@ contract NFTStakerSustainabilityTest is Test {
         uint256 extra = staker.rewardRate() * 1_000; // adds 1000s of runway
         hook.setPendingMint(extra);
 
-        assertEq(
-            staker.runwaySeconds(),
-            (staker.rewardBudget() + extra) / staker.rewardRate()
-        );
+        assertEq(staker.runwaySeconds(), (staker.rewardBudget() + extra) / staker.rewardRate());
     }
 
     function testRunwaySecondsZeroWhenRateIsZero() public {
         // Force a zero rewardRate by setting a window duration larger than
         // remaining budget after partial depletion. Simplest: deploy a fresh
         // staker with no top-up — rate starts at zero.
-        NFTStaker bare = new NFTStaker(
-            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner
-        );
+        NFTStaker bare = new NFTStaker(IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         assertEq(bare.rewardRate(), 0);
         assertEq(bare.runwaySeconds(), 0);
     }
