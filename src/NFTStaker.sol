@@ -262,8 +262,20 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         }
     }
 
-    function emergencyWithdraw() external {
-        revert("not impl");
+    /// @notice Withdraw the caller's full principal in a single ERC1155
+    ///         transfer, forfeiting any pending reward. Callable while paused
+    ///         and does NOT call `_syncBudget` / `_updatePool`, so a broken
+    ///         dispatcher hook can never trap principal. Standard masterchef
+    ///         escape hatch.
+    function emergencyWithdraw() external nonReentrant {
+        UserInfo storage user = users[msg.sender];
+        uint256 amount = user.amount;
+        require(amount > 0, "NFTStaker: nothing to withdraw");
+        user.amount = 0;
+        user.rewardDebt = 0;
+        totalStaked -= amount;
+        stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
+        emit EmergencyWithdrawn(msg.sender, amount);
     }
 
     // ---------------------------------------------------------------------
