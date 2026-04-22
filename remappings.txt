@@ -1,0 +1,6 @@
+@openzeppelin/contracts/=lib/immutable/openzeppelin-contracts/contracts/
+yield-claim-nft/=lib/mutable/yield-claim-nft/src/
+pauser/=lib/mutable/pauser/src/
+forge-std/=lib/mutable/pauser/lib/forge-std/src/
+immutable/=lib/immutable/
+mutable/=lib/mutable/

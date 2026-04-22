@@ -24,6 +24,8 @@ Once scaffolded, this submodule is expected to pull in:
 
 This submodule was not bootstrapped with the parent repo's `.claude/scripts/` scaffolding. Wire dependencies manually as needed (git submodule add into `lib/immutable/` or `lib/mutable/`, then update `foundry.toml` remappings — see a sibling like `yield-claim-nft/foundry.toml` for the remapping pattern).
 
+**Keep `remappings.txt` in sync with `foundry.toml`.** The VSCode Solidity extension doesn't read `foundry.toml`, so a checked-in `remappings.txt` at the submodule root is what drives editor import resolution. Whenever you add, remove, or edit a remapping in `foundry.toml`, regenerate it with `forge remappings > remappings.txt` and commit both files together. Out-of-sync files surface as spurious "Source ... not found: File import callback not supported" lints even though `forge build` succeeds.
+
 ### Feature Specification (implementation checklist)
 
 Treat the list below as the authoritative spec. When the user asks for a new feature, cross-reference this list and remind them of any items still outstanding.
