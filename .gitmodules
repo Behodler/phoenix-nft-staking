@@ -7,3 +7,6 @@
 [submodule "lib/mutable/pauser"]
 	path = lib/mutable/pauser
 	url = https://github.com/Behodler/pauser.git
+[submodule "lib/immutable/forge-std"]
+	path = lib/immutable/forge-std
+	url = https://github.com/foundry-rs/forge-std

@@ -5,6 +5,7 @@ libs = ["lib"]
 solc = "0.8.20"
 remappings = [
     "@openzeppelin/contracts/=lib/immutable/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/immutable/forge-std/src/",
     "yield-claim-nft/=lib/mutable/yield-claim-nft/src/",
     "pauser/=lib/mutable/pauser/src/"
 ]
