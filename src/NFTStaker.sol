@@ -253,9 +253,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
             uint256 paid = _safePay(pending);
-            user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
             if (paid > 0) emit Claimed(msg.sender, paid);
         }
+        user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
     }
 
     /// @dev Transfers `amount` of rewardToken to msg.sender. Reverts if the
