@@ -30,7 +30,9 @@ This submodule was not bootstrapped with the parent repo's `.claude/scripts/` sc
 
 Treat the list below as the authoritative spec. When the user asks for a new feature, cross-reference this list and remind them of any items still outstanding.
 
-1. **ERC1155 multi-ID staking**: Stake/unstake units of a configured ERC1155 contract. Initially one token ID (the BalancerPooler NFT), but the design must allow the owner to whitelist additional IDs on the same ERC1155 contract later (not multiple ERC1155/ERC721 contracts). Per-ID accounting must support independent emission rates / share weighting if multiple IDs are active.
+1. **Single-ID ERC1155 staking, one staker contract per NFT at a time**: Stake/unstake units of a configured ERC1155 token ID (initially the BalancerPooler NFT). The ERC1155 contract address is an immutable constructor arg; the token ID is owner-settable via `setStakedId` but **only while `totalStaked == 0`** — this accommodates `NFTMinter` reconfiguration (e.g. a Balancer pool migration that reissues the NFT under a new ID) without stranding user principal. No in-contract whitelist, no per-ID mapping, no allocation-point math — a single active ID at any moment. If concurrent staking against two different NFTs is ever required, deploy a second `NFTStaker` alongside this one; the "how do multiple stakers share one dispatcher hook" question is deliberately deferred and answerable later via a fan-out splitter contract or a `yield-claim-nft`-side change to allow multiple hook recipients. See `docs/design.md` for the full rationale — briefly: ERC4626 doesn't fit (heterogeneous reward vs. share denomination), and single-ID removes loops / whitelist iteration / `allocPoint` bookkeeping at the cost of deferring multi-NFT orchestration until it's actually needed.
+
+   Pair the mutable ID with a standard masterchef `emergencyWithdraw()` that returns principal, forfeits pending reward, skips `_syncBudget`/`_updatePool`, and is callable while paused. This is the escape hatch that keeps an ID-change migration from deadlocking on unresponsive stakers and prevents principal from being trapped if the dispatcher hook is ever broken.
 2. **Masterchef-style per-second emissions in phUSD**: Track `accRewardPerShare` scaled by a precision constant, `lastRewardTime`, and per-user `rewardDebt`, updated on every interaction. "Share" unit is NFT units staked (ERC1155 balances), not ERC20 wei.
 3. **Depletion window**: Default 18 months (`540 days`). The remaining phUSD balance divided by remaining seconds in the window defines the per-second emission rate.
 4. **Pull-on-interaction**: Every stake / unstake / claim call first invokes `pull()` on the configured dispatcher hook to sweep any outstanding mint-debt into this contract as phUSD.
@@ -47,7 +49,8 @@ Treat the list below as the authoritative spec. When the user asks for a new fea
 - Running out of phUSD mid-window stops emissions cleanly (per-second rate × elapsed can never exceed the tracked remaining budget).
 - A `pull()` that mints zero leaves the existing schedule untouched — no window reset, no rate change.
 - Reducing the window duration does not let users retroactively claim more than the current phUSD balance.
-- Multi-ID accounting: rewards earned by holders of ID A never leak to holders of ID B.
+- Cross-staker isolation: if a second NFT is ever introduced, it gets its own `NFTStaker` deployment. Within a single staker there is only one active token ID, so within-contract cross-ID leakage is structurally impossible.
+- ID change never strands principal: `setStakedId` must revert unless `totalStaked == 0`. Users always recover their deposit in the same ID they deposited. `emergencyWithdraw` must work while paused and without touching `_syncBudget`/`_updatePool`, so the migration path is never blocked by a broken dispatcher hook.
 
 ## Dependency Management
 
