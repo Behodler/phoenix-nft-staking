@@ -223,8 +223,8 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         if (user.amount > 0) {
             uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
             if (pending > 0) {
-                rewardToken.safeTransfer(msg.sender, pending);
-                emit Claimed(msg.sender, pending);
+                pending = _safePay(pending);
+                if (pending > 0) emit Claimed(msg.sender, pending);
             }
         }
         stakedToken.safeTransferFrom(msg.sender, address(this), stakedId, amount, "");
@@ -241,8 +241,8 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         _syncBudget();
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
-            rewardToken.safeTransfer(msg.sender, pending);
-            emit Claimed(msg.sender, pending);
+            pending = _safePay(pending);
+            if (pending > 0) emit Claimed(msg.sender, pending);
         }
         user.amount -= amount;
         totalStaked -= amount;
@@ -256,10 +256,24 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         UserInfo storage user = users[msg.sender];
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
-            rewardToken.safeTransfer(msg.sender, pending);
+            uint256 paid = _safePay(pending);
             user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
-            emit Claimed(msg.sender, pending);
+            if (paid > 0) emit Claimed(msg.sender, paid);
         }
+    }
+
+    /// @dev Caps `amount` at the on-chain reward balance and transfers to
+    ///      msg.sender. Returns the amount actually paid. Necessary because
+    ///      per-user floor rounding in (amount * acc / ACC_PRECISION) can in
+    ///      rare cases cumulatively exceed rewardBudget by 1 wei across many
+    ///      accruals; the on-chain balance is the hard cap.
+    function _safePay(uint256 amount) internal returns (uint256) {
+        uint256 balance = rewardToken.balanceOf(address(this));
+        uint256 paid = amount > balance ? balance : amount;
+        if (paid > 0) {
+            rewardToken.safeTransfer(msg.sender, paid);
+        }
+        return paid;
     }
 
     /// @notice Withdraw the caller's full principal in a single ERC1155
