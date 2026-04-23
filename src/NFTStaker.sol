@@ -99,6 +99,27 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         _;
     }
 
+    /// @dev Permits owner unconditionally; permits non-owner when either the call
+    ///      does not lower `rewardRate`, or the window was already expired going
+    ///      into the call. Defends `topUp` and `pullAndRefresh` from rate-dilution
+    ///      grief (small inflow mid-window drains the budget under the old rate,
+    ///      then recomputes a lower rate over the full window and keeps
+    ///      `windowEnd` perpetually far out). Captures `rewardRate` and `windowEnd`
+    ///      before the body; `_updatePool` does not touch either, so the pre/post
+    ///      compare isolates the schedule-reset effect. A no-op pull (zero inflow,
+    ///      or unset hook) leaves `rewardRate` unchanged and passes the check.
+    ///      The expired-window clause lets any caller restart a dormant schedule
+    ///      without owner intervention — there is no active rate to protect, so
+    ///      the grief vector doesn't apply.
+    modifier ownerOrNotGriefed() {
+        uint256 rPre = rewardRate;
+        uint256 endPre = windowEnd;
+        _;
+        require(
+            msg.sender == owner() || rewardRate >= rPre || endPre <= block.timestamp, "NFTStaker: reward rate reduced"
+        );
+    }
+
     constructor(IERC1155 _stakedToken, uint256 _stakedId, IERC20 _rewardToken, address _initialOwner)
         Ownable(_initialOwner)
     {
@@ -153,7 +174,15 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         rewardRate = newDuration == 0 ? 0 : rewardBudget / newDuration;
     }
 
-    function topUp(uint256 amount) external onlyOwner {
+    /// @notice Permissionless refill of the reward budget, guarded against
+    ///         rate dilution. Any caller may transfer `amount` phUSD into the
+    ///         contract, which extends the window to `now + windowDuration`
+    ///         and recomputes `rewardRate` over the new budget. Non-owner
+    ///         callers are reverted if the recomputation lowers `rewardRate`
+    ///         (see `ownerOrNotGriefed`); the owner bypasses this guard and
+    ///         can intentionally extend at a lower rate if required.
+    /// @param  amount phUSD units to inject. Must be nonzero.
+    function topUp(uint256 amount) external ownerOrNotGriefed {
         require(amount > 0, "NFTStaker: zero topUp");
         // Settle accrual at OLD rate before mutating the schedule.
         _updatePool();
@@ -166,7 +195,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
 
     /// @notice Public wrapper for the implicit `_syncBudget()` performed at the
     ///         start of every user action. Useful for keepers and for tests.
-    function pullAndRefresh() external {
+    ///         Non-owner callers are blocked if the pull would reduce
+    ///         `rewardRate` — see `ownerOrNotGriefed`.
+    function pullAndRefresh() external ownerOrNotGriefed {
         _syncBudget();
     }
 
