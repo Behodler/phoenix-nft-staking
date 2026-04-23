@@ -75,11 +75,10 @@ contract NFTStakerConfigTest is Test {
         staker.setStakedId(99);
     }
 
-    function testTopUpOnlyOwner() public {
-        vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        staker.topUp(1);
-    }
+    // Note: `topUp` is no longer `onlyOwner`. It is guarded by the
+    // `ownerOrNotGriefed` modifier — non-owner callers are permitted
+    // provided the call does not reduce `rewardRate`. Coverage lives in
+    // `NFTStakerPermissions.t.sol`.
 
     // ---------- setWindowDuration bounds ----------
 
