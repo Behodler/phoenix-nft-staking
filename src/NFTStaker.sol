@@ -76,19 +76,6 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     mapping(address => UserInfo) public users;
 
     // ---------------------------------------------------------------------
-    // Cooldown state
-    // ---------------------------------------------------------------------
-
-    /// @notice Minimum seconds between user-triggered `_syncBudget` pulls.
-    ///         Owner-triggered paths (`topUp`, `pullAndRefresh`) bypass this.
-    ///         Default `0` preserves the pre-fix pull-on-every-interaction
-    ///         behavior; set via `setMinPullInterval` post-deploy.
-    uint256 public minPullInterval;
-
-    /// @notice Timestamp of the last dispatcher pull attempt (from any path).
-    uint256 public lastPullAt;
-
-    // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
 
@@ -102,7 +89,6 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     event DispatcherHookChanged(address indexed previous, address indexed next);
     event StakedIdChanged(uint256 previous, uint256 next);
     event PauserChanged(address indexed previousPauser, address indexed newPauser);
-    event MinPullIntervalChanged(uint256 previous, uint256 next);
 
     // ---------------------------------------------------------------------
     // Modifiers
@@ -162,60 +148,68 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         _updatePool();
         emit WindowDurationChanged(windowDuration, newDuration);
         windowDuration = newDuration;
-        // Reset the active window/rate against the existing budget.
-        windowEnd = block.timestamp + newDuration;
-        rewardRate = newDuration == 0 ? 0 : rewardBudget / newDuration;
-    }
-
-    function setMinPullInterval(uint256 newInterval) external onlyOwner {
-        emit MinPullIntervalChanged(minPullInterval, newInterval);
-        minPullInterval = newInterval;
     }
 
     /// @notice Owner-only refill of the reward budget. Transfers `amount`
-    ///         phUSD into the contract, extends the window to
-    ///         `now + windowDuration`, and recomputes `rewardRate` over the
-    ///         new budget. Does not call `_syncBudget` and does not touch the
-    ///         user-path cooldown clock (`lastPullAt`).
+    ///         phUSD into the contract, then applies the monotonic-upward
+    ///         invariant: small top-ups preserve `rewardRate` and extend
+    ///         `windowEnd`; large top-ups (or bootstrap / post-expiry) raise
+    ///         `rewardRate` and reset `windowEnd`. Does not call
+    ///         `_syncBudget`, so the dispatcher-hook-independence escape
+    ///         hatch is preserved.
     /// @param  amount phUSD units to inject. Must be nonzero.
+    /// @dev    Monotonic-upward invariant enforced via `_applyAsymmetricWindow`.
     function topUp(uint256 amount) external onlyOwner {
         require(amount > 0, "NFTStaker: zero topUp");
-        // Settle accrual at OLD rate before mutating the schedule.
+        // Settle accrual under the OLD rate before mutating the schedule.
         _updatePool();
         rewardToken.safeTransferFrom(msg.sender, address(this), amount);
         rewardBudget += amount;
-        windowEnd = block.timestamp + windowDuration;
-        rewardRate = rewardBudget / windowDuration;
+        _applyAsymmetricWindow(amount);
         emit ToppedUp(msg.sender, amount, rewardBudget, rewardRate);
     }
 
-    /// @notice Owner-only manual trigger of `_syncBudget`. Bypasses the
-    ///         user-path cooldown so the owner retains unconditional
-    ///         operational control over the dispatcher pull.
+    /// @notice Owner-only manual trigger of `_syncBudget`.
     function pullAndRefresh() external onlyOwner {
-        _syncBudget(true);
+        _syncBudget();
     }
 
     // ---------------------------------------------------------------------
     // Internal funding mechanics
     // ---------------------------------------------------------------------
 
-    /// @dev `bypassInterval=true` is reserved for owner operational paths
-    ///      (`pullAndRefresh`); user entrypoints always pass `false` so the
-    ///      `minPullInterval` rate-limit applies.
-    function _syncBudget(bool bypassInterval) internal {
+    /// @dev Applies the monotonic-upward rate invariant after `rewardBudget`
+    ///      has been incremented by `inflow`. Reset branch fires on
+    ///      bootstrap / post-expiry restart / legitimate rate raise;
+    ///      otherwise the inflow is absorbed as extra budget and `windowEnd`
+    ///      is extended at the current rate. `rewardRate` is never lowered.
+    ///      Caller is responsible for (a) the `rewardBudget += inflow` that
+    ///      precedes this call and (b) emitting the path-specific event
+    ///      (`Pulled` / `ToppedUp`) after it returns.
+    function _applyAsymmetricWindow(uint256 inflow) internal {
+        uint256 candidate = windowDuration > 0 ? rewardBudget / windowDuration : 0;
+        bool scheduleExpired = block.timestamp >= windowEnd;
+        if (scheduleExpired || candidate > rewardRate) {
+            // Bootstrap, post-expiry restart, or legitimate rate raise — full reset.
+            rewardRate = candidate;
+            windowEnd = block.timestamp + windowDuration;
+        } else if (rewardRate > 0) {
+            // Under-refill — preserve R, extend windowEnd at current rate.
+            windowEnd += inflow / rewardRate;
+        }
+    }
+
+    /// @dev Monotonic-upward invariant enforced via `_applyAsymmetricWindow`.
+    function _syncBudget() internal {
         // Always settle accrual under the OLD rate before mutating anything.
         _updatePool();
         if (address(dispatcherHook) == address(0)) return;
-        if (!bypassInterval && block.timestamp < lastPullAt + minPullInterval) return;
         uint256 pre = rewardToken.balanceOf(address(this));
         dispatcherHook.pull();
-        lastPullAt = block.timestamp;
         uint256 inflow = rewardToken.balanceOf(address(this)) - pre;
         if (inflow == 0) return;
         rewardBudget += inflow;
-        windowEnd = block.timestamp + windowDuration;
-        rewardRate = rewardBudget / windowDuration;
+        _applyAsymmetricWindow(inflow);
         emit Pulled(inflow, rewardBudget, rewardRate, windowEnd);
     }
 
@@ -245,7 +239,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
 
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero stake");
-        _syncBudget(false);
+        _syncBudget();
         UserInfo storage user = users[msg.sender];
         if (user.amount > 0) {
             uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
@@ -265,7 +259,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         require(amount > 0, "NFTStaker: zero unstake");
         UserInfo storage user = users[msg.sender];
         require(user.amount >= amount, "NFTStaker: insufficient stake");
-        _syncBudget(false);
+        _syncBudget();
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
             pending = _safePay(pending);
@@ -279,7 +273,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     function claim() external nonReentrant whenNotPaused {
-        _syncBudget(false);
+        _syncBudget();
         UserInfo storage user = users[msg.sender];
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {

@@ -147,21 +147,41 @@ contract NFTStakerFundingTest is Test {
         staker.topUp(0);
     }
 
-    // ---------- setWindowDuration mid-life ----------
+    // ---------- setWindowDuration is config-only ----------
 
-    function testSetWindowDurationResetsWindowAndRate() public {
-        // Fund first
+    function testSetWindowDurationIsConfigOnly() public {
+        // Fund first — seeds rewardRate_0 and windowEnd_0.
         uint256 amount = 540 days * 100;
         hook.setPendingMint(amount);
         vm.prank(owner);
         staker.pullAndRefresh();
 
+        uint256 rate0 = staker.rewardRate();
+        uint256 end0 = staker.windowEnd();
+        assertGt(rate0, 0);
+        assertGt(end0, 0);
+
         uint256 newDuration = 90 days;
         vm.prank(owner);
         staker.setWindowDuration(newDuration);
 
+        // Setter is config-only: neither rewardRate nor windowEnd should
+        // shift at the setter call itself.
         assertEq(staker.windowDuration(), newDuration);
-        assertEq(staker.windowEnd(), block.timestamp + newDuration);
-        assertEq(staker.rewardRate(), staker.rewardBudget() / newDuration);
+        assertEq(staker.rewardRate(), rate0, "setter must not rewrite rewardRate");
+        assertEq(staker.windowEnd(), end0, "setter must not rewrite windowEnd");
+
+        // A subsequent nonzero-inflow pullAndRefresh under a shorter
+        // duration raises rewardRate — the "next qualifying pull rescales"
+        // property (candidate = (budget + inflow) / newDuration > rate0).
+        uint256 extra = 1 ether;
+        hook.setPendingMint(extra);
+        vm.prank(owner);
+        staker.pullAndRefresh();
+
+        uint256 newRate = staker.rewardRate();
+        assertGt(newRate, rate0, "qualifying inflow must raise rate after shortened window");
+        assertEq(newRate, staker.rewardBudget() / newDuration, "new rate = budget / newDuration");
+        assertEq(staker.windowEnd(), block.timestamp + newDuration, "windowEnd should reset on rate raise");
     }
 }

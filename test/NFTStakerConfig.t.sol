@@ -75,9 +75,8 @@ contract NFTStakerConfigTest is Test {
         staker.setStakedId(99);
     }
 
-    // Note: `topUp`, `pullAndRefresh`, and `setMinPullInterval` are all
-    // `onlyOwner`; user-path `_syncBudget` pulls are rate-limited by the
-    // `minPullInterval` cooldown. Coverage lives in
+    // Note: `topUp` and `pullAndRefresh` are `onlyOwner`. Coverage of the
+    // monotonic-upward `_syncBudget` invariant lives in
     // `NFTStakerPermissions.t.sol`.
 
     // ---------- setWindowDuration bounds ----------
