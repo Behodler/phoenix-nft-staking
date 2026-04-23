@@ -76,6 +76,19 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     mapping(address => UserInfo) public users;
 
     // ---------------------------------------------------------------------
+    // Cooldown state
+    // ---------------------------------------------------------------------
+
+    /// @notice Minimum seconds between user-triggered `_syncBudget` pulls.
+    ///         Owner-triggered paths (`topUp`, `pullAndRefresh`) bypass this.
+    ///         Default `0` preserves the pre-fix pull-on-every-interaction
+    ///         behavior; set via `setMinPullInterval` post-deploy.
+    uint256 public minPullInterval;
+
+    /// @notice Timestamp of the last dispatcher pull attempt (from any path).
+    uint256 public lastPullAt;
+
+    // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
 
@@ -89,6 +102,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     event DispatcherHookChanged(address indexed previous, address indexed next);
     event StakedIdChanged(uint256 previous, uint256 next);
     event PauserChanged(address indexed previousPauser, address indexed newPauser);
+    event MinPullIntervalChanged(uint256 previous, uint256 next);
 
     // ---------------------------------------------------------------------
     // Modifiers
@@ -97,27 +111,6 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     modifier onlyPauser() {
         require(msg.sender == pauser, "NFTStaker: caller is not pauser");
         _;
-    }
-
-    /// @dev Permits owner unconditionally; permits non-owner when either the call
-    ///      does not lower `rewardRate`, or the window was already expired going
-    ///      into the call. Defends `topUp` and `pullAndRefresh` from rate-dilution
-    ///      grief (small inflow mid-window drains the budget under the old rate,
-    ///      then recomputes a lower rate over the full window and keeps
-    ///      `windowEnd` perpetually far out). Captures `rewardRate` and `windowEnd`
-    ///      before the body; `_updatePool` does not touch either, so the pre/post
-    ///      compare isolates the schedule-reset effect. A no-op pull (zero inflow,
-    ///      or unset hook) leaves `rewardRate` unchanged and passes the check.
-    ///      The expired-window clause lets any caller restart a dormant schedule
-    ///      without owner intervention — there is no active rate to protect, so
-    ///      the grief vector doesn't apply.
-    modifier ownerOrNotGriefed() {
-        uint256 rPre = rewardRate;
-        uint256 endPre = windowEnd;
-        _;
-        require(
-            msg.sender == owner() || rewardRate >= rPre || endPre <= block.timestamp, "NFTStaker: reward rate reduced"
-        );
     }
 
     constructor(IERC1155 _stakedToken, uint256 _stakedId, IERC20 _rewardToken, address _initialOwner)
@@ -174,15 +167,18 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         rewardRate = newDuration == 0 ? 0 : rewardBudget / newDuration;
     }
 
-    /// @notice Permissionless refill of the reward budget, guarded against
-    ///         rate dilution. Any caller may transfer `amount` phUSD into the
-    ///         contract, which extends the window to `now + windowDuration`
-    ///         and recomputes `rewardRate` over the new budget. Non-owner
-    ///         callers are reverted if the recomputation lowers `rewardRate`
-    ///         (see `ownerOrNotGriefed`); the owner bypasses this guard and
-    ///         can intentionally extend at a lower rate if required.
+    function setMinPullInterval(uint256 newInterval) external onlyOwner {
+        emit MinPullIntervalChanged(minPullInterval, newInterval);
+        minPullInterval = newInterval;
+    }
+
+    /// @notice Owner-only refill of the reward budget. Transfers `amount`
+    ///         phUSD into the contract, extends the window to
+    ///         `now + windowDuration`, and recomputes `rewardRate` over the
+    ///         new budget. Does not call `_syncBudget` and does not touch the
+    ///         user-path cooldown clock (`lastPullAt`).
     /// @param  amount phUSD units to inject. Must be nonzero.
-    function topUp(uint256 amount) external ownerOrNotGriefed {
+    function topUp(uint256 amount) external onlyOwner {
         require(amount > 0, "NFTStaker: zero topUp");
         // Settle accrual at OLD rate before mutating the schedule.
         _updatePool();
@@ -193,24 +189,28 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         emit ToppedUp(msg.sender, amount, rewardBudget, rewardRate);
     }
 
-    /// @notice Public wrapper for the implicit `_syncBudget()` performed at the
-    ///         start of every user action. Useful for keepers and for tests.
-    ///         Non-owner callers are blocked if the pull would reduce
-    ///         `rewardRate` — see `ownerOrNotGriefed`.
-    function pullAndRefresh() external ownerOrNotGriefed {
-        _syncBudget();
+    /// @notice Owner-only manual trigger of `_syncBudget`. Bypasses the
+    ///         user-path cooldown so the owner retains unconditional
+    ///         operational control over the dispatcher pull.
+    function pullAndRefresh() external onlyOwner {
+        _syncBudget(true);
     }
 
     // ---------------------------------------------------------------------
     // Internal funding mechanics
     // ---------------------------------------------------------------------
 
-    function _syncBudget() internal {
+    /// @dev `bypassInterval=true` is reserved for owner operational paths
+    ///      (`pullAndRefresh`); user entrypoints always pass `false` so the
+    ///      `minPullInterval` rate-limit applies.
+    function _syncBudget(bool bypassInterval) internal {
         // Always settle accrual under the OLD rate before mutating anything.
         _updatePool();
         if (address(dispatcherHook) == address(0)) return;
+        if (!bypassInterval && block.timestamp < lastPullAt + minPullInterval) return;
         uint256 pre = rewardToken.balanceOf(address(this));
         dispatcherHook.pull();
+        lastPullAt = block.timestamp;
         uint256 inflow = rewardToken.balanceOf(address(this)) - pre;
         if (inflow == 0) return;
         rewardBudget += inflow;
@@ -245,7 +245,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
 
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero stake");
-        _syncBudget();
+        _syncBudget(false);
         UserInfo storage user = users[msg.sender];
         if (user.amount > 0) {
             uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
@@ -265,7 +265,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         require(amount > 0, "NFTStaker: zero unstake");
         UserInfo storage user = users[msg.sender];
         require(user.amount >= amount, "NFTStaker: insufficient stake");
-        _syncBudget();
+        _syncBudget(false);
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {
             pending = _safePay(pending);
@@ -279,7 +279,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     function claim() external nonReentrant whenNotPaused {
-        _syncBudget();
+        _syncBudget(false);
         UserInfo storage user = users[msg.sender];
         uint256 pending = (user.amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         if (pending > 0) {

@@ -75,9 +75,9 @@ contract NFTStakerConfigTest is Test {
         staker.setStakedId(99);
     }
 
-    // Note: `topUp` is no longer `onlyOwner`. It is guarded by the
-    // `ownerOrNotGriefed` modifier — non-owner callers are permitted
-    // provided the call does not reduce `rewardRate`. Coverage lives in
+    // Note: `topUp`, `pullAndRefresh`, and `setMinPullInterval` are all
+    // `onlyOwner`; user-path `_syncBudget` pulls are rate-limited by the
+    // `minPullInterval` cooldown. Coverage lives in
     // `NFTStakerPermissions.t.sol`.
 
     // ---------- setWindowDuration bounds ----------

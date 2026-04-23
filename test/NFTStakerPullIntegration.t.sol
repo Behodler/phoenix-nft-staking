@@ -45,6 +45,7 @@ contract NFTStakerPullIntegrationTest is Test {
         uint256 initialBudget = staker.windowDuration() * 100;
         hook.setPendingMint(initialBudget);
         // Trigger pull explicitly so we control the timeline
+        vm.prank(owner);
         staker.pullAndRefresh();
 
         // Alice stakes early, accrues solo
@@ -80,6 +81,7 @@ contract NFTStakerPullIntegrationTest is Test {
         // Seed initial schedule
         uint256 initialBudget = staker.windowDuration() * 100;
         hook.setPendingMint(initialBudget);
+        vm.prank(owner);
         staker.pullAndRefresh();
 
         uint256 endBefore = staker.windowEnd();
@@ -102,6 +104,7 @@ contract NFTStakerPullIntegrationTest is Test {
         // Seed initial schedule
         uint256 initialBudget = staker.windowDuration() * 100;
         hook.setPendingMint(initialBudget);
+        vm.prank(owner);
         staker.pullAndRefresh();
 
         vm.prank(alice);

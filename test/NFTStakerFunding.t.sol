@@ -41,6 +41,7 @@ contract NFTStakerFundingTest is Test {
         vm.expectEmit(true, true, true, true, address(staker));
         emit Pulled(amount, amount, amount / staker.windowDuration(), block.timestamp + staker.windowDuration());
 
+        vm.prank(owner);
         staker.pullAndRefresh();
 
         assertEq(staker.rewardBudget(), amount);
@@ -52,6 +53,7 @@ contract NFTStakerFundingTest is Test {
         // First pull to set baseline
         uint256 firstAmount = 540 days * 50;
         hook.setPendingMint(firstAmount);
+        vm.prank(owner);
         staker.pullAndRefresh();
         uint256 firstEnd = staker.windowEnd();
 
@@ -59,6 +61,7 @@ contract NFTStakerFundingTest is Test {
 
         uint256 secondAmount = 540 days * 50;
         hook.setPendingMint(secondAmount);
+        vm.prank(owner);
         staker.pullAndRefresh();
 
         // Window should reset to now+windowDuration, not the original end
@@ -90,6 +93,7 @@ contract NFTStakerFundingTest is Test {
 
         // Recorder for expectEmit not needed: we want to prove no Pulled event fires.
         vm.recordLogs();
+        vm.prank(owner);
         staker.pullAndRefresh();
         // Iterate logs and assert none has the Pulled signature
         bytes32 pulledSig = keccak256("Pulled(uint256,uint256,uint256,uint256)");
@@ -110,6 +114,7 @@ contract NFTStakerFundingTest is Test {
         vm.prank(owner);
         staker.setDispatcherHook(IBalancerPoolerMintDebtHook(address(0)));
         // Should not revert and should not change state
+        vm.prank(owner);
         staker.pullAndRefresh();
         assertEq(staker.rewardBudget(), 0);
         assertEq(staker.rewardRate(), 0);
@@ -148,6 +153,7 @@ contract NFTStakerFundingTest is Test {
         // Fund first
         uint256 amount = 540 days * 100;
         hook.setPendingMint(amount);
+        vm.prank(owner);
         staker.pullAndRefresh();
 
         uint256 newDuration = 90 days;
