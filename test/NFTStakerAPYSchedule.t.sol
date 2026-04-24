@@ -56,12 +56,7 @@ contract NFTStakerAPYScheduleTest is Test {
         nftMinter.setTotalSupply(ID, 0);
 
         staker = new NFTStaker(
-            IERC1155(address(nft)),
-            ID,
-            IERC20(address(phUSD)),
-            owner,
-            INFTSupply(address(nftMinter)),
-            DISPATCHER_INDEX
+            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(nftMinter)), DISPATCHER_INDEX
         );
 
         hook = new MockBalancerPoolerMintDebtHook(phUSD, address(staker));
@@ -105,9 +100,10 @@ contract NFTStakerAPYScheduleTest is Test {
     }
 
     function testSetTargetAPYAcceptsMax() public {
+        uint256 max = staker.MAX_TARGET_APY();
         vm.prank(owner);
-        staker.setTargetAPY(staker.MAX_TARGET_APY());
-        assertEq(staker.targetAPY(), staker.MAX_TARGET_APY());
+        staker.setTargetAPY(max);
+        assertEq(staker.targetAPY(), max);
     }
 
     function testSetTargetAPYEmitsEvent() public {
@@ -475,12 +471,7 @@ contract NFTStakerAPYScheduleTest is Test {
     function testConstructorRejectsZeroNFTMinter() public {
         vm.expectRevert(bytes("NFTStaker: zero nft minter"));
         new NFTStaker(
-            IERC1155(address(nft)),
-            ID,
-            IERC20(address(phUSD)),
-            owner,
-            INFTSupply(address(0)),
-            DISPATCHER_INDEX
+            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(0)), DISPATCHER_INDEX
         );
     }
 

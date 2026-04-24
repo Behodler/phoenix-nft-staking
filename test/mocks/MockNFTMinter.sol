@@ -44,11 +44,7 @@ contract MockNFTMinter is INFTSupply {
     function setConfig(uint256 index, address dispatcher, uint256 price, uint256 growthBasisPoints, bool disabled)
         external
     {
-        _configs[index] = Config({
-            dispatcher: dispatcher,
-            price: price,
-            growthBasisPoints: growthBasisPoints,
-            disabled: disabled
-        });
+        _configs[index] =
+            Config({dispatcher: dispatcher, price: price, growthBasisPoints: growthBasisPoints, disabled: disabled});
     }
 }

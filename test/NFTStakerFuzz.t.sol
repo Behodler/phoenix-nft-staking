@@ -3,58 +3,65 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {NFTStaker} from "../src/NFTStaker.sol";
+import {INFTSupply} from "../src/INFTSupply.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockNFTMinter} from "./mocks/MockNFTMinter.sol";
 
-/// @notice Fuzz harness for the depletion invariant. With three users
-///         taking arbitrary stake amounts and arbitrary time warps between
-///         interactions (no top-ups, no dispatcher hook), the sum of all
-///         claimed phUSD plus the sum of all currently-pending rewards must
-///         never exceed the initial budget seeded via topUp.
-///
-/// Post-M-01 note: with `_safePay` now reverting on any shortfall instead of
-/// silently capping, the harness must ensure the contract always holds at
-/// least `sum(user.pending)` wei. Floor-division drift in
-/// `_updatePool` (rounding `(reward * ACC_PRECISION) / totalStaked` down)
-/// and in the per-user pending calculation can leave sum(pending) a few wei
-/// ABOVE the undistributed budget in interleaved-settlement scenarios —
-/// enough to trip the revert even though no real loss has occurred. We seed
-/// a small phUSD buffer directly on the contract (not via `topUp`, so the
-/// schedule is unaffected) to absorb this rounding. The depletion invariants
-/// are adjusted from `claimed + pending <= initialBudget` to
-/// `claimed + pending <= initialBudget + buffer` (and the full-drain exact
-/// reconciliation accounts for the buffer remaining on the contract).
+/// @notice Fuzz over the APY-driven schedule. Two classes of properties:
+///           1. `_recomputeSchedule` never reverts across the stated input
+///              bounds (N, growthBP, price, targetAPY, V).
+///           2. Computed `rewardRate` matches the closed-form reference
+///              within 1 wei tolerance (pure floor-division agreement).
+///         Also keeps the legacy depletion-invariant harness as a
+///         solvency smoke test: claimed + pending across 3 actors must
+///         never exceed the seeded budget (plus a rounding buffer that
+///         absorbs per-update floor-division drift).
 contract NFTStakerFuzzTest is Test {
+    using Math for uint256;
+
     NFTStaker internal staker;
     MockERC1155 internal nft;
     MockERC20 internal phUSD;
+    MockNFTMinter internal nftMinter;
 
     address internal owner = address(0xD1);
     address[3] internal stakers;
 
     uint256 internal constant ID = 1;
+    uint256 internal constant DISPATCHER_INDEX = 1;
+    uint256 internal constant APY_PRECISION = 1e18;
+    uint256 internal constant SECONDS_PER_YEAR = 365 days;
     uint256 internal constant ROUNDING_BUFFER = 1_000_000;
     uint256 internal initialBudget;
 
     function setUp() public {
         nft = new MockERC1155();
         phUSD = new MockERC20("phUSD", "phUSD");
-        staker = new NFTStaker(IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
+        nftMinter = new MockNFTMinter();
+        // Uniform price for easier depletion math.
+        nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 0, false);
+        nftMinter.setTotalSupply(ID, 100);
 
-        // Pick a tidy initial budget that divides cleanly by windowDuration
-        initialBudget = staker.windowDuration() * 1_000_000;
+        staker = new NFTStaker(
+            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(nftMinter)), DISPATCHER_INDEX
+        );
+
+        initialBudget = 1_000_000 ether;
         phUSD.mint(owner, initialBudget);
         vm.prank(owner);
         phUSD.approve(address(staker), initialBudget);
         vm.prank(owner);
         staker.topUp(initialBudget);
 
-        // Seed a rounding buffer that is NOT tracked in rewardBudget. This
-        // absorbs the worst-case floor-division drift across interleaved
-        // stake/claim/unstake settlements so `_safePay`'s revert never trips
-        // on a purely-arithmetic shortfall that represents no real loss.
+        vm.prank(owner);
+        staker.setTargetAPY(0.3e18);
+
+        // Seed a rounding buffer that is NOT tracked in rewardBudget.
         phUSD.mint(address(staker), ROUNDING_BUFFER);
 
         stakers[0] = address(0xA1);
@@ -67,9 +74,100 @@ contract NFTStakerFuzzTest is Test {
         }
     }
 
-    /// Fuzz: 3 actors, each with a (bounded) stake amount and warp interval.
-    /// At each step the actor either stakes, claims, or unstakes a fraction.
-    /// Final invariant: total phUSD distributed (claimed + still-pending) <= initialBudget.
+    // -------------------------------------------------------------------
+    // _recomputeSchedule fuzz — never reverts, matches closed form
+    // -------------------------------------------------------------------
+
+    function _closedFormRate(uint256 price, uint256 growthBP, uint256 N, uint256 A, uint256 V)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 T;
+        if (N == 0 || price == 0) {
+            T = 0;
+        } else if (growthBP == 0) {
+            T = price * N;
+        } else {
+            uint256 r = APY_PRECISION + growthBP * 1e14;
+            uint256 latestPrice = Math.mulDiv(price, APY_PRECISION, r);
+            if (N == 1) {
+                T = latestPrice;
+            } else {
+                uint256 rPowN = FixedPointMathLib.rpow(r, N, APY_PRECISION);
+                uint256 rPowNm1 = FixedPointMathLib.rpow(r, N - 1, APY_PRECISION);
+                uint256 rMinusOne = r - APY_PRECISION;
+                uint256 num = Math.mulDiv(latestPrice, rPowN - APY_PRECISION, APY_PRECISION);
+                uint256 den = Math.mulDiv(rPowNm1, rMinusOne, APY_PRECISION);
+                T = Math.mulDiv(num, APY_PRECISION, den);
+            }
+        }
+        uint256 F = Math.mulDiv(T, A, APY_PRECISION);
+        uint256 R = (F == 0) ? 0 : F / SECONDS_PER_YEAR;
+        V; // silence warning
+        return R;
+    }
+
+    function testFuzzRecomputeMatchesClosedForm(uint16 growthBPRaw, uint16 nRaw, uint128 priceSeed, uint16 apyBP)
+        public
+    {
+        // Bound inputs to realistic ranges that keep rpow(r, N, 1e18) in the
+        // uint256 range. With growthBP capped at 100 BP (1%) and N capped at
+        // 2000, r^N reaches ~(1.01)^2000 ≈ 4.4e8 (1e18 scale = ~4.4e26), well
+        // within uint256.
+        uint256 growthBP = uint256(growthBPRaw) % 101; // 0..100 BP
+        uint256 n = uint256(nRaw) % 2_000; // 0..1999
+        uint256 price = (uint256(priceSeed) % (1_000_000 ether)) + 1;
+        // apyBP 0..5000 basis points i.e. 0..50%
+        uint256 A = (uint256(apyBP) % 5001) * 1e14;
+
+        // Stand up a dedicated staker to isolate the recompute.
+        MockNFTMinter m = new MockNFTMinter();
+        m.setConfig(DISPATCHER_INDEX, address(0xBEEF), price, growthBP, false);
+        m.setTotalSupply(ID, n);
+
+        NFTStaker s = new NFTStaker(
+            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(m)), DISPATCHER_INDEX
+        );
+
+        uint256 V = 123_456 ether;
+        phUSD.mint(address(s), V);
+
+        // Setting the APY triggers _recomputeSchedule. Must not revert.
+        vm.prank(owner);
+        s.setTargetAPY(A);
+
+        uint256 expected = _closedFormRate(price, growthBP, n, A, V);
+        assertEq(s.rewardRate(), expected, "rate must match closed form");
+    }
+
+    function testFuzzRecomputeDoesNotRevertWhenVZero(uint16 growthBPRaw, uint16 nRaw, uint128 priceSeed, uint16 apyBP)
+        public
+    {
+        uint256 growthBP = uint256(growthBPRaw) % 101; // 0..100 BP
+        uint256 n = uint256(nRaw) % 2_000;
+        uint256 price = (uint256(priceSeed) % (1_000_000 ether)) + 1;
+        uint256 A = (uint256(apyBP) % 5001) * 1e14;
+
+        MockNFTMinter m = new MockNFTMinter();
+        m.setConfig(DISPATCHER_INDEX, address(0xBEEF), price, growthBP, false);
+        m.setTotalSupply(ID, n);
+
+        NFTStaker s = new NFTStaker(
+            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(m)), DISPATCHER_INDEX
+        );
+
+        // V = 0 (no balance, no hook)
+        vm.prank(owner);
+        s.setTargetAPY(A);
+        // windowEnd must equal block.timestamp (runway = 0).
+        assertEq(s.windowEnd(), block.timestamp);
+    }
+
+    // -------------------------------------------------------------------
+    // Solvency smoke — claimed + pending <= seeded budget (+ buffer)
+    // -------------------------------------------------------------------
+
     function testFuzzDepletionInvariant(
         uint64 amount0,
         uint64 amount1,
@@ -85,50 +183,37 @@ contract NFTStakerFuzzTest is Test {
 
         uint32[3] memory warps = [warp0, warp1, warp2];
 
-        // Each actor stakes an arbitrary amount, warp arbitrary time
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(stakers[i]);
             staker.stake(amounts[i]);
-            // Bound warp to keep it reasonable but able to span past windowEnd
             uint256 dt = uint256(warps[i]) % (1_000 days) + 1;
             vm.warp(block.timestamp + dt);
         }
 
-        // Each actor claims
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(stakers[i]);
             staker.claim();
         }
 
-        // Sanity warp + claim round 2
         vm.warp(block.timestamp + 30 days);
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(stakers[i]);
             staker.claim();
         }
 
-        // Sum claimed (== phUSD balance of each staker, since none was minted to them)
         uint256 totalClaimed;
         for (uint256 i = 0; i < 3; i++) {
             totalClaimed += phUSD.balanceOf(stakers[i]);
         }
 
-        // Sum pending across all three
         uint256 totalPending;
         for (uint256 i = 0; i < 3; i++) {
             totalPending += staker.pendingReward(stakers[i]);
         }
 
-        // Depletion invariant. The harness seeds a small rounding buffer on
-        // top of the scheduled budget (see setUp) to absorb floor-division
-        // drift; the invariant is correspondingly relaxed by that buffer.
-        // The meaningful assertion is that distributed-plus-pending does not
-        // exceed what was scheduled + the absorbed rounding drift.
         assertLe(totalClaimed + totalPending, initialBudget + ROUNDING_BUFFER, "depletion invariant violated");
     }
 
-    /// Tighter check: drain everyone fully (warp far past windowEnd, all
-    /// users claim, then unstake) and assert claimed total <= initialBudget.
     function testFuzzFullDrainStaysWithinBudget(uint64 amount0, uint64 amount1, uint64 amount2) public {
         uint256[3] memory amounts;
         amounts[0] = uint256(amount0) % 1_000_000 + 1;
@@ -140,10 +225,8 @@ contract NFTStakerFuzzTest is Test {
             staker.stake(amounts[i]);
         }
 
-        // Warp far past windowEnd
         vm.warp(staker.windowEnd() + 365 days);
 
-        // Each actor unstakes their full amount (which also pays pending)
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(stakers[i]);
             staker.unstake(amounts[i]);
@@ -155,8 +238,6 @@ contract NFTStakerFuzzTest is Test {
         }
 
         assertLe(totalClaimed, initialBudget + ROUNDING_BUFFER, "drained more than initial budget");
-        // Reconciliation: contract balance + distributed == initialBudget + rounding buffer.
-        // The buffer remains on the contract (no legitimate path pays it out).
         assertEq(
             phUSD.balanceOf(address(staker)) + totalClaimed,
             initialBudget + ROUNDING_BUFFER,
