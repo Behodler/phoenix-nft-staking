@@ -7,7 +7,8 @@ remappings = [
     "@openzeppelin/contracts/=lib/immutable/openzeppelin-contracts/contracts/",
     "forge-std/=lib/immutable/forge-std/src/",
     "yield-claim-nft/=lib/mutable/yield-claim-nft/src/",
-    "pauser/=lib/mutable/pauser/src/"
+    "pauser/=lib/mutable/pauser/src/",
+    "solady/=lib/immutable/solady/src/"
 ]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
