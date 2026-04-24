@@ -325,9 +325,18 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     ///                                      geometric series, avoids the
     ///                                      `r - 1 == 0` divide-by-zero).
     ///
-    ///      Every `mulDiv` floors. That bias under-states `T` slightly,
-    ///      which is the conservative direction for a reward contract;
-    ///      DO NOT flip to ceiling rounding.
+    ///      Rounding: every `mulDiv` here is the floor variant. The
+    ///      intermediate `den` floor at line 351 technically inflates the
+    ///      num/den ratio, but the outer `num.mulDiv(APY_PRECISION, den)`
+    ///      at line 352 floors the final quotient, so the net bias on `T`
+    ///      is bounded at a handful of wei below exact in expectation and
+    ///      cannot exceed exact by more than ~1 wei in any case. `F`,
+    ///      `newRate`, and `runway` all floor again downstream, each
+    ///      shaving at most 1 wei in the protocol's favour. Net effect is
+    ///      far below any economically meaningful threshold at realistic
+    ///      APYs. DO NOT flip any site to ceiling rounding — doing so on
+    ///      the rate or runway path would let users draw against rewards
+    ///      the contract has not budgeted for.
     function _recomputeSchedule() internal {
         (, uint256 price, uint256 growthBasisPoints,) = nftMinter.configs(dispatcherIndex);
         uint256 N = nftMinter.totalSupply(stakedId);
