@@ -244,4 +244,87 @@ contract NFTStakerFuzzTest is Test {
             "balance + claimed != initial + buffer"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Strong solvency invariant: balance == rewardBudget + committedDebt
+    // -------------------------------------------------------------------
+
+    function _assertSolvency() internal view {
+        assertEq(
+            phUSD.balanceOf(address(staker)),
+            staker.rewardBudget() + staker.committedDebt(),
+            "balance != rewardBudget + committedDebt"
+        );
+    }
+
+    /// @notice Drives a bounded random sequence of (stake / warp+claim /
+    ///         unstake / topUp / pullAndRefresh / setTargetAPY) per actor
+    ///         and asserts the strong invariant after every action. Audit
+    ///         M-01 fix: pre-fix the invariant only held at recompute
+    ///         boundaries; post-fix it holds always.
+    function testFuzzSolvencyInvariantHoldsAcrossRandomActions(uint256 seed) public {
+        // The setUp mints ROUNDING_BUFFER directly to the staker AFTER
+        // the topUp's recompute, so balance temporarily exceeds
+        // rewardBudget by that amount. Trigger a recompute up-front to
+        // fold the buffer into rewardBudget so the strong invariant
+        // applies from action 0.
+        vm.prank(owner);
+        staker.pullAndRefresh();
+        _assertSolvency();
+
+        uint256 actions = 32;
+        // Each staker holds 1000 NFT units to start (plus they got
+        // type(uint128).max in setUp). Use a small per-action stake to
+        // keep accruals bounded.
+        for (uint256 i = 0; i < actions; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            uint256 actor = (r >> 8) % 3;
+            uint256 op = r % 7;
+            uint256 dt = ((r >> 16) % (90 days)) + 1;
+
+            // Always advance time to exercise accrual.
+            vm.warp(block.timestamp + dt);
+
+            if (op == 0) {
+                // stake — small amount to avoid overflow with uint128 supply
+                uint256 amt = ((r >> 32) % 100) + 1;
+                vm.prank(stakers[actor]);
+                staker.stake(amt);
+            } else if (op == 1) {
+                // unstake — only if the actor has stake
+                (uint256 amt,) = staker.users(stakers[actor]);
+                if (amt > 0) {
+                    uint256 toUnstake = ((r >> 32) % amt) + 1;
+                    vm.prank(stakers[actor]);
+                    staker.unstake(toUnstake);
+                }
+            } else if (op == 2) {
+                // claim — always safe even with zero stake (no-op)
+                vm.prank(stakers[actor]);
+                staker.claim();
+            } else if (op == 3) {
+                // topUp from owner
+                uint256 amt = (((r >> 32) % 1000) + 1) * 1 ether;
+                phUSD.mint(owner, amt);
+                vm.prank(owner);
+                phUSD.approve(address(staker), amt);
+                vm.prank(owner);
+                staker.topUp(amt);
+            } else if (op == 4) {
+                // pullAndRefresh
+                vm.prank(owner);
+                staker.pullAndRefresh();
+            } else if (op == 5) {
+                // setTargetAPY — bounded to MAX_TARGET_APY
+                uint256 newAPY = ((r >> 32) % 5001) * 1e14;
+                vm.prank(owner);
+                staker.setTargetAPY(newAPY);
+            } else {
+                // op == 6: noop time advance, no action — invariant must
+                // still hold without any state change.
+            }
+
+            _assertSolvency();
+        }
+    }
 }

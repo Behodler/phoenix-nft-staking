@@ -196,24 +196,24 @@ contract NFTStakerSustainabilityTest is Test {
 
     // ---------- solvency invariant ----------
     //
-    // Under the APY-target model `rewardBudget = V` is reset at every
-    // recompute, so the `balance == rewardBudget + totalDebt` invariant
-    // only holds AT recompute boundaries. Between a recompute and the
-    // next one, `_safePay` drops balance while `rewardBudget` stays pinned
-    // to the snapshot V. What MUST hold at all times is that the contract
-    // never pays out more than balance (enforced by `_safePay`'s revert)
-    // and that `balance >= pending` for any active staker.
+    // Strong invariant under the post-M-01 model with explicit
+    // `committedDebt`: `balance == rewardBudget + committedDebt` at all
+    // times. `_updatePool` moves accrual into `committedDebt`, `_safePay`
+    // drains both `committedDebt` and balance by the paid amount, and
+    // `_recomputeSchedule` resizes `rewardBudget` to `V - committedDebt`.
     function testBalanceNeverBelowPending() public {
         vm.prank(alice);
         staker.stake(10);
+        // Strong invariant after stake.
+        assertEq(phUSD.balanceOf(address(staker)), staker.rewardBudget() + staker.committedDebt());
+
         vm.warp(block.timestamp + 12_345);
         vm.prank(alice);
         staker.claim();
 
         // After the claim there is no outstanding pending for alice.
         assertEq(staker.pendingReward(alice), 0);
-        // And the balance stayed non-negative (a no-op check enforced by
-        // _safePay but documented here).
-        assertGe(phUSD.balanceOf(address(staker)), 0);
+        // And the strong invariant still holds.
+        assertEq(phUSD.balanceOf(address(staker)), staker.rewardBudget() + staker.committedDebt());
     }
 }

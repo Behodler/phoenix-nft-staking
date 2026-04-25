@@ -88,6 +88,15 @@ contract NFTStakerFundingTest is Test {
 
     // ---------- pullAndRefresh ----------
 
+    function _assertSolvency(string memory label) internal view {
+        uint256 hookDebt = address(staker.dispatcherHook()) == address(0) ? 0 : staker.dispatcherHook().mintDebt();
+        assertEq(
+            phUSD.balanceOf(address(staker)) + hookDebt,
+            staker.rewardBudget() + staker.committedDebt(),
+            label
+        );
+    }
+
     function testNonzeroPullMaterialisesInflowAndRecomputes() public {
         uint256 inflow = 100_000 ether;
         hook.setPendingMint(inflow);
@@ -103,6 +112,7 @@ contract NFTStakerFundingTest is Test {
         assertEq(staker.rewardBudget(), inflow, "budget must equal V");
         assertEq(staker.rewardRate(), expectedRate, "rate must match closed-form");
         assertEq(staker.windowEnd(), block.timestamp + inflow / expectedRate, "windowEnd must be derived from V/R");
+        _assertSolvency("after pullAndRefresh");
     }
 
     function testZeroPullIsStillARecomputeNoInflowEvent() public {
@@ -134,6 +144,7 @@ contract NFTStakerFundingTest is Test {
         // Recompute still fires; V is unchanged so the rate is unchanged.
         assertEq(staker.rewardBudget(), budgetBefore);
         assertEq(staker.rewardRate(), rateBefore);
+        _assertSolvency("after zero-pull pullAndRefresh");
     }
 
     function testPullWithUnsetHookIsNoInflowStillRecomputes() public {
@@ -147,6 +158,7 @@ contract NFTStakerFundingTest is Test {
         assertEq(staker.rewardBudget(), 0);
         assertEq(staker.rewardRate(), expectedRate);
         assertEq(staker.windowEnd(), block.timestamp);
+        _assertSolvency("after unset-hook pullAndRefresh");
     }
 
     // ---------- topUp ----------
@@ -169,6 +181,7 @@ contract NFTStakerFundingTest is Test {
         assertEq(staker.rewardRate(), expectedRate, "rate is APY-driven, independent of topUp size");
         assertEq(staker.windowEnd(), block.timestamp + amount / expectedRate, "windowEnd must be derived from V/R");
         assertEq(phUSD.balanceOf(address(staker)), amount);
+        _assertSolvency("after topUp");
     }
 
     function testTopUpRejectsZero() public {

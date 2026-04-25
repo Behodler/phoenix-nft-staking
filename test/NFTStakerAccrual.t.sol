@@ -266,4 +266,60 @@ contract NFTStakerAccrualTest is Test {
         vm.prank(alice);
         staker.claim();
     }
+
+    // ---------- strong solvency invariant across full accrual cycle ----------
+
+    function _assertSolvency(string memory label) internal view {
+        assertEq(
+            phUSD.balanceOf(address(staker)),
+            staker.rewardBudget() + staker.committedDebt(),
+            label
+        );
+    }
+
+    /// @notice Drives a multi-staker accrual cycle (stake → warp → claim →
+    ///         additional stake → unstake → restake) and confirms the strong
+    ///         invariant `balance == rewardBudget + committedDebt` after
+    ///         each step. Pins the M-01 fix: the prior bug allowed a state
+    ///         where balance < rewardBudget + totalDebt between recomputes,
+    ///         DoS'ing late claimers.
+    function testSolvencyInvariantAcrossAccrualCycle() public {
+        _assertSolvency("baseline");
+
+        vm.prank(alice);
+        staker.stake(10);
+        _assertSolvency("alice stake");
+
+        vm.warp(block.timestamp + 30 days);
+        vm.prank(bob);
+        staker.stake(20);
+        _assertSolvency("bob stake (recompute)");
+
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(alice);
+        staker.claim();
+        _assertSolvency("alice claim");
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(alice);
+        staker.unstake(5);
+        _assertSolvency("alice unstake (partial)");
+
+        vm.prank(alice);
+        staker.stake(15);
+        _assertSolvency("alice restake");
+
+        vm.warp(block.timestamp + 30 days);
+        vm.prank(bob);
+        staker.claim();
+        _assertSolvency("bob claim");
+
+        vm.prank(alice);
+        staker.unstake(20);
+        _assertSolvency("alice full unstake");
+
+        vm.prank(bob);
+        staker.unstake(20);
+        _assertSolvency("bob full unstake");
+    }
 }
