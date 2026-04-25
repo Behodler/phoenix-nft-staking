@@ -100,9 +100,19 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     uint256 public rewardRate;
 
     /// @notice Value budgeted for the current schedule, equal to
-    ///         `V = balance + mintDebt` at the most recent recompute (after
-    ///         any pull). Decreases as `_updatePool` settles accrual.
+    ///         `V - committedDebt` at the most recent recompute (where
+    ///         `V = balance + mintDebt`). Decreases as `_updatePool`
+    ///         settles accrual.
     uint256 public rewardBudget;
+
+    /// @notice Per-share-baked, unpaid emissions: the cumulative phUSD that
+    ///         `_updatePool` has moved from `rewardBudget` into
+    ///         `accRewardPerShare`, minus the cumulative phUSD that
+    ///         `_safePay` has actually paid out. Maintained as O(1) state to
+    ///         preserve the strong invariant
+    ///         `balance == rewardBudget + committedDebt` at all times — see
+    ///         `CLAUDE.md` ("Solvency (always)") and audit fix M-01.
+    uint256 public committedDebt;
 
     // ---------------------------------------------------------------------
     // Accrual state
@@ -285,9 +295,11 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     /// @dev Settles per-share accrual from `lastRewardTime` up to
-    ///      `min(now, windowEnd)` under the current `rewardRate`.
-    ///      Decrements `rewardBudget` by the amount accrued and clamps to
-    ///      `rewardBudget` to guarantee clean depletion.
+    ///      `min(now, windowEnd)` under the current `rewardRate`. Moves the
+    ///      accrued amount out of `rewardBudget` and into `committedDebt`
+    ///      (preserving `balance == rewardBudget + committedDebt`), then
+    ///      bakes it into `accRewardPerShare`. Clamps the move to the
+    ///      remaining `rewardBudget` to guarantee clean depletion.
     function _updatePool() internal {
         if (block.timestamp <= lastRewardTime) return;
         if (totalStaked == 0) {
@@ -300,6 +312,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         if (reward > rewardBudget) reward = rewardBudget;
         if (reward > 0) {
             rewardBudget -= reward;
+            committedDebt += reward;
             accRewardPerShare += (reward * ACC_PRECISION) / totalStaked;
         }
         lastRewardTime = block.timestamp;
@@ -367,15 +380,23 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
             V += dispatcherHook.mintDebt();
         }
 
+        // Strip already-committed accrual from V before sizing the next
+        // budget. This is the M-01 fix: re-using V here over-promised by
+        // the amount `_updatePool` had just moved into `accRewardPerShare`,
+        // DoSing late claimers via `_safePay` shortfalls. Clamp at zero to
+        // keep recompute non-reverting if hook misbehaviour ever drives V
+        // below committedDebt (principal escape via emergencyWithdraw).
+        uint256 budget = V > committedDebt ? V - committedDebt : 0;
+
         uint256 F = T.mulDiv(targetAPY, APY_PRECISION);
         uint256 newRate = (F == 0) ? 0 : F / SECONDS_PER_YEAR;
-        uint256 runway = (newRate == 0) ? 0 : V / newRate;
+        uint256 runway = (newRate == 0) ? 0 : budget / newRate;
 
         rewardRate = newRate;
-        rewardBudget = V;
+        rewardBudget = budget;
         windowEnd = block.timestamp + runway;
 
-        emit ScheduleRecomputed(T, V, newRate, windowEnd);
+        emit ScheduleRecomputed(T, budget, newRate, windowEnd);
     }
 
     // ---------------------------------------------------------------------
@@ -429,17 +450,34 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     }
 
     /// @dev Transfers `amount` of rewardToken to msg.sender. Reverts if the
-    ///      on-chain balance is insufficient. `_syncBudget` is always
-    ///      called upstream of every payout path, so any remaining shortfall
-    ///      at this point is a genuine liquidity gap. Reverting here
-    ///      prevents silent forfeiture of earned rewards (audit M-01).
-    ///      `balance == rewardBudget + totalDebt` is the post-recompute
-    ///      invariant; between recomputes `_updatePool` decrements
-    ///      `rewardBudget` while balance stays constant modulo `_safePay`s.
+    ///      on-chain balance is insufficient (no silent forfeiture). After
+    ///      the transfer succeeds, decrement `(committedDebt + rewardBudget)`
+    ///      by `amount` to preserve the strong invariant
+    ///      `balance == rewardBudget + committedDebt` — balance drops by
+    ///      `amount`, so the sum on the right must drop by the same.
+    ///
+    ///      In the common path, all of `amount` comes out of `committedDebt`
+    ///      because `accRewardPerShare`-derived `pending` is fully baked in
+    ///      by the upstream `_updatePool`. In the floor-division dust case,
+    ///      per-user `pending` (computed via two separate floor operations
+    ///      on `user.amount * acc / ACC_PRECISION`) can marginally exceed
+    ///      the cumulative reward `_updatePool` moved into `committedDebt`
+    ///      — at most ~1 wei per claim per user. The `if (amount >
+    ///      committedDebt)` branch absorbs that excess from `rewardBudget`,
+    ///      which is safe because the `balance >= amount` precondition
+    ///      together with the invariant guarantees `rewardBudget +
+    ///      committedDebt >= amount`. The shortfall revert path on a
+    ///      genuine balance gap is unchanged.
     function _safePay(uint256 amount) internal returns (uint256) {
         require(rewardToken.balanceOf(address(this)) >= amount, "NFTStaker: insufficient reward balance");
         if (amount > 0) {
             rewardToken.safeTransfer(msg.sender, amount);
+            if (amount > committedDebt) {
+                rewardBudget -= (amount - committedDebt);
+                committedDebt = 0;
+            } else {
+                committedDebt -= amount;
+            }
         }
         return amount;
     }
@@ -449,13 +487,37 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     ///         paused and does NOT call `_syncBudget` / `_updatePool`, so
     ///         a broken dispatcher hook, NFT minter, or recompute path can
     ///         never trap principal. Standard masterchef escape hatch.
+    ///
+    ///         Forfeited rewards: the user's pending against the CURRENT
+    ///         `accRewardPerShare` (i.e. their share of already-committed
+    ///         debt) is decremented from `committedDebt`. In-flight accrual
+    ///         since the last `_updatePool` is not yet reflected in
+    ///         `accRewardPerShare`, so it is not subtracted here — it stays
+    ///         in `rewardBudget` and is recycled into the next recompute,
+    ///         which is the correct behaviour. This preserves the strong
+    ///         invariant `balance == rewardBudget + committedDebt` after
+    ///         the call.
     function emergencyWithdraw() external nonReentrant {
         UserInfo storage user = users[msg.sender];
         uint256 amount = user.amount;
         require(amount > 0, "NFTStaker: nothing to withdraw");
+        uint256 pending = (amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
         user.amount = 0;
         user.rewardDebt = 0;
         totalStaked -= amount;
+        if (pending > 0) {
+            // Bound by the current `committedDebt` to absorb any
+            // floor-division dust where the user's accumulated pending
+            // marginally exceeds the cumulative committed total. Forfeited
+            // phUSD stays in the contract balance, so to preserve the
+            // strong invariant `balance == rewardBudget + committedDebt`
+            // it must be reabsorbed into the rewardBudget pool — it then
+            // recycles into the next recompute as fresh runway for
+            // surviving stakers.
+            uint256 forfeit = pending > committedDebt ? committedDebt : pending;
+            committedDebt -= forfeit;
+            rewardBudget += forfeit;
+        }
         stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
         emit EmergencyWithdrawn(msg.sender, amount);
     }
@@ -484,22 +546,22 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         return rewardRate;
     }
 
-    /// @notice Tokens currently owed to stakers: accrued but unclaimed
-    ///         rewards including in-flight accrual since `lastRewardTime`.
-    ///         Derived from `balance == rewardBudget + totalDebt` (holds
-    ///         at recompute boundaries; between recomputes `_updatePool`
-    ///         decrements `rewardBudget` while balance is static).
+    /// @notice Tokens currently owed to stakers: cumulative accrued-and-
+    ///         unpaid rewards (`committedDebt`) plus in-flight accrual since
+    ///         the last `_updatePool` boundary. Reads `committedDebt`
+    ///         directly — the strong invariant
+    ///         `balance == rewardBudget + committedDebt` makes this an O(1)
+    ///         passthrough plus a forward simulation of the next
+    ///         `_updatePool` call.
     function totalDebt() external view returns (uint256) {
-        uint256 budget = rewardBudget;
-        if (block.timestamp > lastRewardTime && totalStaked > 0) {
-            uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
-            uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
-            uint256 reward = elapsed * rewardRate;
-            if (reward > budget) reward = budget;
-            budget -= reward;
+        if (block.timestamp <= lastRewardTime || totalStaked == 0) {
+            return committedDebt;
         }
-        uint256 balance = rewardToken.balanceOf(address(this));
-        return balance > budget ? balance - budget : 0;
+        uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
+        uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
+        uint256 reward = elapsed * rewardRate;
+        if (reward > rewardBudget) reward = rewardBudget;
+        return committedDebt + reward;
     }
 
     /// @notice All phUSD the pool controls: held balance plus pending mint
