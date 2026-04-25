@@ -90,11 +90,7 @@ contract NFTStakerFundingTest is Test {
 
     function _assertSolvency(string memory label) internal view {
         uint256 hookDebt = address(staker.dispatcherHook()) == address(0) ? 0 : staker.dispatcherHook().mintDebt();
-        assertEq(
-            phUSD.balanceOf(address(staker)) + hookDebt,
-            staker.rewardBudget() + staker.committedDebt(),
-            label
-        );
+        assertEq(phUSD.balanceOf(address(staker)) + hookDebt, staker.rewardBudget() + staker.committedDebt(), label);
     }
 
     function testNonzeroPullMaterialisesInflowAndRecomputes() public {

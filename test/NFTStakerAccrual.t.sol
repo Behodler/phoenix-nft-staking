@@ -270,11 +270,7 @@ contract NFTStakerAccrualTest is Test {
     // ---------- strong solvency invariant across full accrual cycle ----------
 
     function _assertSolvency(string memory label) internal view {
-        assertEq(
-            phUSD.balanceOf(address(staker)),
-            staker.rewardBudget() + staker.committedDebt(),
-            label
-        );
+        assertEq(phUSD.balanceOf(address(staker)), staker.rewardBudget() + staker.committedDebt(), label);
     }
 
     /// @notice Drives a multi-staker accrual cycle (stake → warp → claim →
