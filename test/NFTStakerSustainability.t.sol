@@ -305,7 +305,9 @@ contract NFTStakerSustainabilityTest is Test {
         // Effective APY = (reward / stakedValue) * (365 days / 1 day)
         // Should be ~ 0.5e18 (50%), NOT ~ 50e18 (5000%).
         uint256 effectiveAPY = (actualReward * 1e18 * 365 days) / (stakedValue * 1 days);
-        assertApproxEqRel(effectiveAPY, 0.5e18, 0.001e18, "effective APY must equal target, no participation multiplier");
+        assertApproxEqRel(
+            effectiveAPY, 0.5e18, 0.001e18, "effective APY must equal target, no participation multiplier"
+        );
     }
 
     function test_M03_LowParticipationDoesNotInflateAPYWithGrowth() public {

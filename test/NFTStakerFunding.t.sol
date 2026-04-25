@@ -297,7 +297,9 @@ contract NFTStakerFundingTest is Test {
         vm.prank(alice);
         staker.unstake(10);
         uint256 rateAfter3 = staker.rewardRate();
-        assertEq(rateAfter3, _expectedRate(10, 100 ether, 1, 0.3e18), "R after unstake(10) must size for totalStaked=10");
+        assertEq(
+            rateAfter3, _expectedRate(10, 100 ether, 1, 0.3e18), "R after unstake(10) must size for totalStaked=10"
+        );
         assertApproxEqAbs(rateAfter3, rateAfter1, 2, "R must return to the pre-stake level");
     }
 
