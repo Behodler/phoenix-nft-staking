@@ -9,7 +9,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {IPausable} from "pauser/interfaces/IPausable.sol";
 import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
 import {INFTSupply} from "./INFTSupply.sol";
@@ -18,10 +17,15 @@ import {INFTSupply} from "./INFTSupply.sol";
 /// @notice Masterchef-style staking pool for a single ERC1155 token ID.
 ///         Stakers deposit ERC1155 units of `stakedId` and earn per-second
 ///         emissions of `rewardToken` (phUSD). The emission schedule is
-///         derived from an owner-set `targetAPY` and the live aggregate
-///         NFT value read from `nftMinter`; the runway (time until
-///         depletion) is a derived quantity `V / F` rather than a fixed
-///         knob. See the parent CLAUDE.md and
+///         derived from an owner-set `targetAPY` and the staked-subset
+///         notional `S = totalStaked * latestPrice` (where `latestPrice`
+///         is the most-recent paid mint price); the runway (time until
+///         depletion) is a derived quantity `V / R` rather than a fixed
+///         knob. Sizing the rate against the staked subset (rather than
+///         the aggregate notional of every minted NFT) closes audit
+///         finding M-03: a lone staker among many minters earns at most
+///         `targetAPY` for their NFT, never `N * targetAPY`. See the
+///         parent CLAUDE.md and
 ///         `scratchpad/planning-docs/phoenix/phase2/nft-staking/variable-runway.md`
 ///         for the full design.
 contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausable {
@@ -83,8 +87,11 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     ///         calculation. Owner-settable only when `totalStaked == 0`.
     uint256 public dispatcherIndex;
 
-    /// @notice 1e18-scaled target annual percentage yield for the average
-    ///         NFT. `0.3e18` = 30% APY. Bounded by `MAX_TARGET_APY`.
+    /// @notice 1e18-scaled target annual percentage yield for the latest
+    ///         minter (the staker who paid `latestPrice`). Earlier minters
+    ///         paid less than `latestPrice` and earn proportionally more —
+    ///         see the "APY-as-floor for latest minter" invariant in
+    ///         CLAUDE.md. `0.3e18` = 30%. Bounded by `MAX_TARGET_APY`.
     uint256 public targetAPY;
 
     // ---------------------------------------------------------------------
@@ -96,7 +103,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     uint256 public windowEnd;
 
     /// @notice Per-second phUSD emissions. Recomputed from
-    ///         `T * targetAPY / SECONDS_PER_YEAR` on every interaction.
+    ///         `S * targetAPY / SECONDS_PER_YEAR` on every interaction,
+    ///         where `S = totalStaked * latestPrice` is the staked-subset
+    ///         notional valued at the most-recent paid mint price.
     uint256 public rewardRate;
 
     /// @notice Value budgeted for the current schedule, equal to
@@ -153,9 +162,17 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     event DispatcherIndexChanged(uint256 previous, uint256 next);
     event NFTMinterChanged(address indexed previous, address indexed next);
     /// @dev Emitted whenever `_recomputeSchedule` runs. Fields are the
-    ///      closed-form T (aggregate NFT value), V (available value incl.
-    ///      pending mint debt), the new per-second rate, and the derived
-    ///      windowEnd timestamp.
+    ///      staked-subset notional `S = totalStaked * latestPrice` (the
+    ///      basis the rate is sized against, post-audit M-03), the
+    ///      `availableValue` available for emissions (`V - committedDebt`,
+    ///      i.e. the budget left after accounting for already-committed
+    ///      accrual per audit M-01), the new per-second rate, and the
+    ///      derived windowEnd timestamp.
+    ///      NOTE: the first field name (`totalNFTValue`) is preserved
+    ///      from the pre-M-03 schema to minimise off-chain consumer
+    ///      churn, but the value's MEANING shifted: pre-M-03 it carried
+    ///      the aggregate notional `T` of all minted NFTs; post-M-03 it
+    ///      carries the staked-subset notional `S`.
     event ScheduleRecomputed(uint256 totalNFTValue, uint256 availableValue, uint256 newRate, uint256 newWindowEnd);
 
     // ---------------------------------------------------------------------
@@ -323,57 +340,65 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
     ///      `rewardRate`, `rewardBudget`, `windowEnd` per the APY target.
     ///
     ///      Math (all values in 1e18 fp unless noted):
-    ///        r          = 1 + growthBasisPoints / 10_000
+    ///        r           = 1 + growthBasisPoints / 10_000
     ///        latestPrice = price / r
-    ///        T          = latestPrice * (r^N - 1) / (r^(N-1) * (r - 1))
-    ///        V          = balance + mintDebt
-    ///        F          = T * targetAPY
-    ///        R          = F / SECONDS_PER_YEAR
-    ///        runway     = V / R        (seconds)
+    ///        S           = totalStaked * latestPrice           // staked subset
+    ///        V           = balance + mintDebt
+    ///        budget      = V - committedDebt                   // M-01
+    ///        F           = S * targetAPY
+    ///        R           = F / SECONDS_PER_YEAR
+    ///        runway      = budget / R                          (seconds)
+    ///
+    ///      Audit M-03: the rate is sized against the staked subset
+    ///      `S = totalStaked * latestPrice` rather than the aggregate
+    ///      notional of every minted NFT. This eliminates the
+    ///      `effectiveAPY = targetAPY * (N / totalStaked)` participation
+    ///      multiplier the audit flagged: per-NFT emissions = latestPrice
+    ///      * targetAPY / SECONDS_PER_YEAR, the latest minter (paid
+    ///      `latestPrice`) earns exactly `targetAPY`, and earlier minters
+    ///      earn `targetAPY * (latestPrice / theirMintPrice) > targetAPY`.
+    ///
+    ///      `latestPrice` recovery: `nftMinter.configs(dispatcherIndex)`
+    ///      returns the NEXT mint price (`price`); after each mint the
+    ///      contract scales it up by `r`, so the most-recent paid price
+    ///      is `price / r`. With `growthBasisPoints == 0` this collapses
+    ///      to `latestPrice = price`.
     ///
     ///      Edge cases:
-    ///        N == 0 or targetAPY == 0     -> rate 0, windowEnd = now.
-    ///        N == 1                      -> T = latestPrice exactly.
-    ///        growthBasisPoints == 0      -> T = latestPrice * N (no
-    ///                                      geometric series, avoids the
-    ///                                      `r - 1 == 0` divide-by-zero).
+    ///        totalStaked == 0 || price == 0 || targetAPY == 0
+    ///                                      -> rate 0, windowEnd = now.
+    ///        growthBasisPoints == 0        -> latestPrice = price (no
+    ///                                         geometric scaling).
     ///
-    ///      Rounding: every `mulDiv` here is the floor variant. The
-    ///      intermediate `den` floor at line 351 technically inflates the
-    ///      num/den ratio, but the outer `num.mulDiv(APY_PRECISION, den)`
-    ///      at line 352 floors the final quotient, so the net bias on `T`
-    ///      is bounded at a handful of wei below exact in expectation and
-    ///      cannot exceed exact by more than ~1 wei in any case. `F`,
-    ///      `newRate`, and `runway` all floor again downstream, each
-    ///      shaving at most 1 wei in the protocol's favour. Net effect is
-    ///      far below any economically meaningful threshold at realistic
-    ///      APYs. DO NOT flip any site to ceiling rounding — doing so on
-    ///      the rate or runway path would let users draw against rewards
-    ///      the contract has not budgeted for.
+    ///      `totalStaked * latestPrice` overflow: `totalStaked` is bounded
+    ///      by realistic ERC1155 supply (≤ 1e6 in practice); `latestPrice`
+    ///      is wei-scaled mint price (~1e21 for typical configs). Product
+    ///      ≤ ~1e27, comfortably below 2^256.
+    ///
+    ///      Rounding: the single `latestPrice = price.mulDiv(1e18, r)`
+    ///      floor is the only non-bare-multiply path; `F`, `newRate`, and
+    ///      `runway` floor again downstream, each shaving at most 1 wei in
+    ///      the protocol's favour. Net bias on `R` is a handful of wei
+    ///      below exact in expectation. DO NOT flip any site to ceiling
+    ///      rounding — doing so on the rate or runway path would let users
+    ///      draw against rewards the contract has not budgeted for.
     function _recomputeSchedule() internal {
         (, uint256 price, uint256 growthBasisPoints,) = nftMinter.configs(dispatcherIndex);
-        uint256 N = nftMinter.totalSupply(stakedId);
 
-        uint256 T;
-        if (N == 0 || price == 0) {
-            T = 0;
+        uint256 latestPrice;
+        if (price == 0) {
+            latestPrice = 0;
         } else if (growthBasisPoints == 0) {
-            // No geometric growth — uniform price.
-            T = price * N;
+            latestPrice = price;
         } else {
             uint256 r = APY_PRECISION + growthBasisPoints * 1e14;
-            uint256 latestPrice = price.mulDiv(APY_PRECISION, r);
-            if (N == 1) {
-                T = latestPrice;
-            } else {
-                uint256 rPowN = FixedPointMathLib.rpow(r, N, APY_PRECISION);
-                uint256 rPowNm1 = FixedPointMathLib.rpow(r, N - 1, APY_PRECISION);
-                uint256 rMinusOne = r - APY_PRECISION;
-                uint256 num = latestPrice.mulDiv(rPowN - APY_PRECISION, APY_PRECISION);
-                uint256 den = rPowNm1.mulDiv(rMinusOne, APY_PRECISION);
-                T = num.mulDiv(APY_PRECISION, den);
-            }
+            latestPrice = price.mulDiv(APY_PRECISION, r);
         }
+
+        // M-03: size the rate against the staked subset, not the aggregate
+        // notional of all minted NFTs. Bare multiplication is exact and
+        // cheaper than a mulDiv; the bound argument lives in the NatSpec.
+        uint256 S = (totalStaked == 0 || latestPrice == 0) ? 0 : totalStaked * latestPrice;
 
         uint256 V = rewardToken.balanceOf(address(this));
         if (address(dispatcherHook) != address(0)) {
@@ -388,7 +413,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         // below committedDebt (principal escape via emergencyWithdraw).
         uint256 budget = V > committedDebt ? V - committedDebt : 0;
 
-        uint256 F = T.mulDiv(targetAPY, APY_PRECISION);
+        uint256 F = S.mulDiv(targetAPY, APY_PRECISION);
         uint256 newRate = (F == 0) ? 0 : F / SECONDS_PER_YEAR;
         uint256 runway = (newRate == 0) ? 0 : budget / newRate;
 
@@ -396,7 +421,7 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         rewardBudget = budget;
         windowEnd = block.timestamp + runway;
 
-        emit ScheduleRecomputed(T, budget, newRate, windowEnd);
+        emit ScheduleRecomputed(S, budget, newRate, windowEnd);
     }
 
     // ---------------------------------------------------------------------
@@ -405,6 +430,9 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
 
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero stake");
+        // Head: settle accrual at the OLD rate against the OLD totalStaked
+        // (preserves "late stakers never get retroactive rewards"). Sweeps
+        // mint debt and recomputes too; we re-recompute at the tail.
         _syncBudget();
         UserInfo storage user = users[msg.sender];
         if (user.amount > 0) {
@@ -419,6 +447,12 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         totalStaked += amount;
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
         emit Staked(msg.sender, amount);
+        // Tail (audit M-03): R scales linearly with `totalStaked`, so re-
+        // size R against the post-mutation pool. No `_syncBudget` here:
+        // no time has elapsed since the head and `mintDebt` cannot change
+        // mid-call, so a bare `_recomputeSchedule` suffices and avoids
+        // a second `pull()` round-trip.
+        _recomputeSchedule();
     }
 
     function unstake(uint256 amount) external nonReentrant whenNotPaused {
@@ -436,6 +470,10 @@ contract NFTStaker is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausab
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
         stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
         emit Unstaked(msg.sender, amount);
+        // Tail (audit M-03): see `stake` rationale. Without this, an
+        // unstake leaves R sized for the OLD larger pool and the
+        // remaining stakers over-collect until the next interaction.
+        _recomputeSchedule();
     }
 
     function claim() external nonReentrant whenNotPaused {

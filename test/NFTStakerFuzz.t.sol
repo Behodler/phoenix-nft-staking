@@ -127,8 +127,10 @@ contract NFTStakerFuzzTest is Test {
         phUSD.mint(address(s), V);
 
         // Stake `toStake` to make S non-zero. Use a fresh staker actor
-        // and mint enough NFTs to it; reuse stakers[0] is fine.
+        // and mint + approve on the per-test staker `s`.
         nft.mint(stakers[0], ID, toStake);
+        vm.prank(stakers[0]);
+        nft.setApprovalForAll(address(s), true);
         vm.prank(stakers[0]);
         s.stake(toStake);
 
@@ -161,6 +163,8 @@ contract NFTStakerFuzzTest is Test {
 
         // No V. Stake to make totalStaked non-zero.
         nft.mint(stakers[0], ID, toStake);
+        vm.prank(stakers[0]);
+        nft.setApprovalForAll(address(s), true);
         vm.prank(stakers[0]);
         s.stake(toStake);
 
