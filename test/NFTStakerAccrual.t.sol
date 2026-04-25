@@ -22,7 +22,6 @@ contract NFTStakerAccrualTest is Test {
 
     uint256 internal constant ID = 1;
     uint256 internal constant DISPATCHER_INDEX = 1;
-    uint256 internal rate;
 
     function setUp() public {
         nft = new MockERC1155();
@@ -30,7 +29,7 @@ contract NFTStakerAccrualTest is Test {
         nftMinter = new MockNFTMinter();
         // Uniform price for clean per-second rate.
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 0, false);
-        nftMinter.setTotalSupply(ID, 100); // T = 100 * 100e18
+        nftMinter.setTotalSupply(ID, 100);
 
         staker = new NFTStaker(
             IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(nftMinter)), DISPATCHER_INDEX
@@ -44,12 +43,11 @@ contract NFTStakerAccrualTest is Test {
         vm.prank(owner);
         staker.topUp(seed);
 
-        // 30% APY on T=10_000 ether -> R = 3000e18 / SECONDS_PER_YEAR
+        // 30% APY; rate is sized against totalStaked (post-M-03), so each
+        // test computes its expected per-second rate after its stake-up
+        // has settled.
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
-
-        rate = staker.rewardRate();
-        assertGt(rate, 0);
 
         nft.mint(alice, ID, 1_000);
         nft.mint(bob, ID, 1_000);
@@ -64,6 +62,8 @@ contract NFTStakerAccrualTest is Test {
     function testSingleStakerAccruesAtRateTimesElapsed() public {
         vm.prank(alice);
         staker.stake(10);
+        uint256 rate = staker.rewardRate();
+        assertGt(rate, 0);
 
         assertEq(staker.pendingReward(alice), 0);
 
@@ -74,6 +74,7 @@ contract NFTStakerAccrualTest is Test {
     function testClaimTransfersExactPendingAndZeroes() public {
         vm.prank(alice);
         staker.stake(10);
+        uint256 rate = staker.rewardRate();
 
         vm.warp(block.timestamp + 50);
         uint256 expected = rate * 50;
@@ -92,14 +93,19 @@ contract NFTStakerAccrualTest is Test {
     function testTwoEqualStakersSplit5050() public {
         vm.prank(alice);
         staker.stake(10);
+        // Bob's stake re-sizes R for totalStaked=20. To pin a clean
+        // expected accrual, snapshot the rate AFTER both stakes are in
+        // place, then warp.
         vm.prank(bob);
         staker.stake(10);
 
+        uint256 rate = staker.rewardRate();
         vm.warp(block.timestamp + 100);
 
         uint256 total = rate * 100;
-        assertEq(staker.pendingReward(alice), total / 2);
-        assertEq(staker.pendingReward(bob), total / 2);
+        // Floor-division can drop a wei from each share.
+        assertApproxEqAbs(staker.pendingReward(alice), total / 2, 1);
+        assertApproxEqAbs(staker.pendingReward(bob), total / 2, 1);
     }
 
     // ---------- staker B joins halfway ----------
@@ -107,17 +113,24 @@ contract NFTStakerAccrualTest is Test {
     function testStakerJoiningHalfwayDoesNotGetRetroactiveRewards() public {
         vm.prank(alice);
         staker.stake(10);
+        uint256 rateAlone = staker.rewardRate();
 
         vm.warp(block.timestamp + 100);
-        assertEq(staker.pendingReward(alice), rate * 100);
+        assertEq(staker.pendingReward(alice), rateAlone * 100, "alice must accrue at the alone-rate");
 
         vm.prank(bob);
         staker.stake(10);
-        assertEq(staker.pendingReward(bob), 0);
+        // Tail recompute fired — totalStaked doubled so R doubled too.
+        uint256 rateShared = staker.rewardRate();
+        assertEq(staker.pendingReward(bob), 0, "bob has no retroactive rewards");
 
         vm.warp(block.timestamp + 100);
-        assertEq(staker.pendingReward(alice), rate * 150);
-        assertEq(staker.pendingReward(bob), rate * 50);
+        // After 100s at rateShared, the per-second emissions are split
+        // 50/50 between alice and bob. Alice's pending grows by
+        // rateShared * 100 / 2; bob accrues rateShared * 100 / 2.
+        // Floor-division can drop a wei from each share.
+        assertApproxEqAbs(staker.pendingReward(alice), rateAlone * 100 + rateShared * 100 / 2, 1);
+        assertApproxEqAbs(staker.pendingReward(bob), rateShared * 100 / 2, 1);
     }
 
     // ---------- emissions stop past windowEnd ----------
@@ -135,6 +148,8 @@ contract NFTStakerAccrualTest is Test {
     }
 
     function testCurrentRewardRateZeroAfterWindowEnd() public {
+        vm.prank(alice);
+        staker.stake(10);
         assertEq(staker.currentRewardRate(), staker.rewardRate());
 
         vm.warp(staker.windowEnd());
@@ -149,9 +164,9 @@ contract NFTStakerAccrualTest is Test {
     function testAccrualSurvivesAPYDropMidWindow() public {
         vm.prank(alice);
         staker.stake(10);
+        uint256 oldRate = staker.rewardRate();
 
         vm.warp(block.timestamp + 50);
-        uint256 oldRate = staker.rewardRate();
         uint256 oldAccrual = oldRate * 50;
 
         // Halve APY -> rate halves; old accrual must be preserved.
@@ -172,9 +187,10 @@ contract NFTStakerAccrualTest is Test {
     // ---------- budget exhaustion ----------
 
     function testBudgetExhaustionStopsEmissionsBeforeRecompute() public {
-        uint256 stakeAt = block.timestamp;
         vm.prank(alice);
         staker.stake(10);
+        uint256 stakeAt = block.timestamp;
+        uint256 rate = staker.rewardRate();
 
         // Warp past windowEnd. Before any interaction triggers a
         // recompute, pendingReward must reflect the cap at windowEnd.
@@ -196,6 +212,7 @@ contract NFTStakerAccrualTest is Test {
     function testUnstakeReturnsPrincipalAndPaysPending() public {
         vm.prank(alice);
         staker.stake(10);
+        uint256 rate = staker.rewardRate();
 
         vm.warp(block.timestamp + 50);
 
@@ -260,6 +277,7 @@ contract NFTStakerAccrualTest is Test {
     function testClaimEmitsClaimedEventWhenNonZero() public {
         vm.prank(alice);
         staker.stake(5);
+        uint256 rate = staker.rewardRate();
         vm.warp(block.timestamp + 10);
         vm.expectEmit(true, true, true, true, address(staker));
         emit Claimed(alice, rate * 10);

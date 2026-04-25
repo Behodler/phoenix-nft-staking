@@ -53,8 +53,6 @@ contract NFTStakerSafePayTest is Test {
 
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
-        rate = staker.rewardRate();
-        assertGt(rate, 0);
 
         nft.mint(alice, ID, 1_000);
         nft.mint(bob, ID, 1_000);
@@ -62,6 +60,20 @@ contract NFTStakerSafePayTest is Test {
         nft.setApprovalForAll(address(staker), true);
         vm.prank(bob);
         nft.setApprovalForAll(address(staker), true);
+
+        // Under M-03 sizing R = totalStaked * latestPrice * A /
+        // SECONDS_PER_YEAR. Pin a "single-staker rate" by pre-staking 10
+        // units from a seed actor; tests then read `rate` post-stake when
+        // they are the only additional participant or compute a share-
+        // weighted expected accrual themselves.
+        address seedStaker = address(0xCAFE);
+        nft.mint(seedStaker, ID, 10);
+        vm.prank(seedStaker);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(seedStaker);
+        staker.stake(10);
+        rate = staker.rewardRate();
+        assertGt(rate, 0);
     }
 
     // -------------------------------------------------------------------

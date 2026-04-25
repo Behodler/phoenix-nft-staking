@@ -56,19 +56,33 @@ contract NFTStakerPullIntegrationTest is Test {
         nft.setApprovalForAll(address(staker), true);
         vm.prank(bob);
         nft.setApprovalForAll(address(staker), true);
+
+        // Under M-03 sizing R = totalStaked * latestPrice * A /
+        // SECONDS_PER_YEAR. Pre-stake a baseline so subsequent test
+        // logic that reads rewardRate() pre-test-stake observes a
+        // non-zero rate. Use a separate "seed" actor so alice/bob keep
+        // pristine balances for their own per-test stake mutations.
+        address seedStaker = address(0xCAFE);
+        nft.mint(seedStaker, ID, 100);
+        vm.prank(seedStaker);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(seedStaker);
+        staker.stake(100);
     }
 
     /// Pull lands new budget BEFORE the new staker's rewardDebt is set. The
-    /// new budget must not retroactively reward the staker for time before
-    /// they joined. Under the APY-target model, rate is constant in T/A —
-    /// V growth only extends runway; it does not retroactively reward.
+    /// new budget must not retroactively reward an incoming staker for
+    /// time before they joined. Under the APY-target model with M-03
+    /// sizing, V growth (via pull) only extends runway and does not
+    /// retroactively bump alice's share.
     function testStakeAfterPullDoesNotRetroactivelyReward() public {
         vm.prank(alice);
         staker.stake(10);
+        // alice owns 10 / (100 + 10) of total stake.
 
         vm.warp(block.timestamp + 50);
         uint256 alicePendingBefore = staker.pendingReward(alice);
-        assertEq(alicePendingBefore, staker.rewardRate() * 50);
+        assertGt(alicePendingBefore, 0, "alice must have accrued");
 
         // New mint debt becomes available.
         hook.setPendingMint(100_000 ether);
@@ -85,15 +99,19 @@ contract NFTStakerPullIntegrationTest is Test {
     function testStakeWithZeroHookDebtBehavesLikeNoInflow() public {
         uint256 rateBefore = staker.rewardRate();
         uint256 budgetBefore = staker.rewardBudget();
+        uint256 stakedBefore = staker.totalStaked();
 
         hook.setPendingMint(0);
 
         vm.prank(alice);
         staker.stake(5);
 
-        // Rate is APY-driven at constant T so it does not move.
-        assertEq(staker.rewardRate(), rateBefore);
-        // V unchanged -> budget unchanged.
+        // Under M-03 sizing R = totalStaked * latestPrice * A /
+        // SECONDS_PER_YEAR. A stake of 5 with no hook inflow grows
+        // totalStaked from `stakedBefore` to `stakedBefore + 5` and the
+        // rate scales accordingly. V is unchanged so budget is unchanged.
+        uint256 expectedRate = rateBefore * (stakedBefore + 5) / stakedBefore;
+        assertApproxEqAbs(staker.rewardRate(), expectedRate, 1);
         assertEq(staker.rewardBudget(), budgetBefore);
     }
 
@@ -104,8 +122,8 @@ contract NFTStakerPullIntegrationTest is Test {
         vm.warp(block.timestamp + 100);
 
         uint256 oldRate = staker.rewardRate();
-        uint256 expectedPending = oldRate * 100;
-        assertEq(staker.pendingReward(alice), expectedPending);
+        uint256 expectedPending = staker.pendingReward(alice);
+        assertGt(expectedPending, 0, "alice must have accrued");
 
         // Fresh debt batch — claim() pulls it and recomputes.
         hook.setPendingMint(500_000 ether);
@@ -115,10 +133,11 @@ contract NFTStakerPullIntegrationTest is Test {
         staker.claim();
 
         // Alice received exactly the pre-pull pending; the new budget did
-        // not retroactively bump her share (T unchanged -> R unchanged).
+        // not retroactively bump her share (totalStaked unchanged across
+        // claim -> R unchanged).
         assertEq(phUSD.balanceOf(alice) - phusdBefore, expectedPending);
 
-        // R stays the same (T, A unchanged).
+        // R stays the same (totalStaked, latestPrice, A all unchanged).
         assertEq(staker.rewardRate(), oldRate);
     }
 }

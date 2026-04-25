@@ -7,16 +7,17 @@ import {INFTSupply} from "../src/INFTSupply.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockNFTMinter} from "./mocks/MockNFTMinter.sol";
 
-/// @notice Fuzz over the APY-driven schedule. Two classes of properties:
+/// @notice Fuzz over the M-03 / S-based APY-driven schedule. Two property
+///         classes:
 ///           1. `_recomputeSchedule` never reverts across the stated input
-///              bounds (N, growthBP, price, targetAPY, V).
+///              bounds (totalStaked, growthBP, price, targetAPY, V).
 ///           2. Computed `rewardRate` matches the closed-form reference
-///              within 1 wei tolerance (pure floor-division agreement).
+///              EXACTLY (single mulDiv, no rpow — so no rounding tolerance
+///              is needed).
 ///         Also keeps the legacy depletion-invariant harness as a
 ///         solvency smoke test: claimed + pending across 3 actors must
 ///         never exceed the seeded budget (plus a rounding buffer that
@@ -78,45 +79,37 @@ contract NFTStakerFuzzTest is Test {
     // _recomputeSchedule fuzz — never reverts, matches closed form
     // -------------------------------------------------------------------
 
-    function _closedFormRate(uint256 price, uint256 growthBP, uint256 N, uint256 A, uint256 V)
+    function _closedFormRate(uint256 price, uint256 growthBP, uint256 totalStaked_, uint256 A)
         internal
         pure
         returns (uint256)
     {
-        uint256 T;
-        if (N == 0 || price == 0) {
-            T = 0;
+        uint256 latestPrice;
+        if (price == 0) {
+            latestPrice = 0;
         } else if (growthBP == 0) {
-            T = price * N;
+            latestPrice = price;
         } else {
             uint256 r = APY_PRECISION + growthBP * 1e14;
-            uint256 latestPrice = Math.mulDiv(price, APY_PRECISION, r);
-            if (N == 1) {
-                T = latestPrice;
-            } else {
-                uint256 rPowN = FixedPointMathLib.rpow(r, N, APY_PRECISION);
-                uint256 rPowNm1 = FixedPointMathLib.rpow(r, N - 1, APY_PRECISION);
-                uint256 rMinusOne = r - APY_PRECISION;
-                uint256 num = Math.mulDiv(latestPrice, rPowN - APY_PRECISION, APY_PRECISION);
-                uint256 den = Math.mulDiv(rPowNm1, rMinusOne, APY_PRECISION);
-                T = Math.mulDiv(num, APY_PRECISION, den);
-            }
+            latestPrice = Math.mulDiv(price, APY_PRECISION, r);
         }
-        uint256 F = Math.mulDiv(T, A, APY_PRECISION);
-        uint256 R = (F == 0) ? 0 : F / SECONDS_PER_YEAR;
-        V; // silence warning
-        return R;
+        uint256 S = (totalStaked_ == 0 || latestPrice == 0) ? 0 : totalStaked_ * latestPrice;
+        uint256 F = Math.mulDiv(S, A, APY_PRECISION);
+        return (F == 0) ? 0 : F / SECONDS_PER_YEAR;
     }
 
-    function testFuzzRecomputeMatchesClosedForm(uint16 growthBPRaw, uint16 nRaw, uint128 priceSeed, uint16 apyBP)
+    /// @notice Closed-form fuzz: for any (totalStaked, latestPrice,
+    ///         targetAPY) inside the stated bounds, the rate the contract
+    ///         computes equals (totalStaked * latestPrice * targetAPY /
+    ///         1e18) / SECONDS_PER_YEAR EXACTLY (single mulDiv, no rpow).
+    function testFuzzRecomputeMatchesClosedForm(uint16 growthBPRaw, uint64 stakedRaw, uint128 priceSeed, uint16 apyBP)
         public
     {
-        // Bound inputs to realistic ranges that keep rpow(r, N, 1e18) in the
-        // uint256 range. With growthBP capped at 100 BP (1%) and N capped at
-        // 2000, r^N reaches ~(1.01)^2000 ≈ 4.4e8 (1e18 scale = ~4.4e26), well
-        // within uint256.
+        // Bound inputs to realistic ranges. With S = totalStaked *
+        // latestPrice and latestPrice <= 1e6 ether (~1e24), totalStaked up
+        // to 1e6 keeps S below 2^160 — comfortably below 2^256.
         uint256 growthBP = uint256(growthBPRaw) % 101; // 0..100 BP
-        uint256 n = uint256(nRaw) % 2_000; // 0..1999
+        uint256 toStake = (uint256(stakedRaw) % 1_000_000) + 1; // 1..1_000_000
         uint256 price = (uint256(priceSeed) % (1_000_000 ether)) + 1;
         // apyBP 0..5000 basis points i.e. 0..50%
         uint256 A = (uint256(apyBP) % 5001) * 1e14;
@@ -124,7 +117,7 @@ contract NFTStakerFuzzTest is Test {
         // Stand up a dedicated staker to isolate the recompute.
         MockNFTMinter m = new MockNFTMinter();
         m.setConfig(DISPATCHER_INDEX, address(0xBEEF), price, growthBP, false);
-        m.setTotalSupply(ID, n);
+        m.setTotalSupply(ID, toStake);
 
         NFTStaker s = new NFTStaker(
             IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(m)), DISPATCHER_INDEX
@@ -133,34 +126,47 @@ contract NFTStakerFuzzTest is Test {
         uint256 V = 123_456 ether;
         phUSD.mint(address(s), V);
 
+        // Stake `toStake` to make S non-zero. Use a fresh staker actor
+        // and mint enough NFTs to it; reuse stakers[0] is fine.
+        nft.mint(stakers[0], ID, toStake);
+        vm.prank(stakers[0]);
+        s.stake(toStake);
+
         // Setting the APY triggers _recomputeSchedule. Must not revert.
         vm.prank(owner);
         s.setTargetAPY(A);
 
-        uint256 expected = _closedFormRate(price, growthBP, n, A, V);
-        assertEq(s.rewardRate(), expected, "rate must match closed form");
+        uint256 expected = _closedFormRate(price, growthBP, toStake, A);
+        assertEq(s.rewardRate(), expected, "rate must match S-based closed form");
     }
 
-    function testFuzzRecomputeDoesNotRevertWhenVZero(uint16 growthBPRaw, uint16 nRaw, uint128 priceSeed, uint16 apyBP)
-        public
-    {
+    function testFuzzRecomputeDoesNotRevertWhenVZero(
+        uint16 growthBPRaw,
+        uint64 stakedRaw,
+        uint128 priceSeed,
+        uint16 apyBP
+    ) public {
         uint256 growthBP = uint256(growthBPRaw) % 101; // 0..100 BP
-        uint256 n = uint256(nRaw) % 2_000;
+        uint256 toStake = (uint256(stakedRaw) % 1_000_000) + 1;
         uint256 price = (uint256(priceSeed) % (1_000_000 ether)) + 1;
         uint256 A = (uint256(apyBP) % 5001) * 1e14;
 
         MockNFTMinter m = new MockNFTMinter();
         m.setConfig(DISPATCHER_INDEX, address(0xBEEF), price, growthBP, false);
-        m.setTotalSupply(ID, n);
+        m.setTotalSupply(ID, toStake);
 
         NFTStaker s = new NFTStaker(
             IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(m)), DISPATCHER_INDEX
         );
 
-        // V = 0 (no balance, no hook)
+        // No V. Stake to make totalStaked non-zero.
+        nft.mint(stakers[0], ID, toStake);
+        vm.prank(stakers[0]);
+        s.stake(toStake);
+
         vm.prank(owner);
         s.setTargetAPY(A);
-        // windowEnd must equal block.timestamp (runway = 0).
+        // windowEnd must equal block.timestamp (runway = 0, V = 0).
         assertEq(s.windowEnd(), block.timestamp);
     }
 
@@ -261,7 +267,10 @@ contract NFTStakerFuzzTest is Test {
     ///         unstake / topUp / pullAndRefresh / setTargetAPY) per actor
     ///         and asserts the strong invariant after every action. Audit
     ///         M-01 fix: pre-fix the invariant only held at recompute
-    ///         boundaries; post-fix it holds always.
+    ///         boundaries; post-fix it holds always. Audit M-03 fix: the
+    ///         tail recompute on stake/unstake doesn't touch budget
+    ///         accounting (no pull, no _updatePool between head and tail),
+    ///         so the invariant holds across the new code path too.
     function testFuzzSolvencyInvariantHoldsAcrossRandomActions(uint256 seed) public {
         // The setUp mints ROUNDING_BUFFER directly to the staker AFTER
         // the topUp's recompute, so balance temporarily exceeds

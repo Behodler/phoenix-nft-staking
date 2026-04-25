@@ -16,11 +16,14 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockBalancerPoolerMintDebtHook} from "./mocks/MockBalancerPoolerMintDebtHook.sol";
 import {MockNFTMinter} from "./mocks/MockNFTMinter.sol";
 
-/// @notice Red-phase spec for the variable-runway / APY-target model.
-///         Covers `setTargetAPY` permission & bounds, `_recomputeSchedule`
-///         math for small-N / N=0 / N=1 / growthBP=0 / targetAPY=0 cases,
-///         trigger coverage across all recompute sites, cross-submodule
-///         sensitivity to price/growth changes, and APY-decrease settlement.
+/// @notice Spec for the variable-runway / APY-target model under M-03
+///         sizing: `R = totalStaked * latestPrice * targetAPY /
+///         SECONDS_PER_YEAR`. Covers `setTargetAPY` permission & bounds,
+///         `_recomputeSchedule` math for empty-pool / N=1-staked / growthBP=0
+///         / targetAPY=0 cases, trigger coverage across all recompute sites,
+///         cross-submodule sensitivity to price/growth changes, and
+///         APY-decrease settlement. The aggregate-N notional `T` of the
+///         pre-M-03 model is gone — sizing reads `totalStaked` directly.
 contract NFTStakerAPYScheduleTest is Test {
     using Math for uint256;
 
@@ -62,6 +65,28 @@ contract NFTStakerAPYScheduleTest is Test {
         hook = new MockBalancerPoolerMintDebtHook(phUSD, address(staker));
         vm.prank(owner);
         staker.setDispatcherHook(IBalancerPoolerMintDebtHook(address(hook)));
+    }
+
+    // -------------------------------------------------------------------
+    // helpers — closed-form S-based rate
+    // -------------------------------------------------------------------
+
+    function _latestPrice(uint256 priceNext, uint256 growthBP) internal pure returns (uint256) {
+        if (priceNext == 0) return 0;
+        if (growthBP == 0) return priceNext;
+        uint256 r = APY_PRECISION + growthBP * 1e14;
+        return Math.mulDiv(priceNext, APY_PRECISION, r);
+    }
+
+    function _expectedRate(uint256 totalStaked_, uint256 priceNext, uint256 growthBP, uint256 A)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 latestPrice = _latestPrice(priceNext, growthBP);
+        uint256 S = (totalStaked_ == 0 || latestPrice == 0) ? 0 : totalStaked_ * latestPrice;
+        uint256 F = Math.mulDiv(S, A, APY_PRECISION);
+        return (F == 0) ? 0 : F / SECONDS_PER_YEAR;
     }
 
     // -------------------------------------------------------------------
@@ -114,11 +139,11 @@ contract NFTStakerAPYScheduleTest is Test {
     }
 
     function testSetTargetAPYSettlesAccrualAtOldRateBeforeMutating() public {
-        // Seed: stake, warp at old APY 30%, then drop APY to 10%.
-        // Alice's pending must reflect the old-rate 30% accrual for the
-        // pre-setter window.
+        // Seed: stake, warp at old APY 30%, then drop APY to 10%. Alice's
+        // pending must reflect the old-rate 30% accrual for the pre-setter
+        // window.
         nftMinter.setTotalSupply(ID, 1000);
-        nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 0, false); // no growth -> T = N*price
+        nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 0, false); // no growth -> latestPrice = price
         phUSD.mint(owner, 1_000_000 ether);
         vm.prank(owner);
         phUSD.approve(address(staker), 1_000_000 ether);
@@ -144,10 +169,8 @@ contract NFTStakerAPYScheduleTest is Test {
         vm.prank(owner);
         staker.setTargetAPY(0.1e18);
 
-        // Pending reward should be at least what accrued at the old rate for
-        // the 3600 seconds (subsequent accrual is at the new rate).
-        // Since the setter runs immediately (no further time elapsed), the
-        // pending must equal exactly the old-rate accrual.
+        // Pending reward should be exactly the old-rate accrual for the
+        // 3600s window (the setter ran with no further time elapsed).
         assertEq(staker.pendingReward(alice), expectedAccrual, "old-rate accrual must be settled before APY drop");
 
         // And the rate must now reflect the new APY (lower).
@@ -159,58 +182,70 @@ contract NFTStakerAPYScheduleTest is Test {
     // _recomputeSchedule math — edge cases
     // -------------------------------------------------------------------
 
-    function testRecomputeWhenNIsZeroZeroesRate() public {
-        // No NFTs minted. T = 0, R = 0, windowEnd = now.
-        nftMinter.setTotalSupply(ID, 0);
+    function testRecomputeWhenTotalStakedIsZeroZeroesRate() public {
+        // No stakers. S = 0, R = 0, windowEnd = now. (Independent of N now —
+        // S is sized by totalStaked, not by `nftMinter.totalSupply`.)
+        nftMinter.setTotalSupply(ID, 100);
+        phUSD.mint(address(staker), 1_000_000 ether);
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
 
-        assertEq(staker.rewardRate(), 0, "R must be 0 when N=0");
-        assertEq(staker.windowEnd(), block.timestamp, "windowEnd must equal now when N=0");
-        assertEq(staker.rewardBudget(), 0, "rewardBudget must be 0 when no balance");
+        assertEq(staker.totalStaked(), 0);
+        assertEq(staker.rewardRate(), 0, "R must be 0 when totalStaked=0");
+        assertEq(staker.windowEnd(), block.timestamp, "windowEnd must equal now when totalStaked=0");
     }
 
-    function testRecomputeWhenNIsOneTEqualsLatestPrice() public {
-        // N=1, price (next)=100e18, growthBP=1 -> r = 1.0001e18
+    function testRecomputeWhenSingleNFTStakedREqualsLatestPriceAPY() public {
+        // totalStaked=1, price (next)=100e18, growthBP=1 -> r = 1.0001e18
         // latestPrice = price/r = 100e18 * 1e18 / 1.0001e18
-        // T = latestPrice (reduces to latestPrice for N=1).
-        nftMinter.setTotalSupply(ID, 1);
+        // S = 1 * latestPrice = latestPrice
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 1, false);
+        nftMinter.setTotalSupply(ID, 1);
 
         phUSD.mint(address(staker), 1_000_000 ether); // available V
 
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
 
-        uint256 r = APY_PRECISION + uint256(1) * 1e14;
-        uint256 latestPrice = Math.mulDiv(100 ether, APY_PRECISION, r);
-        uint256 T = latestPrice; // for N=1
-        uint256 F = Math.mulDiv(T, 0.3e18, APY_PRECISION);
-        uint256 expectedRate = F / SECONDS_PER_YEAR;
+        // Mint 1 to alice and stake.
+        nft.mint(alice, ID, 1);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(alice);
+        staker.stake(1);
 
-        assertEq(staker.rewardRate(), expectedRate, "R must match closed-form for N=1");
+        uint256 expectedRate = _expectedRate(1, 100 ether, 1, 0.3e18);
+        assertEq(staker.rewardRate(), expectedRate, "R must match S-based closed-form for totalStaked=1");
     }
 
     function testRecomputeWhenGrowthBPIsZeroUsesUniformPrice() public {
-        // growthBP = 0 -> r = 1 -> no geometric growth.
-        // T = latestPrice * N. latestPrice = price / r = price / 1 = price.
-        nftMinter.setTotalSupply(ID, 5);
+        // growthBP=0 -> latestPrice = price. S = totalStaked * price.
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 0, false);
-
+        nftMinter.setTotalSupply(ID, 5);
         phUSD.mint(address(staker), 1_000_000 ether);
+
+        nft.mint(alice, ID, 5);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(alice);
+        staker.stake(5);
 
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
 
-        uint256 T = 100 ether * 5;
-        uint256 F = Math.mulDiv(T, 0.3e18, APY_PRECISION);
-        uint256 expectedRate = F / SECONDS_PER_YEAR;
-        assertEq(staker.rewardRate(), expectedRate, "uniform-price T formula failed");
+        uint256 expectedRate = _expectedRate(5, 100 ether, 0, 0.3e18);
+        assertEq(staker.rewardRate(), expectedRate, "uniform-price S formula failed");
     }
 
     function testRecomputeWhenTargetAPYIsZeroZeroesRate() public {
         nftMinter.setTotalSupply(ID, 100);
         phUSD.mint(address(staker), 1_000_000 ether);
+
+        nft.mint(alice, ID, 100);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(alice);
+        staker.stake(100);
 
         vm.prank(owner);
         staker.setTargetAPY(0);
@@ -218,63 +253,49 @@ contract NFTStakerAPYScheduleTest is Test {
         assertEq(staker.rewardRate(), 0, "R must be 0 when APY=0");
     }
 
-    function testRecomputeSmallNExactValues() public {
-        // N=2, price=100e18, growthBP=1 -> r=1.0001e18
-        // latestPrice = 100e18 / 1.0001 in 1e18 fp
-        // T = latestPrice * (r^2 - 1) / (r^1 * (r - 1))
-        //   = latestPrice * (r - 1)(r + 1) / (r * (r - 1))
-        //   = latestPrice * (r + 1) / r
-        nftMinter.setTotalSupply(ID, 2);
+    function testRecomputeMultiStakeExactValues() public {
+        // totalStaked=3, price=100e18, growthBP=1 -> r=1.0001e18.
+        // S = 3 * latestPrice. R = S * 0.3e18 / SECONDS_PER_YEAR.
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 1, false);
-
+        nftMinter.setTotalSupply(ID, 3);
         phUSD.mint(address(staker), 1_000_000 ether);
+
+        nft.mint(alice, ID, 3);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(alice);
+        staker.stake(3);
 
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
 
-        uint256 r = APY_PRECISION + 1e14;
-        uint256 latestPrice = Math.mulDiv(100 ether, APY_PRECISION, r);
-        uint256 rPowN = FixedPointMathLib.rpow(r, 2, APY_PRECISION);
-        uint256 rPowNm1 = r;
-        uint256 rMinusOne = r - APY_PRECISION;
-        uint256 num = Math.mulDiv(latestPrice, rPowN - APY_PRECISION, APY_PRECISION);
-        uint256 den = Math.mulDiv(rPowNm1, rMinusOne, APY_PRECISION);
-        uint256 T = Math.mulDiv(num, APY_PRECISION, den);
-        uint256 F = Math.mulDiv(T, 0.3e18, APY_PRECISION);
-        uint256 expectedRate = F / SECONDS_PER_YEAR;
-
-        assertEq(staker.rewardRate(), expectedRate, "R must match closed-form for N=2");
+        uint256 expectedRate = _expectedRate(3, 100 ether, 1, 0.3e18);
+        assertEq(staker.rewardRate(), expectedRate, "R must match S-based closed-form for totalStaked=3");
     }
 
-    function testRecomputeLargeNMatchesClosedForm() public {
-        // N=1000, growthBP=1, APY=30%.
-        // Compute the reference value using the same formulae the contract
-        // uses; the contract must agree exactly.
-        uint256 N = 1000;
+    function testRecomputeLargeStakeMatchesClosedForm() public {
+        // totalStaked=1000, growthBP=1, APY=30%. No more rpow involvement;
+        // sizing is just totalStaked * latestPrice.
+        uint256 staked = 1000;
         uint256 growthBP = 1;
         uint256 priceNext = 100 ether;
         uint256 A = 0.3e18;
 
-        nftMinter.setTotalSupply(ID, N);
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), priceNext, growthBP, false);
-
+        nftMinter.setTotalSupply(ID, staked);
         phUSD.mint(address(staker), 1_000_000_000 ether);
+
+        nft.mint(alice, ID, staked);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        vm.prank(alice);
+        staker.stake(staked);
 
         vm.prank(owner);
         staker.setTargetAPY(A);
 
-        uint256 r = APY_PRECISION + growthBP * 1e14;
-        uint256 latestPrice = Math.mulDiv(priceNext, APY_PRECISION, r);
-        uint256 rPowN = FixedPointMathLib.rpow(r, N, APY_PRECISION);
-        uint256 rPowNm1 = FixedPointMathLib.rpow(r, N - 1, APY_PRECISION);
-        uint256 rMinusOne = r - APY_PRECISION;
-        uint256 num = Math.mulDiv(latestPrice, rPowN - APY_PRECISION, APY_PRECISION);
-        uint256 den = Math.mulDiv(rPowNm1, rMinusOne, APY_PRECISION);
-        uint256 T = Math.mulDiv(num, APY_PRECISION, den);
-        uint256 F = Math.mulDiv(T, A, APY_PRECISION);
-        uint256 expectedRate = F / SECONDS_PER_YEAR;
-
-        assertEq(staker.rewardRate(), expectedRate, "R must match closed-form for N=1000");
+        uint256 expectedRate = _expectedRate(staked, priceNext, growthBP, A);
+        assertEq(staker.rewardRate(), expectedRate, "R must match S-based closed-form for totalStaked=1000");
     }
 
     // -------------------------------------------------------------------
@@ -282,8 +303,8 @@ contract NFTStakerAPYScheduleTest is Test {
     // -------------------------------------------------------------------
 
     function _seedSchedule() internal {
-        nftMinter.setTotalSupply(ID, 100);
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 1, false);
+        nftMinter.setTotalSupply(ID, 100);
         phUSD.mint(owner, 1_000_000 ether);
         vm.prank(owner);
         phUSD.approve(address(staker), 1_000_000 ether);
@@ -295,6 +316,8 @@ contract NFTStakerAPYScheduleTest is Test {
         nft.mint(alice, ID, 100);
         vm.prank(alice);
         nft.setApprovalForAll(address(staker), true);
+        vm.prank(alice);
+        staker.stake(100);
     }
 
     function testTriggerSetTargetAPYEmitsScheduleRecomputed() public {
@@ -317,33 +340,39 @@ contract NFTStakerAPYScheduleTest is Test {
 
     function testTriggerStakeRecomputes() public {
         _seedSchedule();
+        // Mint additional NFTs to alice for further stake.
+        nft.mint(alice, ID, 5);
+        nftMinter.setTotalSupply(ID, 105);
+
         uint256 rateBefore = staker.rewardRate();
         assertGt(rateBefore, 0);
         vm.prank(alice);
         staker.stake(5);
-        // Rate unchanged at same N/price/APY (a stake does not mint NFTs)
-        assertEq(staker.rewardRate(), rateBefore, "stake must leave rate invariant at same (N,price,APY)");
+        // Rate must scale with totalStaked: 100 -> 105, so R should grow
+        // 105/100. Allow 1 wei floor-division drift.
+        uint256 expectedRate = _expectedRate(105, 100 ether, 1, 0.3e18);
+        assertEq(staker.rewardRate(), expectedRate, "stake must re-size R against new totalStaked");
+        assertGt(staker.rewardRate(), rateBefore, "stake increased totalStaked, rate must grow");
     }
 
     function testTriggerUnstakeRecomputes() public {
         _seedSchedule();
-        vm.prank(alice);
-        staker.stake(5);
         vm.warp(block.timestamp + 100);
         vm.prank(alice);
-        staker.unstake(5);
-        // No revert — recompute fired inside the flow.
-        assertGt(staker.rewardRate(), 0);
+        staker.unstake(50);
+        // totalStaked dropped from 100 to 50, R should halve.
+        uint256 expectedRate = _expectedRate(50, 100 ether, 1, 0.3e18);
+        assertEq(staker.rewardRate(), expectedRate, "unstake must re-size R against new totalStaked");
     }
 
     function testTriggerClaimRecomputes() public {
         _seedSchedule();
-        vm.prank(alice);
-        staker.stake(5);
         vm.warp(block.timestamp + 100);
         vm.prank(alice);
         staker.claim();
-        assertGt(staker.rewardRate(), 0);
+        // totalStaked unchanged on claim — R unchanged.
+        uint256 expectedRate = _expectedRate(100, 100 ether, 1, 0.3e18);
+        assertEq(staker.rewardRate(), expectedRate, "claim leaves R invariant at constant totalStaked");
     }
 
     function testTriggerTopUpRecomputes() public {
@@ -354,8 +383,8 @@ contract NFTStakerAPYScheduleTest is Test {
         phUSD.approve(address(staker), 500_000 ether);
         vm.prank(owner);
         staker.topUp(500_000 ether);
-        // N/price/APY unchanged -> rate unchanged
-        assertEq(staker.rewardRate(), rateBefore, "topUp must not move rate at constant N/price/APY");
+        // totalStaked / price / APY unchanged -> rate unchanged.
+        assertEq(staker.rewardRate(), rateBefore, "topUp must not move rate at constant totalStaked/price/APY");
         // windowEnd should extend because V grew
         assertGt(staker.windowEnd(), block.timestamp, "windowEnd must be in the future after topUp");
     }
@@ -365,23 +394,20 @@ contract NFTStakerAPYScheduleTest is Test {
         hook.setPendingMint(100 ether);
         vm.prank(owner);
         staker.pullAndRefresh();
-        // Rate unchanged — V grew but N/price/APY unchanged.
-        // Just confirm emissions still positive and budget reflects pull.
+        // Rate unchanged — V grew but totalStaked/price/APY unchanged.
         assertGt(staker.rewardRate(), 0);
     }
 
     function testTriggerSetDispatcherIndexRecomputesAndRequiresEmptyPool() public {
         _seedSchedule();
-        vm.prank(alice);
-        staker.stake(1);
 
         vm.prank(owner);
         vm.expectRevert(bytes("NFTStaker: stake outstanding"));
         staker.setDispatcherIndex(2);
 
-        // Unstake and try again
+        // Unstake fully and try again
         vm.prank(alice);
-        staker.unstake(1);
+        staker.unstake(100);
         nftMinter.setConfig(2, address(0xBEE2), 200 ether, 1, false);
         vm.prank(owner);
         staker.setDispatcherIndex(2);
@@ -390,8 +416,6 @@ contract NFTStakerAPYScheduleTest is Test {
 
     function testTriggerSetNFTMinterRecomputesAndRequiresEmptyPool() public {
         _seedSchedule();
-        vm.prank(alice);
-        staker.stake(1);
 
         MockNFTMinter other = new MockNFTMinter();
         other.setTotalSupply(ID, 1);
@@ -402,7 +426,7 @@ contract NFTStakerAPYScheduleTest is Test {
         staker.setNFTMinter(INFTSupply(address(other)));
 
         vm.prank(alice);
-        staker.unstake(1);
+        staker.unstake(100);
         vm.prank(owner);
         staker.setNFTMinter(INFTSupply(address(other)));
         assertEq(address(staker.nftMinter()), address(other));
@@ -425,7 +449,7 @@ contract NFTStakerAPYScheduleTest is Test {
         staker.topUp(1);
 
         uint256 rate1 = staker.rewardRate();
-        // T doubles -> F doubles -> R doubles (floor division induced loss < 1)
+        // S doubles -> F doubles -> R doubles (floor division induced loss < 1)
         assertApproxEqAbs(rate1, rate0 * 2, 1, "rate did not track 2x price");
     }
 
@@ -479,5 +503,33 @@ contract NFTStakerAPYScheduleTest is Test {
         assertEq(address(staker.nftMinter()), address(nftMinter));
         assertEq(staker.dispatcherIndex(), DISPATCHER_INDEX);
         assertEq(staker.targetAPY(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Geometric-growth case — earliest minter earns above target
+    // -------------------------------------------------------------------
+
+    function testGeometricGrowthLatestPriceMatchesPriceOverR() public {
+        // growthBP > 0 -> latestPrice = price.mulDiv(1e18, r). Verified via
+        // R inversion: from observed rewardRate, recover the latestPrice the
+        // contract used and assert it equals price/r exactly.
+        uint256 priceNext = 200 ether;
+        uint256 growthBP = 50; // 0.5%
+        uint256 A = 0.4e18;
+        nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), priceNext, growthBP, false);
+        nftMinter.setTotalSupply(ID, 7);
+
+        nft.mint(alice, ID, 7);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        phUSD.mint(address(staker), 1_000_000 ether);
+        vm.prank(alice);
+        staker.stake(7);
+
+        vm.prank(owner);
+        staker.setTargetAPY(A);
+
+        uint256 expectedRate = _expectedRate(7, priceNext, growthBP, A);
+        assertEq(staker.rewardRate(), expectedRate, "geometric-growth rate must use latestPrice = price/r");
     }
 }

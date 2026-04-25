@@ -9,20 +9,21 @@ import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockBalancerPoolerMintDebtHook} from "./mocks/MockBalancerPoolerMintDebtHook.sol";
 import {MockNFTMinter} from "./mocks/MockNFTMinter.sol";
 
 /// @notice Covers the funding surface of the variable-runway / APY-target
-///         model. After any funding event (`topUp`, `pullAndRefresh`) the
-///         schedule must satisfy:
-///             R       = T * A / SECONDS_PER_YEAR
+///         model under M-03 sizing. After any funding event (`topUp`,
+///         `pullAndRefresh`) the schedule must satisfy:
+///             R       = totalStaked * latestPrice * A / SECONDS_PER_YEAR
 ///             window  = block.timestamp + V / R   (V / R floor-divided)
-///             budget  = V
-///         where T is the closed-form aggregate NFT value, A is the target
-///         APY, and V = balance + mintDebt.
+///             budget  = V - committedDebt
+///         where `latestPrice = price / r` (or `price` when `growthBP == 0`),
+///         A is the target APY, and V = balance + mintDebt. Also pins the
+///         M-03 invariant: stake/unstake re-size R against the new
+///         totalStaked.
 contract NFTStakerFundingTest is Test {
     using Math for uint256;
 
@@ -33,6 +34,8 @@ contract NFTStakerFundingTest is Test {
     MockNFTMinter internal nftMinter;
 
     address internal owner = address(0xD1);
+    address internal alice = address(0xA11CE);
+    address internal bob = address(0xB0B);
     uint256 internal constant INITIAL_ID = 1;
     uint256 internal constant DISPATCHER_INDEX = 1;
     uint256 internal constant APY_PRECISION = 1e18;
@@ -40,13 +43,16 @@ contract NFTStakerFundingTest is Test {
 
     event Pulled(uint256 inflow, uint256 newBudget);
     event ToppedUp(address indexed from, uint256 amount, uint256 newBudget);
+    event Staked(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event ScheduleRecomputed(uint256 totalNFTValue, uint256 availableValue, uint256 newRate, uint256 newWindowEnd);
 
     function setUp() public {
         nft = new MockERC1155();
         phUSD = new MockERC20("phUSD", "phUSD");
         nftMinter = new MockNFTMinter();
         nftMinter.setConfig(DISPATCHER_INDEX, address(0xBEEF), 100 ether, 1, false);
-        nftMinter.setTotalSupply(INITIAL_ID, 100); // non-trivial N so T > 0
+        nftMinter.setTotalSupply(INITIAL_ID, 100); // ambient supply
 
         staker = new NFTStaker(
             IERC1155(address(nft)),
@@ -62,28 +68,44 @@ contract NFTStakerFundingTest is Test {
 
         vm.prank(owner);
         staker.setTargetAPY(0.3e18);
+
+        // Mint NFTs and stake some to make S non-zero. Keep totalStaked
+        // small (10 of 100 minted) so R != 0 but V dwarfs F.
+        nft.mint(alice, INITIAL_ID, 100);
+        vm.prank(alice);
+        nft.setApprovalForAll(address(staker), true);
+        nft.mint(bob, INITIAL_ID, 100);
+        vm.prank(bob);
+        nft.setApprovalForAll(address(staker), true);
     }
 
-    // ---------- helper: closed-form T ----------
+    // ---------- helper: closed-form S-based rate ----------
 
-    function _computeT(uint256 price, uint256 growthBP, uint256 N) internal pure returns (uint256) {
-        if (N == 0 || price == 0) return 0;
-        if (growthBP == 0) return price * N;
+    function _latestPrice(uint256 priceNext, uint256 growthBP) internal pure returns (uint256) {
+        if (priceNext == 0) return 0;
+        if (growthBP == 0) return priceNext;
         uint256 r = APY_PRECISION + growthBP * 1e14;
-        uint256 latestPrice = Math.mulDiv(price, APY_PRECISION, r);
-        if (N == 1) return latestPrice;
-        uint256 rPowN = FixedPointMathLib.rpow(r, N, APY_PRECISION);
-        uint256 rPowNm1 = FixedPointMathLib.rpow(r, N - 1, APY_PRECISION);
-        uint256 rMinusOne = r - APY_PRECISION;
-        uint256 num = Math.mulDiv(latestPrice, rPowN - APY_PRECISION, APY_PRECISION);
-        uint256 den = Math.mulDiv(rPowNm1, rMinusOne, APY_PRECISION);
-        return Math.mulDiv(num, APY_PRECISION, den);
+        return Math.mulDiv(priceNext, APY_PRECISION, r);
     }
 
-    function _expectedRate() internal view returns (uint256) {
-        uint256 T = _computeT(100 ether, 1, 100);
-        uint256 F = Math.mulDiv(T, staker.targetAPY(), APY_PRECISION);
-        return F / SECONDS_PER_YEAR;
+    function _expectedRate(uint256 totalStaked_, uint256 priceNext, uint256 growthBP, uint256 A)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 latestPrice = _latestPrice(priceNext, growthBP);
+        uint256 S = (totalStaked_ == 0 || latestPrice == 0) ? 0 : totalStaked_ * latestPrice;
+        uint256 F = Math.mulDiv(S, A, APY_PRECISION);
+        return (F == 0) ? 0 : F / SECONDS_PER_YEAR;
+    }
+
+    function _expectedRateForCurrentStake() internal view returns (uint256) {
+        return _expectedRate(staker.totalStaked(), 100 ether, 1, staker.targetAPY());
+    }
+
+    function _stakeFromAlice(uint256 amount) internal {
+        vm.prank(alice);
+        staker.stake(amount);
     }
 
     // ---------- pullAndRefresh ----------
@@ -94,10 +116,11 @@ contract NFTStakerFundingTest is Test {
     }
 
     function testNonzeroPullMaterialisesInflowAndRecomputes() public {
+        _stakeFromAlice(10);
         uint256 inflow = 100_000 ether;
         hook.setPendingMint(inflow);
 
-        uint256 expectedRate = _expectedRate();
+        uint256 expectedRate = _expectedRateForCurrentStake();
 
         vm.expectEmit(true, true, true, true, address(staker));
         emit Pulled(inflow, inflow);
@@ -112,6 +135,7 @@ contract NFTStakerFundingTest is Test {
     }
 
     function testZeroPullIsStillARecomputeNoInflowEvent() public {
+        _stakeFromAlice(10);
         // Establish a baseline budget via a topUp.
         uint256 amount = 50_000 ether;
         phUSD.mint(owner, amount);
@@ -144,10 +168,11 @@ contract NFTStakerFundingTest is Test {
     }
 
     function testPullWithUnsetHookIsNoInflowStillRecomputes() public {
+        _stakeFromAlice(10);
         vm.prank(owner);
         staker.setDispatcherHook(IBalancerPoolerMintDebtHook(address(0)));
 
-        uint256 expectedRate = _expectedRate();
+        uint256 expectedRate = _expectedRateForCurrentStake();
         // V = balance (no debt) = 0 -> windowEnd == now
         vm.prank(owner);
         staker.pullAndRefresh();
@@ -160,12 +185,13 @@ contract NFTStakerFundingTest is Test {
     // ---------- topUp ----------
 
     function testTopUpIncreasesVAndRecomputes() public {
+        _stakeFromAlice(10);
         uint256 amount = 100_000 ether;
         phUSD.mint(owner, amount);
         vm.prank(owner);
         phUSD.approve(address(staker), amount);
 
-        uint256 expectedRate = _expectedRate();
+        uint256 expectedRate = _expectedRateForCurrentStake();
 
         vm.expectEmit(true, true, true, true, address(staker));
         emit ToppedUp(owner, amount, amount);
@@ -188,10 +214,11 @@ contract NFTStakerFundingTest is Test {
 
     // ---------- APY stability across funding events ----------
 
-    function testRateUnchangedAcrossMultiplePullsAndTopUpsWithConstantNAndPrice() public {
-        uint256 expectedRate = _expectedRate();
+    function testRateUnchangedAcrossMultiplePullsAndTopUpsWithConstantStakeAndPrice() public {
+        _stakeFromAlice(10);
+        uint256 expectedRate = _expectedRateForCurrentStake();
 
-        // Sequence: topUp, pull, topUp, pull — all at constant T.
+        // Sequence: topUp, pull, topUp, pull — all at constant totalStaked.
         phUSD.mint(owner, 200_000 ether);
         vm.prank(owner);
         phUSD.approve(address(staker), 200_000 ether);
@@ -218,7 +245,7 @@ contract NFTStakerFundingTest is Test {
     // ---------- runway is derived ----------
 
     function testRunwayGrowsLinearlyWithV() public {
-        uint256 rateBefore;
+        _stakeFromAlice(10);
         uint256 windowBefore;
 
         phUSD.mint(owner, 300_000 ether);
@@ -227,7 +254,6 @@ contract NFTStakerFundingTest is Test {
 
         vm.prank(owner);
         staker.topUp(100_000 ether);
-        rateBefore = staker.rewardRate();
         windowBefore = staker.windowEnd();
 
         vm.prank(owner);
@@ -237,5 +263,108 @@ contract NFTStakerFundingTest is Test {
         uint256 runwayAfter = staker.windowEnd() - block.timestamp;
         // Allow +/- 1 wei of floor-division drift in V/R.
         assertApproxEqAbs(runwayAfter, runwayBefore * 2, 2);
+    }
+
+    // ---------- M-03: rate recomputes on stake/unstake ----------
+
+    /// @notice Pins the M-03 fix: under S-based sizing R scales linearly
+    ///         with totalStaked, so stake and unstake must re-size R after
+    ///         the totalStaked mutation.
+    function test_RateRecomputesOnStakeUnstake() public {
+        // Top up budget so R can be non-zero.
+        phUSD.mint(owner, 1_000_000 ether);
+        vm.prank(owner);
+        phUSD.approve(address(staker), 1_000_000 ether);
+        vm.prank(owner);
+        staker.topUp(1_000_000 ether);
+
+        // Step 1: alice stakes 10. Expect R sized for totalStaked=10.
+        vm.prank(alice);
+        staker.stake(10);
+        uint256 rateAfter1 = staker.rewardRate();
+        assertEq(rateAfter1, _expectedRate(10, 100 ether, 1, 0.3e18), "R after stake(10) must use post-mutation S");
+        assertGt(rateAfter1, 0);
+
+        // Step 2: alice stakes another 10. Expect R doubled (linearly with
+        // totalStaked).
+        vm.prank(alice);
+        staker.stake(10);
+        uint256 rateAfter2 = staker.rewardRate();
+        assertEq(rateAfter2, _expectedRate(20, 100 ether, 1, 0.3e18), "R after stake(+10) must size for totalStaked=20");
+        assertApproxEqAbs(rateAfter2, rateAfter1 * 2, 2, "R must scale linearly with totalStaked");
+
+        // Step 3: alice unstakes 10. Expect R halved back.
+        vm.prank(alice);
+        staker.unstake(10);
+        uint256 rateAfter3 = staker.rewardRate();
+        assertEq(rateAfter3, _expectedRate(10, 100 ether, 1, 0.3e18), "R after unstake(10) must size for totalStaked=10");
+        assertApproxEqAbs(rateAfter3, rateAfter1, 2, "R must return to the pre-stake level");
+    }
+
+    /// @notice Stake emits Staked first, then ScheduleRecomputed with the
+    ///         post-mutation S as the first event arg. Confirms ordering.
+    function test_StakeEmitsScheduleRecomputedAfterStaked() public {
+        phUSD.mint(owner, 1_000_000 ether);
+        vm.prank(owner);
+        phUSD.approve(address(staker), 1_000_000 ether);
+        vm.prank(owner);
+        staker.topUp(1_000_000 ether);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        staker.stake(10);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 stakedSig = keccak256("Staked(address,uint256)");
+        bytes32 schedSig = keccak256("ScheduleRecomputed(uint256,uint256,uint256,uint256)");
+        int256 stakedIdx = -1;
+        int256 lastSchedIdx = -1;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == stakedSig) stakedIdx = int256(i);
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == schedSig) lastSchedIdx = int256(i);
+        }
+        assertGe(stakedIdx, 0, "Staked event missing");
+        assertGt(lastSchedIdx, stakedIdx, "ScheduleRecomputed must follow Staked (tail recompute)");
+
+        // The last ScheduleRecomputed event should report S = 10 *
+        // latestPrice for the post-stake totalStaked.
+        uint256 latestPrice = _latestPrice(100 ether, 1);
+        uint256 expectedS = 10 * latestPrice;
+        (uint256 sFromLog,,,) = abi.decode(logs[uint256(lastSchedIdx)].data, (uint256, uint256, uint256, uint256));
+        assertEq(sFromLog, expectedS, "post-stake ScheduleRecomputed must report new S");
+    }
+
+    /// @notice Unstake emits Unstaked first, then ScheduleRecomputed with
+    ///         the post-mutation S.
+    function test_UnstakeEmitsScheduleRecomputedAfterUnstaked() public {
+        phUSD.mint(owner, 1_000_000 ether);
+        vm.prank(owner);
+        phUSD.approve(address(staker), 1_000_000 ether);
+        vm.prank(owner);
+        staker.topUp(1_000_000 ether);
+
+        vm.prank(alice);
+        staker.stake(20);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        staker.unstake(15);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 unstakedSig = keccak256("Unstaked(address,uint256)");
+        bytes32 schedSig = keccak256("ScheduleRecomputed(uint256,uint256,uint256,uint256)");
+        int256 unstakedIdx = -1;
+        int256 lastSchedIdx = -1;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == unstakedSig) unstakedIdx = int256(i);
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == schedSig) lastSchedIdx = int256(i);
+        }
+        assertGe(unstakedIdx, 0, "Unstaked event missing");
+        assertGt(lastSchedIdx, unstakedIdx, "ScheduleRecomputed must follow Unstaked (tail recompute)");
+
+        uint256 latestPrice = _latestPrice(100 ether, 1);
+        uint256 expectedS = 5 * latestPrice; // 20 - 15 = 5 staked
+        (uint256 sFromLog,,,) = abi.decode(logs[uint256(lastSchedIdx)].data, (uint256, uint256, uint256, uint256));
+        assertEq(sFromLog, expectedS, "post-unstake ScheduleRecomputed must report new S");
     }
 }
