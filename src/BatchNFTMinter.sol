@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ITokenMinter} from "yield-claim-nft/interfaces/ITokenMinter.sol";
+import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title BatchNFTMinter
-/// @notice Stateless helper that loops `ITokenMinter.mint(...)` `count`
+/// @notice Stateless helper that loops `ITokenMinterV2.mint(...)` `count`
 ///         times in a single transaction, routing each minted unit to a
 ///         caller-specified `recipient`. The caller passes the aggregate
 ///         `paymentAmount` they expect to spend; the helper pulls it
@@ -43,6 +43,11 @@ contract BatchNFTMinter {
     /// @notice Mint `count` NFT units of dispatcher `dispatcherIndex` to
     ///         `recipient`, pulling `paymentAmount` of `paymentToken`
     ///         from `msg.sender` upfront and refunding any surplus.
+    /// @dev    `paymentToken` must match the dispatcher's prime token —
+    ///         V2's `mint(...)` resolves the payment asset from the
+    ///         dispatcher itself, so a mismatch causes the inner mint to
+    ///         revert and the entire batch rolls back atomically
+    ///         (including the upfront pull).
     /// @param  nftMinter        The NFT minter to forward each `mint` to.
     /// @param  paymentToken     ERC20 used to pay for each mint.
     /// @param  dispatcherIndex  Dispatcher index registered with `nftMinter`.
@@ -56,7 +61,7 @@ contract BatchNFTMinter {
     /// @return totalPaid        Caller's net spend (`paymentAmount`
     ///                          minus any refunded surplus).
     function batchMint(
-        ITokenMinter nftMinter,
+        ITokenMinterV2 nftMinter,
         IERC20 paymentToken,
         uint256 dispatcherIndex,
         uint256 count,
@@ -70,7 +75,7 @@ contract BatchNFTMinter {
         paymentToken.forceApprove(address(nftMinter), type(uint256).max);
 
         for (uint256 i; i < count; ++i) {
-            nftMinter.mint(address(paymentToken), dispatcherIndex, recipient);
+            nftMinter.mint(dispatcherIndex, recipient);
         }
 
         paymentToken.forceApprove(address(nftMinter), 0);
