@@ -10,6 +10,3 @@
 [submodule "lib/immutable/forge-std"]
 	path = lib/immutable/forge-std
 	url = https://github.com/foundry-rs/forge-std
-[submodule "lib/immutable/solady"]
-	path = lib/immutable/solady
-	url = https://github.com/Vectorized/solady

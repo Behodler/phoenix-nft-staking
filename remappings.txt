@@ -2,7 +2,6 @@
 forge-std/=lib/immutable/forge-std/src/
 yield-claim-nft/=lib/mutable/yield-claim-nft/src/
 pauser/=lib/mutable/pauser/src/
-solady/=lib/immutable/solady/src/
 erc4626-tests/=lib/immutable/openzeppelin-contracts/lib/erc4626-tests/
 halmos-cheatcodes/=lib/immutable/openzeppelin-contracts/lib/halmos-cheatcodes/src/
 immutable/=lib/immutable/
