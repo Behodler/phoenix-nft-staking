@@ -1,0 +1,14 @@
+{
+  "lib/immutable/forge-std": {
+    "rev": "f93c42c1c15e06db6a72a602d2a37dd3187a08d3"
+  },
+  "lib/immutable/openzeppelin-contracts": {
+    "rev": "b8c7b9e82d2b340cf82f2913c38e3a0bac2f96ae"
+  },
+  "lib/mutable/pauser": {
+    "rev": "545928d067a3dd7ffb853ce41ced7177a34febf1"
+  },
+  "lib/mutable/yield-claim-nft": {
+    "rev": "acfcdc1679f8f795783a988fc56f3ec33f14dc3d"
+  }
+}
