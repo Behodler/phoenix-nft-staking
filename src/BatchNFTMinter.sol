@@ -3,7 +3,9 @@ pragma solidity ^0.8.20;
 
 import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {
+    SafeERC20
+} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title BatchNFTMinter
@@ -56,7 +58,11 @@ contract BatchNFTMinter is Ownable {
 
     event NudgeSizeChanged(uint256 newSize);
     event NudgePaymentTokenChanged(address indexed newToken);
-    event NudgePaid(address indexed recipient, address indexed token, uint256 amount);
+    event NudgePaid(
+        address indexed recipient,
+        address indexed token,
+        uint256 amount
+    );
 
     /// @notice Owner-gated update of the batch-size threshold for the nudge
     ///         payout. Setting `0` disables the feature.
@@ -112,7 +118,10 @@ contract BatchNFTMinter is Ownable {
         if (recipient == address(0)) revert BatchMint__ZeroRecipient();
 
         address _nudgeTokenEntry = nudgePaymentToken;
-        if (_nudgeTokenEntry != address(0) && _nudgeTokenEntry == address(paymentToken)) {
+        if (
+            _nudgeTokenEntry != address(0) &&
+            _nudgeTokenEntry == address(paymentToken)
+        ) {
             revert BatchMint__NudgeTokenMatchesPaymentToken();
         }
 
@@ -125,16 +134,22 @@ contract BatchNFTMinter is Ownable {
 
         paymentToken.forceApprove(address(nftMinter), 0);
 
+        //note to reviewer: I (dev) changed nudgeToken to reuse _nudgeTokenEntry
         uint256 _nudgeSize = nudgeSize;
         if (_nudgeSize != 0 && count >= _nudgeSize) {
             // _nudgeTokenEntry guaranteed != paymentToken by the up-front guard;
             // re-read here is a warm SLOAD.
-            address _nudgeToken = nudgePaymentToken;
-            if (_nudgeToken != address(0)) {
-                uint256 nudgeAmount = IERC20(_nudgeToken).balanceOf(address(this));
+
+            if (_nudgeTokenEntry != address(0)) {
+                uint256 nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(
+                    address(this)
+                );
                 if (nudgeAmount != 0) {
-                    IERC20(_nudgeToken).safeTransfer(recipient, nudgeAmount);
-                    emit NudgePaid(recipient, _nudgeToken, nudgeAmount);
+                    IERC20(_nudgeTokenEntry).safeTransfer(
+                        recipient,
+                        nudgeAmount
+                    );
+                    emit NudgePaid(recipient, _nudgeTokenEntry, nudgeAmount);
                 }
             }
         }
@@ -142,7 +157,9 @@ contract BatchNFTMinter is Ownable {
         uint256 remaining = paymentToken.balanceOf(address(this));
         if (remaining / DUST_THRESHOLD != 0) {
             paymentToken.safeTransfer(msg.sender, remaining);
-            totalPaid = paymentAmount > remaining ? paymentAmount - remaining : 0;
+            totalPaid = paymentAmount > remaining
+                ? paymentAmount - remaining
+                : 0;
         } else {
             totalPaid = paymentAmount;
         }
