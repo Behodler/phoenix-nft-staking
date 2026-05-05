@@ -24,6 +24,7 @@ contract BatchNFTMinterTest is Test {
     MockERC1155 internal nft;
     MockERC20 internal payToken;
 
+    address internal owner = makeAddr("batchOwner");
     address internal caller = address(0xCAFE);
     address internal recipient = address(0xBEEF);
     uint256 internal constant DISPATCHER_INDEX = 7;
@@ -31,7 +32,7 @@ contract BatchNFTMinterTest is Test {
     uint256 internal constant GROWTH_BPS = 250; // 2.5% per mint
 
     function setUp() public virtual {
-        batch = new BatchNFTMinter();
+        batch = new BatchNFTMinter(owner);
         nftMinter = new MockITokenMinterV2();
         nft = new MockERC1155();
         payToken = new MockERC20("PayToken", "PAY");
@@ -338,5 +339,32 @@ contract BatchNFTMinterTest is Test {
             ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 25, recipient, expected
         );
         vm.snapshotGasLastCall("batchMintN_25");
+    }
+
+    /// @notice Capture the unhappy-path SLOAD overhead added by the nudge
+    ///         feature: nudge configured (so the entry-guard SLOAD pays
+    ///         cold gas), but `count` is below the threshold so the
+    ///         post-loop transfer block early-exits after one warm read.
+    function test_gas_batchMintNudge_unhappyPath() public {
+        // Configure the nudge with a distinct token and a threshold the
+        // call will not meet.
+        MockERC20 nudgeToken = new MockERC20("NudgeToken", "NDG");
+        vm.prank(owner);
+        batch.setNudgePaymentToken(address(nudgeToken));
+        vm.prank(owner);
+        batch.setNudgeSize(10);
+
+        // Fund the helper with nudge tokens so SLOAD/balanceOf reads
+        // exercise hot storage in the same shape the happy path would.
+        nudgeToken.mint(address(batch), 1_000 ether);
+
+        uint256 N = 5; // below the threshold of 10
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+        vm.prank(caller);
+        batch.batchMint(
+            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
+        );
+        vm.snapshotGasLastCall("batchMintNudge_unhappyPath");
     }
 }
