@@ -3,10 +3,10 @@ pragma solidity ^0.8.20;
 
 import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {
-    SafeERC20
-} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IPausable} from "pauser/interfaces/IPausable.sol";
 
 /// @title BatchNFTMinter
 /// @notice Helper that loops `ITokenMinterV2.mint(...)` `count` times in a single
@@ -14,6 +14,19 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 ///         The caller passes the aggregate `paymentAmount`; the helper pulls it
 ///         once upfront, pre-approves the minter for `type(uint256).max`, then
 ///         revokes the approval at the end.
+///
+/// The NFT minter is a **trusted, owner-configured** contract (`tokenMinter`),
+/// NOT a call parameter. Originally `batchMint` accepted the minter as a
+/// caller-supplied argument; that was safe while the contract held no funds of
+/// its own (story-009's stateless looper). Once the owner-administered nudge
+/// (below) gave the contract a balance that pays out on a purely numeric
+/// `count >= nudgeSize` gate, a caller-supplied minter became a drain vector:
+/// an attacker could pass a no-op minter, fake `count` cheap "mints", clear the
+/// gate, and walk off with the entire nudge pot without paying for any real
+/// mints. Pinning the minter to owner-set state closes this — qualifying for
+/// the nudge now requires genuinely paying for >= `nudgeSize` real mints at the
+/// dispatcher's ramping price, and a faked/mismatched `paymentToken` reverts the
+/// real `mint()` and rolls the whole batch back.
 ///
 /// Owner-administered nudge incentive (introduced after the original stateless
 /// design): when `count >= nudgeSize` and `nudgePaymentToken` is set, the
@@ -33,7 +46,12 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 ///
 /// If `paymentAmount` falls short of the dispatcher's cumulative charge an
 /// inner `mint` reverts and the entire batch atomically rolls back.
-contract BatchNFTMinter is Ownable {
+///
+/// Pausing is wired into the Phoenix global `Pauser` via the hybrid OZ
+/// `Pausable` + `IPausable` pattern (see `NFTStaker`): a settable `pauser`
+/// address may `pause()`/`unpause()`, and only `batchMint` is gated by
+/// `whenNotPaused`. Admin setters and `rescueERC20` stay callable while paused.
+contract BatchNFTMinter is Ownable, Pausable, IPausable {
     using SafeERC20 for IERC20;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
@@ -43,11 +61,19 @@ contract BatchNFTMinter is Ownable {
     ///      slack. For an 18-decimal token this is ~10^-12 of a unit.
     uint256 internal constant DUST_THRESHOLD = 1e6;
 
+    /// @notice Trusted, owner-configured NFT minter every `batchMint` forwards
+    ///         to. `address(0)` disables `batchMint`.
+    ITokenMinterV2 public tokenMinter;
+
     /// @notice Batch sizes >= this value qualify for the nudge payout. `0` disables.
     uint256 public nudgeSize;
 
     /// @notice ERC20 paid out as the nudge. `address(0)` disables.
     address public nudgePaymentToken;
+
+    /// @notice Address authorised to pause/unpause via the global pauser.
+    ///         Settable by the owner; `address(0)` disables pausing.
+    address public pauser;
 
     /// @dev Reverted when `count == 0`.
     error BatchMint__ZeroCount();
@@ -55,14 +81,30 @@ contract BatchNFTMinter is Ownable {
     error BatchMint__ZeroRecipient();
     /// @dev Reverted when `nudgePaymentToken` is set and equals the call's `paymentToken`.
     error BatchMint__NudgeTokenMatchesPaymentToken();
+    /// @dev Reverted when `batchMint` is called while `tokenMinter` is unset.
+    error BatchMint__MinterNotConfigured();
+    /// @dev Reverted when `rescueERC20` is given a zero destination.
+    error Rescue__ZeroRecipient();
 
     event NudgeSizeChanged(uint256 newSize);
     event NudgePaymentTokenChanged(address indexed newToken);
-    event NudgePaid(
-        address indexed recipient,
-        address indexed token,
-        uint256 amount
-    );
+    event NudgePaid(address indexed recipient, address indexed token, uint256 amount);
+    event TokenMinterSet(address indexed newMinter);
+    event Rescued(address indexed token, address indexed to, uint256 amount);
+    event PauserChanged(address indexed previousPauser, address indexed newPauser);
+
+    modifier onlyPauser() {
+        require(msg.sender == pauser, "BatchNFTMinter: caller is not pauser");
+        _;
+    }
+
+    /// @notice Owner-gated update of the trusted NFT minter. Setting
+    ///         `address(0)` disables `batchMint` (it reverts
+    ///         `BatchMint__MinterNotConfigured`).
+    function setTokenMinter(ITokenMinterV2 newMinter) external onlyOwner {
+        tokenMinter = newMinter;
+        emit TokenMinterSet(address(newMinter));
+    }
 
     /// @notice Owner-gated update of the batch-size threshold for the nudge
     ///         payout. Setting `0` disables the feature.
@@ -78,14 +120,48 @@ contract BatchNFTMinter is Ownable {
         emit NudgePaymentTokenChanged(newToken);
     }
 
+    /// @notice Owner-gated update of the pauser address. Setting `address(0)`
+    ///         disables pausing. Stays callable while paused.
+    function setPauser(address newPauser) external onlyOwner {
+        emit PauserChanged(pauser, newPauser);
+        pauser = newPauser;
+    }
+
+    /// @notice Pause `batchMint`. Callable only by the registered `pauser`
+    ///         (typically the global Pauser contract). Matches `NFTStaker`'s
+    ///         pauser-only convention.
+    function pause() external override onlyPauser {
+        _pause();
+    }
+
+    /// @notice Resume `batchMint`. Callable only by the registered `pauser`.
+    function unpause() external override onlyPauser {
+        _unpause();
+    }
+
+    /// @notice Owner-only recovery of an arbitrary ERC20. The deployed
+    ///         contract previously had no owner-withdraw at all, so a trapped
+    ///         balance could only ever leave via the nudge — this is the
+    ///         missing escape hatch. Owner-trusted (the owner can already pull
+    ///         the nudge token via the nudge setters), so no token restriction
+    ///         is needed; an explicit `amount` is preferred over a
+    ///         full-balance sweep so it composes with the nudge pot. Stays
+    ///         callable while paused (mirrors `NFTStaker.emergencyWithdraw`).
+    function rescueERC20(IERC20 token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert Rescue__ZeroRecipient();
+        token.safeTransfer(to, amount);
+        emit Rescued(address(token), to, amount);
+    }
+
     /// @notice Mint `count` NFT units of dispatcher `dispatcherIndex` to
     ///         `recipient`, pulling `paymentAmount` of `paymentToken`
     ///         from `msg.sender` upfront and refunding any surplus.
-    /// @dev    `paymentToken` must match the dispatcher's prime token —
-    ///         V2's `mint(...)` resolves the payment asset from the
-    ///         dispatcher itself, so a mismatch causes the inner mint to
-    ///         revert and the entire batch rolls back atomically
-    ///         (including the upfront pull).
+    /// @dev    Forwards to the trusted, owner-pinned `tokenMinter`; reverts
+    ///         `BatchMint__MinterNotConfigured` if it is unset. `paymentToken`
+    ///         must match the dispatcher's prime token — V2's `mint(...)`
+    ///         resolves the payment asset from the dispatcher itself, so a
+    ///         mismatch causes the inner mint to revert and the entire batch
+    ///         rolls back atomically (including the upfront pull).
     ///
     ///         When the nudge feature is active and `count >= nudgeSize`,
     ///         the helper transfers its full `nudgePaymentToken` balance
@@ -94,9 +170,8 @@ contract BatchNFTMinter is Ownable {
     ///         If `nudgePaymentToken` is configured it must be a different
     ///         address than `paymentToken` — otherwise the call reverts
     ///         up-front, before any funds are pulled.
-    /// @param  nftMinter        The NFT minter to forward each `mint` to.
     /// @param  paymentToken     ERC20 used to pay for each mint.
-    /// @param  dispatcherIndex  Dispatcher index registered with `nftMinter`.
+    /// @param  dispatcherIndex  Dispatcher index registered with the pinned minter.
     /// @param  count            Number of mints (>0).
     /// @param  recipient        ERC1155 recipient (non-zero).
     /// @param  paymentAmount    Total payment-token to pull upfront.
@@ -107,21 +182,22 @@ contract BatchNFTMinter is Ownable {
     /// @return totalPaid        Caller's net spend (`paymentAmount`
     ///                          minus any refunded surplus).
     function batchMint(
-        ITokenMinterV2 nftMinter,
         IERC20 paymentToken,
         uint256 dispatcherIndex,
         uint256 count,
         address recipient,
         uint256 paymentAmount
-    ) external returns (uint256 totalPaid) {
+    ) external whenNotPaused returns (uint256 totalPaid) {
         if (count == 0) revert BatchMint__ZeroCount();
         if (recipient == address(0)) revert BatchMint__ZeroRecipient();
 
+        ITokenMinterV2 nftMinter = tokenMinter;
+        if (address(nftMinter) == address(0)) {
+            revert BatchMint__MinterNotConfigured();
+        }
+
         address _nudgeTokenEntry = nudgePaymentToken;
-        if (
-            _nudgeTokenEntry != address(0) &&
-            _nudgeTokenEntry == address(paymentToken)
-        ) {
+        if (_nudgeTokenEntry != address(0) && _nudgeTokenEntry == address(paymentToken)) {
             revert BatchMint__NudgeTokenMatchesPaymentToken();
         }
 
@@ -141,14 +217,9 @@ contract BatchNFTMinter is Ownable {
             // re-read here is a warm SLOAD.
 
             if (_nudgeTokenEntry != address(0)) {
-                uint256 nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(
-                    address(this)
-                );
+                uint256 nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(address(this));
                 if (nudgeAmount != 0) {
-                    IERC20(_nudgeTokenEntry).safeTransfer(
-                        recipient,
-                        nudgeAmount
-                    );
+                    IERC20(_nudgeTokenEntry).safeTransfer(recipient, nudgeAmount);
                     emit NudgePaid(recipient, _nudgeTokenEntry, nudgeAmount);
                 }
             }
@@ -157,9 +228,7 @@ contract BatchNFTMinter is Ownable {
         uint256 remaining = paymentToken.balanceOf(address(this));
         if (remaining / DUST_THRESHOLD != 0) {
             paymentToken.safeTransfer(msg.sender, remaining);
-            totalPaid = paymentAmount > remaining
-                ? paymentAmount - remaining
-                : 0;
+            totalPaid = paymentAmount > remaining ? paymentAmount - remaining : 0;
         } else {
             totalPaid = paymentAmount;
         }

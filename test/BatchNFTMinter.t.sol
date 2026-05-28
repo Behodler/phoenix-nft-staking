@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -25,6 +26,7 @@ contract BatchNFTMinterTest is Test {
     MockERC20 internal payToken;
 
     address internal owner = makeAddr("batchOwner");
+    address internal pauser = makeAddr("batchPauser");
     address internal caller = address(0xCAFE);
     address internal recipient = address(0xBEEF);
     uint256 internal constant DISPATCHER_INDEX = 7;
@@ -40,6 +42,9 @@ contract BatchNFTMinterTest is Test {
         nftMinter.setStakedToken(nft);
         nftMinter.setConfig(DISPATCHER_INDEX, START_PRICE, GROWTH_BPS);
         nftMinter.setPrimeToken(DISPATCHER_INDEX, address(payToken));
+
+        vm.prank(owner);
+        batch.setTokenMinter(ITokenMinterV2(address(nftMinter)));
     }
 
     // ---- helpers ----
@@ -75,12 +80,64 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(START_PRICE, address(batch));
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, START_PRICE
-        );
+        uint256 totalPaid = batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, START_PRICE);
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 1, "recipient gets 1 NFT unit");
         assertEq(totalPaid, START_PRICE, "totalPaid equals starting price");
+    }
+
+    function test_batchMint_revertsWhenMinterNotConfigured() public {
+        // Unpin the minter; batchMint must refuse to run.
+        vm.prank(owner);
+        batch.setTokenMinter(ITokenMinterV2(address(0)));
+
+        _fundCaller(START_PRICE, address(batch));
+        vm.prank(caller);
+        vm.expectRevert(BatchNFTMinter.BatchMint__MinterNotConfigured.selector);
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, START_PRICE);
+    }
+
+    function test_batchMint_revertsWhenPaused() public {
+        vm.prank(owner);
+        batch.setPauser(pauser);
+        vm.prank(pauser);
+        batch.pause();
+
+        _fundCaller(START_PRICE, address(batch));
+        vm.prank(caller);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, START_PRICE);
+
+        // After unpause it works again.
+        vm.prank(pauser);
+        batch.unpause();
+        vm.prank(caller);
+        uint256 totalPaid = batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, START_PRICE);
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 1, "mint resumes after unpause");
+        assertEq(totalPaid, START_PRICE, "totalPaid correct after unpause");
+    }
+
+    function test_setPauser_onlyOwner_andEmits() public {
+        vm.prank(caller);
+        vm.expectRevert();
+        batch.setPauser(pauser);
+
+        vm.prank(owner);
+        batch.setPauser(pauser);
+        assertEq(batch.pauser(), pauser, "pauser stored");
+    }
+
+    function test_pause_revertsForNonPauser() public {
+        vm.prank(owner);
+        batch.setPauser(pauser);
+
+        vm.prank(caller);
+        vm.expectRevert("BatchNFTMinter: caller is not pauser");
+        batch.pause();
+
+        vm.prank(caller);
+        vm.expectRevert("BatchNFTMinter: caller is not pauser");
+        batch.unpause();
     }
 
     function test_batchMint_NIterations_mintsNUnitsToRecipient() public {
@@ -89,9 +146,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(expected, address(batch));
 
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected);
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "recipient gets N NFT units");
     }
@@ -108,9 +163,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
-        );
+        uint256 totalPaid = batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected);
 
         uint256 callerAfter = payToken.balanceOf(caller);
         assertEq(callerBefore - callerAfter, expected, "caller balance delta = sum of growing prices");
@@ -120,17 +173,13 @@ contract BatchNFTMinterTest is Test {
     function test_batchMint_revertsOnZeroCount() public {
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__ZeroCount.selector);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 0, recipient, 0
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 0, recipient, 0);
     }
 
     function test_batchMint_revertsOnZeroRecipient() public {
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__ZeroRecipient.selector);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 1, address(0), 0
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 1, address(0), 0);
     }
 
     function test_batchMint_revertsAtomicallyOnInnerRevert() public {
@@ -146,9 +195,7 @@ contract BatchNFTMinterTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(MockITokenMinterV2.MockITokenMinterV2__ForcedRevert.selector);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected);
 
         assertEq(payToken.balanceOf(caller), callerBefore, "caller balance unchanged on revert");
         assertEq(
@@ -164,9 +211,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(expected, address(batch));
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
-        );
+        uint256 totalPaid = batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected);
 
         assertEq(totalPaid, expected, "returned totalPaid matches geometric sum");
     }
@@ -181,9 +226,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, paid
-        );
+        uint256 totalPaid = batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, paid);
 
         assertEq(totalPaid, expected, "totalPaid is dispatcher cost, not paymentAmount");
         assertEq(payToken.balanceOf(caller), callerBefore - expected, "surplus refunded to caller");
@@ -199,9 +242,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, paid
-        );
+        uint256 totalPaid = batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, paid);
 
         assertEq(totalPaid, paid, "totalPaid swallows dust");
         assertEq(payToken.balanceOf(caller), callerBefore - paid, "no refund issued for sub-threshold");
@@ -220,9 +261,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected);
 
         assertEq(
             payToken.balanceOf(caller),
@@ -267,9 +306,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 1);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 1, recipient, expected);
         vm.snapshotGasLastCall("batchMintCount1");
     }
 
@@ -284,9 +321,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 2);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 2, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 2, recipient, expected);
         vm.snapshotGasLastCall("batchMintN_2");
     }
 
@@ -301,9 +336,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 5);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 5, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 5, recipient, expected);
         vm.snapshotGasLastCall("batchMintN_5");
     }
 
@@ -318,9 +351,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 10);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 10, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 10, recipient, expected);
         vm.snapshotGasLastCall("batchMintN_10");
     }
 
@@ -335,9 +366,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 25);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, 25, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, 25, recipient, expected);
         vm.snapshotGasLastCall("batchMintN_25");
     }
 
@@ -362,9 +391,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(
-            ITokenMinterV2(address(nftMinter)), IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected
-        );
+        batch.batchMint(IERC20(address(payToken)), DISPATCHER_INDEX, N, recipient, expected);
         vm.snapshotGasLastCall("batchMintNudge_unhappyPath");
     }
 }
