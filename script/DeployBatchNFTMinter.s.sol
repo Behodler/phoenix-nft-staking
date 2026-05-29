@@ -40,6 +40,13 @@ contract DeployBatchNFTMinter is Script {
     /// @notice Batch-size threshold qualifying for the nudge.
     uint256 internal constant NUDGE_SIZE = 40;
 
+    /// @notice The only dispatcher index this helper mints — the
+    ///         `BalancerPoolerV2` dispatcher on the canonical `NFTMinterV2`.
+    ///         ASSUMED = 4; the operator MUST confirm against the live minter
+    ///         (`dispatcherToIndex(BalancerPoolerV2)` / `configs(4).dispatcher`)
+    ///         before broadcast. If it differs, set the correct value here.
+    uint256 internal constant DISPATCHER_INDEX = 4;
+
     /// @notice Global Pauser address (Phoenix). Override via env `PAUSER`.
     ///         Defaults to address(0) so a misconfigured run trips the guard
     ///         rather than silently deploying an unpausable contract.
@@ -64,6 +71,7 @@ contract DeployBatchNFTMinter is Script {
         // the dust sweep becomes a drain. USDC is the nudge token; mints pay in
         // the dispatcher's prime token (e.g. USDS), which must not be USDC.
         require(NUDGE_SIZE != 0, "deploy: nudgeSize zero");
+        require(DISPATCHER_INDEX != 0, "deploy: dispatcherIndex unset");
         require(pauser != address(0), "deploy: pauser unset (set PAUSER env)");
         require(owner != address(0), "deploy: owner unset");
 
@@ -73,6 +81,9 @@ contract DeployBatchNFTMinter is Script {
 
         // Pin the trusted minter FIRST — the load-bearing fix.
         batch.setTokenMinter(ITokenMinterV2(TOKEN_MINTER));
+
+        // Pin the only dispatcher index this helper mints (derives payment token).
+        batch.setDispatcherIndex(DISPATCHER_INDEX);
 
         // Then the nudge knobs.
         batch.setNudgePaymentToken(USDC);
@@ -85,6 +96,7 @@ contract DeployBatchNFTMinter is Script {
 
         // Post-conditions mirror the guards.
         require(address(batch.tokenMinter()) == TOKEN_MINTER, "deploy: minter not pinned");
+        require(batch.dispatcherIndex() == DISPATCHER_INDEX, "deploy: dispatcherIndex not pinned");
         require(batch.nudgePaymentToken() == USDC, "deploy: nudge token not set");
         require(batch.nudgeSize() == NUDGE_SIZE, "deploy: nudge size not set");
         require(batch.pauser() == pauser, "deploy: pauser not set");
@@ -92,6 +104,7 @@ contract DeployBatchNFTMinter is Script {
         console2.log("BatchNFTMinter deployed:", address(batch));
         console2.log("  owner:        ", owner);
         console2.log("  tokenMinter:  ", TOKEN_MINTER);
+        console2.log("  dispatcherIdx:", DISPATCHER_INDEX);
         console2.log("  nudgeToken:   ", USDC);
         console2.log("  nudgeSize:    ", NUDGE_SIZE);
         console2.log("  pauser:       ", pauser);

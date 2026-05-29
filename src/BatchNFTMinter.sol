@@ -2,6 +2,8 @@
 pragma solidity ^0.8.20;
 
 import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
+import {INFTMinterV2} from "yield-claim-nft/V2/interfaces/INFTMinterV2.sol";
+import {ITokenDispatcherV2} from "yield-claim-nft/V2/interfaces/ITokenDispatcherV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -65,6 +67,13 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     ///         to. `address(0)` disables `batchMint`.
     ITokenMinterV2 public tokenMinter;
 
+    /// @notice The only dispatcher index `batchMint` mints. Owner-set;
+    ///         `0` = unconfigured and disables `batchMint`. The V2 minter's
+    ///         `nextIndex` starts at 1, so `0` is never a valid registered
+    ///         dispatcher — reusing it as the disabled sentinel mirrors
+    ///         `tokenMinter == address(0)`.
+    uint256 public dispatcherIndex;
+
     /// @notice Batch sizes >= this value qualify for the nudge payout. `0` disables.
     uint256 public nudgeSize;
 
@@ -83,6 +92,9 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     error BatchMint__NudgeTokenMatchesPaymentToken();
     /// @dev Reverted when `batchMint` is called while `tokenMinter` is unset.
     error BatchMint__MinterNotConfigured();
+    /// @dev Reverted when `batchMint` is called while `dispatcherIndex` is unset
+    ///      (`0`) or the pinned index resolves to a zero dispatcher.
+    error BatchMint__DispatcherNotConfigured();
     /// @dev Reverted when `rescueERC20` is given a zero destination.
     error Rescue__ZeroRecipient();
 
@@ -90,6 +102,7 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     event NudgePaymentTokenChanged(address indexed newToken);
     event NudgePaid(address indexed recipient, address indexed token, uint256 amount);
     event TokenMinterSet(address indexed newMinter);
+    event DispatcherIndexSet(uint256 indexed dispatcherIndex);
     event Rescued(address indexed token, address indexed to, uint256 amount);
     event PauserChanged(address indexed previousPauser, address indexed newPauser);
 
@@ -104,6 +117,15 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     function setTokenMinter(ITokenMinterV2 newMinter) external onlyOwner {
         tokenMinter = newMinter;
         emit TokenMinterSet(address(newMinter));
+    }
+
+    /// @notice Owner-gated update of the only dispatcher index `batchMint`
+    ///         mints. Setting `0` disables `batchMint` (it reverts
+    ///         `BatchMint__DispatcherNotConfigured`). Stays callable while
+    ///         paused.
+    function setDispatcherIndex(uint256 newIndex) external onlyOwner {
+        dispatcherIndex = newIndex;
+        emit DispatcherIndexSet(newIndex);
     }
 
     /// @notice Owner-gated update of the batch-size threshold for the nudge
@@ -153,25 +175,28 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
         emit Rescued(address(token), to, amount);
     }
 
-    /// @notice Mint `count` NFT units of dispatcher `dispatcherIndex` to
-    ///         `recipient`, pulling `paymentAmount` of `paymentToken`
-    ///         from `msg.sender` upfront and refunding any surplus.
+    /// @notice Mint `count` NFT units of the owner-pinned `dispatcherIndex`
+    ///         to `recipient`, pulling `paymentAmount` of the dispatcher's
+    ///         prime token from `msg.sender` upfront and refunding any surplus.
     /// @dev    Forwards to the trusted, owner-pinned `tokenMinter`; reverts
-    ///         `BatchMint__MinterNotConfigured` if it is unset. `paymentToken`
-    ///         must match the dispatcher's prime token — V2's `mint(...)`
-    ///         resolves the payment asset from the dispatcher itself, so a
-    ///         mismatch causes the inner mint to revert and the entire batch
-    ///         rolls back atomically (including the upfront pull).
+    ///         `BatchMint__MinterNotConfigured` if it is unset. The dispatcher
+    ///         is pinned as owner-set state (`dispatcherIndex`); the caller can
+    ///         no longer choose it. `batchMint` reverts
+    ///         `BatchMint__DispatcherNotConfigured` if `dispatcherIndex` is `0`
+    ///         (unconfigured) or resolves to a zero dispatcher. The payment
+    ///         asset is DERIVED from the pinned dispatcher's `primeToken()` —
+    ///         it is no longer a caller-supplied parameter, so a wrong/zero
+    ///         payment asset can never be passed.
     ///
     ///         When the nudge feature is active and `count >= nudgeSize`,
     ///         the helper transfers its full `nudgePaymentToken` balance
     ///         to `recipient` AFTER the loop (and after the V2 minter
     ///         allowance is revoked) but BEFORE the dust refund sweep.
     ///         If `nudgePaymentToken` is configured it must be a different
-    ///         address than `paymentToken` — otherwise the call reverts
-    ///         up-front, before any funds are pulled.
-    /// @param  paymentToken     ERC20 used to pay for each mint.
-    /// @param  dispatcherIndex  Dispatcher index registered with the pinned minter.
+    ///         address than the derived payment token — otherwise the call
+    ///         reverts up-front, before any funds are pulled. With the payment
+    ///         token derived, this guard is a deploy-time config invariant
+    ///         (nudge token must differ from the dispatcher's prime token).
     /// @param  count            Number of mints (>0).
     /// @param  recipient        ERC1155 recipient (non-zero).
     /// @param  paymentAmount    Total payment-token to pull upfront.
@@ -182,8 +207,6 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     /// @return totalPaid        Caller's net spend (`paymentAmount`
     ///                          minus any refunded surplus).
     function batchMint(
-        IERC20 paymentToken,
-        uint256 dispatcherIndex,
         uint256 count,
         address recipient,
         uint256 paymentAmount
@@ -196,6 +219,14 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
             revert BatchMint__MinterNotConfigured();
         }
 
+        uint256 _dispatcherIndex = dispatcherIndex;
+        if (_dispatcherIndex == 0) revert BatchMint__DispatcherNotConfigured();
+
+        (address dispatcher,,,) = INFTMinterV2(address(nftMinter)).configs(_dispatcherIndex);
+        if (dispatcher == address(0)) revert BatchMint__DispatcherNotConfigured();
+
+        IERC20 paymentToken = IERC20(ITokenDispatcherV2(dispatcher).primeToken());
+
         address _nudgeTokenEntry = nudgePaymentToken;
         if (_nudgeTokenEntry != address(0) && _nudgeTokenEntry == address(paymentToken)) {
             revert BatchMint__NudgeTokenMatchesPaymentToken();
@@ -205,7 +236,7 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
         paymentToken.forceApprove(address(nftMinter), type(uint256).max);
 
         for (uint256 i; i < count; ++i) {
-            nftMinter.mint(dispatcherIndex, recipient);
+            nftMinter.mint(_dispatcherIndex, recipient);
         }
 
         paymentToken.forceApprove(address(nftMinter), 0);

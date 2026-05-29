@@ -37,6 +37,7 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
 
     mapping(uint256 => Config) private _configs;
     mapping(uint256 => address) private _primeToken;
+    mapping(uint256 => address) private _dispatcher;
     MockERC1155 public stakedToken;
 
     uint256 public mintCallCount;
@@ -90,6 +91,26 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
 
     function setPrimeToken(uint256 index, address token) external {
         _primeToken[index] = token;
+    }
+
+    /// @notice Pin the dispatcher address returned by `configs(index)`.
+    ///         `BatchNFTMinter` resolves the payment asset by reading
+    ///         `configs(index).dispatcher` then `dispatcher.primeToken()`.
+    function setDispatcher(uint256 index, address dispatcher) external {
+        _dispatcher[index] = dispatcher;
+    }
+
+    /// @notice `INFTMinterV2.configs` shape. `BatchNFTMinter` casts
+    ///         `address(tokenMinter)` to `INFTMinterV2` and reads the
+    ///         dispatcher address from here. Price/growth mirror the mock's
+    ///         own `Config` storage; `disabled` is always false.
+    function configs(uint256 index)
+        external
+        view
+        returns (address dispatcher, uint256 price, uint256 growthBasisPoints, bool disabled)
+    {
+        Config storage c = _configs[index];
+        return (_dispatcher[index], c.price, c.growthBasisPoints, false);
     }
 
     function setStakedToken(MockERC1155 token) external {
