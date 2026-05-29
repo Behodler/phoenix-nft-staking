@@ -145,7 +145,7 @@ contract BatchNFTMinterNudgeTest is Test {
         uint256 recipientBefore = nudgeToken.balanceOf(recipient);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
         assertEq(nudgeToken.balanceOf(recipient), recipientBefore, "no nudge paid when size is zero");
     }
 
@@ -161,7 +161,7 @@ contract BatchNFTMinterNudgeTest is Test {
         uint256 recipientBefore = nudgeToken.balanceOf(recipient);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
         assertEq(nudgeToken.balanceOf(recipient), recipientBefore, "no nudge paid when token is zero");
     }
 
@@ -183,7 +183,7 @@ contract BatchNFTMinterNudgeTest is Test {
         emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(
             nudgeToken.balanceOf(recipient),
@@ -207,7 +207,7 @@ contract BatchNFTMinterNudgeTest is Test {
         emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(
             nudgeToken.balanceOf(recipient),
@@ -230,7 +230,7 @@ contract BatchNFTMinterNudgeTest is Test {
         // not present.
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 nudgePaidSig = keccak256("NudgePaid(address,address,uint256)");
         for (uint256 i = 0; i < logs.length; i++) {
@@ -254,7 +254,7 @@ contract BatchNFTMinterNudgeTest is Test {
         uint256 recipientBefore = nudgeToken.balanceOf(recipient);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(nudgeToken.balanceOf(recipient), recipientBefore, "no payout when size is zero");
         assertEq(nudgeToken.balanceOf(address(batch)), NUDGE_FUNDED_AMOUNT, "helper retains nudge balance");
@@ -271,7 +271,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         // Should succeed without paying any nudge — no revert.
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         // Sanity: nudgeToken not configured, helper should hold none.
         assertEq(nudgeToken.balanceOf(recipient), 0, "recipient gets no nudge");
@@ -293,7 +293,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 nudgePaidSig = keccak256("NudgePaid(address,address,uint256)");
         for (uint256 i = 0; i < logs.length; i++) {
@@ -322,7 +322,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(MockITokenMinterV2.MockITokenMinterV2__ForcedRevert.selector);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(nudgeToken.balanceOf(recipient), recipientBefore, "recipient nudge unchanged on revert");
         assertEq(nudgeToken.balanceOf(address(batch)), batchBefore, "helper nudge balance unchanged on revert");
@@ -350,7 +350,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__NudgeTokenMatchesPaymentToken.selector);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(payToken.balanceOf(caller), callerBefore, "guard fires before upfront pull");
     }
@@ -367,7 +367,7 @@ contract BatchNFTMinterNudgeTest is Test {
         assertEq(batch.nudgePaymentToken(), address(0), "nudge token unset by default");
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         // Reaching this point without revert is the assertion.
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "mint succeeded with feature off");
@@ -395,7 +395,7 @@ contract BatchNFTMinterNudgeTest is Test {
         emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, paid);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, 0);
 
         // Nudge: recipient got funded amount in nudgeToken.
         assertEq(
@@ -444,7 +444,7 @@ contract BatchNFTMinterNudgeTest is Test {
         uint256 N = NUDGE_SIZE; // clears the gate
         vm.prank(attacker);
         vm.expectRevert();
-        batch.batchMint(N, attacker, 0);
+        batch.batchMint(N, attacker, 0, 0);
 
         assertEq(nudgeToken.balanceOf(address(batch)), potBefore, "pot untouched after failed drain");
         assertEq(nudgeToken.balanceOf(attacker), 0, "attacker received nothing");
@@ -465,7 +465,7 @@ contract BatchNFTMinterNudgeTest is Test {
         emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "recipient gets N real NFT units");
         assertEq(nudgeToken.balanceOf(recipient), recipientBefore + NUDGE_FUNDED_AMOUNT, "nudge paid on genuine batch");
@@ -523,7 +523,7 @@ contract BatchNFTMinterNudgeTest is Test {
         _fundCaller(expected, address(batch));
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__MinterNotConfigured.selector);
-        batch.batchMint(1, recipient, expected);
+        batch.batchMint(1, recipient, expected, 0);
     }
 
     // ----------------------------------------------------------------
@@ -563,7 +563,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__DispatcherNotConfigured.selector);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(nudgeToken.balanceOf(address(batch)), potBefore, "pot untouched when dispatcher unset");
         assertEq(nudgeToken.balanceOf(recipient), 0, "recipient gets no nudge when dispatcher unset");
@@ -589,7 +589,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__DispatcherNotConfigured.selector);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(nudgeToken.balanceOf(address(batch)), potBefore, "pot untouched when dispatcher resolves to zero");
     }
@@ -615,7 +615,7 @@ contract BatchNFTMinterNudgeTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, paid);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, 0);
 
         // The DERIVED payToken is what was pulled and swept — surplus refunded.
         assertEq(payToken.balanceOf(caller), callerBefore - expected, "derived token pulled; surplus refunded");
@@ -652,10 +652,205 @@ contract BatchNFTMinterNudgeTest is Test {
         // before any funds move. Pot stays put.
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__NudgeTokenMatchesPaymentToken.selector);
-        batch.batchMint(N, caller, expected);
+        batch.batchMint(N, caller, expected, 0);
 
         assertEq(payToken.balanceOf(address(batch)), potBefore, "pot not swept");
         assertEq(payToken.balanceOf(caller), expected, "caller keeps its funds, no windfall");
+    }
+
+    // ----------------------------------------------------------------
+    // minReward slippage guard (audit pns13m1 — front-running / nudge griefing)
+    //
+    // A user who calls `batchMint` expecting the nudge reward can be front-run
+    // by an MEV bot that lands its own qualifying batch first and sweeps the
+    // full (balance-based, first-qualifier-takes-all) pot. The victim then
+    // mints at the dispatcher's price for zero/reduced reward — still paying
+    // the full mint cost. `minReward` lets the caller declare the minimum nudge
+    // reward they accept; if the deliverable reward is below it, the WHOLE batch
+    // reverts, rolling back the mints and the payment pull. `minReward == 0`
+    // preserves today's behaviour exactly.
+    //
+    // NOTE: `minReward` is slippage protection, not MEV elimination — the
+    // front-runner still wins the pot. It only stops the loser from minting for
+    // less than their stated floor.
+    // ----------------------------------------------------------------
+
+    /// @dev Front-run / pot-drained: the pot is swept by an attacker's own
+    ///      qualifying batch, then the victim's batch (with `minReward` set to
+    ///      the pot they observed) reverts `BatchMint__RewardBelowMinimum`. No
+    ///      NFTs are minted to the victim's recipient and no payment is pulled.
+    function test_batchMint_minReward_frontRunRevertsAndRollsBack() public {
+        _enableNudgeFeature(NUDGE_SIZE);
+        uint256 observedPot = nudgeToken.balanceOf(address(batch));
+        assertEq(observedPot, NUDGE_FUNDED_AMOUNT, "pot funded for the victim to observe");
+
+        // Attacker front-runs with their own qualifying batch and sweeps the pot.
+        uint256 NA = NUDGE_SIZE;
+        uint256 attackerCost = _expectedTotal(START_PRICE, GROWTH_BPS, NA);
+        payToken.mint(attacker, attackerCost);
+        vm.prank(attacker);
+        payToken.approve(address(batch), attackerCost);
+        vm.prank(attacker);
+        batch.batchMint(NA, attacker, attackerCost, 0);
+        assertEq(nudgeToken.balanceOf(address(batch)), 0, "attacker drained the pot");
+
+        // Victim's tx (was pending) lands second. They set minReward to the pot
+        // they expected to win. The dispatcher price has ramped from the
+        // attacker's mints, so fund a generous buffer — enough that the inner
+        // mints would succeed and the slippage floor (not insufficient payment)
+        // is what reverts. Reward deliverable is now 0 < minReward -> revert.
+        uint256 N = NUDGE_SIZE;
+        uint256 buffer = _expectedTotal(START_PRICE, GROWTH_BPS, 4 * N); // ample headroom
+        _fundCaller(buffer, address(batch));
+
+        uint256 callerPayBefore = payToken.balanceOf(caller);
+        uint256 recipientNftBefore = nft.balanceOf(recipient, DISPATCHER_INDEX);
+
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, observedPot, 0)
+        );
+        batch.batchMint(N, recipient, buffer, observedPot);
+
+        // No mint cost was pulled (atomic rollback) and the victim minted nothing.
+        assertEq(payToken.balanceOf(caller), callerPayBefore, "no payment pulled on slippage revert");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), recipientNftBefore, "victim minted no NFTs");
+    }
+
+    /// @dev Floor met — happy path: `minReward <= nudgeAmount` succeeds, mints
+    ///      `count`, pays the full nudge, and the dust/totalPaid accounting is
+    ///      unchanged.
+    function test_batchMint_minReward_floorMetHappyPath() public {
+        _enableNudgeFeature(NUDGE_SIZE);
+
+        uint256 N = NUDGE_SIZE;
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        uint256 surplus = 7 ether;
+        uint256 paid = expected + surplus;
+        _fundCaller(paid, address(batch));
+
+        uint256 callerPayBefore = payToken.balanceOf(caller);
+        uint256 recipientNudgeBefore = nudgeToken.balanceOf(recipient);
+
+        // Floor strictly below the pot.
+        uint256 floor = NUDGE_FUNDED_AMOUNT - 1 ether;
+
+        vm.expectEmit(true, true, true, true, address(batch));
+        emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
+
+        vm.prank(caller);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, floor);
+
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "minted count");
+        assertEq(
+            nudgeToken.balanceOf(recipient), recipientNudgeBefore + NUDGE_FUNDED_AMOUNT, "full nudge paid"
+        );
+        assertEq(nudgeToken.balanceOf(address(batch)), 0, "helper drained of nudge");
+        assertEq(payToken.balanceOf(caller), callerPayBefore - expected, "surplus refunded unchanged");
+        assertEq(totalPaid, expected, "totalPaid accounting unchanged");
+    }
+
+    /// @dev Floor exactly equal: `minReward == nudgeAmount` succeeds (boundary —
+    ///      the guard is `<`, not `<=`).
+    function test_batchMint_minReward_floorExactlyEqualSucceeds() public {
+        _enableNudgeFeature(NUDGE_SIZE);
+
+        uint256 N = NUDGE_SIZE;
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+
+        uint256 recipientNudgeBefore = nudgeToken.balanceOf(recipient);
+
+        // Floor exactly equal to the pot.
+        vm.expectEmit(true, true, true, true, address(batch));
+        emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
+
+        vm.prank(caller);
+        batch.batchMint(N, recipient, expected, NUDGE_FUNDED_AMOUNT);
+
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "minted count at exact floor");
+        assertEq(
+            nudgeToken.balanceOf(recipient),
+            recipientNudgeBefore + NUDGE_FUNDED_AMOUNT,
+            "full nudge paid at exact floor"
+        );
+    }
+
+    /// @dev `minReward == 0` is backward-compatible: a qualifying batch still
+    ///      pays the nudge, and a non-qualifying batch still succeeds without
+    ///      paying — exactly as today, no revert added.
+    function test_batchMint_minReward_zeroIsBackwardCompatible() public {
+        _enableNudgeFeature(NUDGE_SIZE);
+
+        // Qualifying batch, minReward == 0 -> pays full nudge.
+        uint256 N = NUDGE_SIZE;
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+        uint256 recipientBefore = nudgeToken.balanceOf(recipient);
+
+        vm.prank(caller);
+        batch.batchMint(N, recipient, expected, 0);
+        assertEq(nudgeToken.balanceOf(recipient), recipientBefore + NUDGE_FUNDED_AMOUNT, "nudge paid with floor 0");
+
+        // Non-qualifying batch, minReward == 0 -> succeeds, no payout, no revert.
+        // The price has ramped from the first batch; fund from the current price.
+        uint256 NB = NUDGE_SIZE - 1;
+        uint256 priceNow = nftMinter.getPrice(DISPATCHER_INDEX);
+        uint256 expectedB = _expectedTotal(priceNow, GROWTH_BPS, NB);
+        _fundCaller(expectedB, address(batch));
+        uint256 recipientBeforeB = nudgeToken.balanceOf(recipient);
+
+        vm.prank(caller);
+        batch.batchMint(NB, recipient, expectedB, 0);
+        assertEq(nudgeToken.balanceOf(recipient), recipientBeforeB, "no payout below threshold, no revert with floor 0");
+    }
+
+    /// @dev Floor set but nudge not triggered: `count < nudgeSize` with
+    ///      `minReward > 0` reverts `BatchMint__RewardBelowMinimum(minReward, 0)`
+    ///      and mints nothing — the caller demanded a reward none is available.
+    function test_batchMint_minReward_floorSetButNudgeNotTriggeredReverts() public {
+        _enableNudgeFeature(NUDGE_SIZE);
+
+        uint256 N = NUDGE_SIZE - 1; // below threshold -> reward deliverable is 0
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+
+        uint256 callerPayBefore = payToken.balanceOf(caller);
+        uint256 recipientNftBefore = nft.balanceOf(recipient, DISPATCHER_INDEX);
+
+        uint256 floor = 1; // any non-zero floor
+
+        vm.prank(caller);
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, floor, 0));
+        batch.batchMint(N, recipient, expected, floor);
+
+        assertEq(payToken.balanceOf(caller), callerPayBefore, "no payment pulled when floor unmet below threshold");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), recipientNftBefore, "minted nothing when floor unmet");
+    }
+
+    /// @dev Revert carries the two error fields: `minReward` and `actualReward`.
+    ///      Here the pot is partially funded below the floor, so `actualReward`
+    ///      is the (non-zero) deliverable balance.
+    function test_batchMint_minReward_revertCarriesFields() public {
+        // Configure the feature but fund the pot below the floor we'll request.
+        vm.prank(owner);
+        batch.setNudgePaymentToken(address(nudgeToken));
+        vm.prank(owner);
+        batch.setNudgeSize(NUDGE_SIZE);
+        uint256 actualPot = 123 ether;
+        nudgeToken.mint(address(batch), actualPot);
+
+        uint256 N = NUDGE_SIZE;
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+
+        uint256 floor = 200 ether; // > actualPot
+
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, floor, actualPot)
+        );
+        batch.batchMint(N, recipient, expected, floor);
     }
 
     // ----------------------------------------------------------------
@@ -747,12 +942,12 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         vm.prank(pauser);
         batch.unpause();
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "mint resumes after unpause");
     }
 }

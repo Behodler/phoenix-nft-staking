@@ -97,6 +97,9 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     error BatchMint__DispatcherNotConfigured();
     /// @dev Reverted when `rescueERC20` is given a zero destination.
     error Rescue__ZeroRecipient();
+    /// @dev Reverted when the nudge reward actually deliverable to `recipient`
+    ///      is below the caller's `minReward` floor (front-run / pot-drained).
+    error BatchMint__RewardBelowMinimum(uint256 minReward, uint256 actualReward);
 
     event NudgeSizeChanged(uint256 newSize);
     event NudgePaymentTokenChanged(address indexed newToken);
@@ -204,12 +207,28 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     ///                          cost across `count` iterations or an
     ///                          inner mint reverts. Surplus >=
     ///                          `DUST_THRESHOLD` is refunded.
+    /// @param  minReward        Minimum acceptable nudge reward (slippage
+    ///                          floor). The reward actually deliverable to
+    ///                          `recipient` is the full `nudgePaymentToken`
+    ///                          balance when the nudge triggers, else `0`. If
+    ///                          that amount is `< minReward` the whole batch
+    ///                          reverts `BatchMint__RewardBelowMinimum` —
+    ///                          rolling back the `count` mints and the
+    ///                          `paymentAmount` pull — so the caller never pays
+    ///                          mint costs for a reward that was front-run /
+    ///                          sniped out from under them. `0` = no floor
+    ///                          (exact pre-existing behaviour). NOTE: this does
+    ///                          NOT stop a front-runner from winning the pot —
+    ///                          whoever qualifies first still takes the entire
+    ///                          balance-based payout; the floor only stops the
+    ///                          loser from minting for less than they declared.
     /// @return totalPaid        Caller's net spend (`paymentAmount`
     ///                          minus any refunded surplus).
     function batchMint(
         uint256 count,
         address recipient,
-        uint256 paymentAmount
+        uint256 paymentAmount,
+        uint256 minReward
     ) external whenNotPaused returns (uint256 totalPaid) {
         if (count == 0) revert BatchMint__ZeroCount();
         if (recipient == address(0)) revert BatchMint__ZeroRecipient();
@@ -242,18 +261,27 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
         paymentToken.forceApprove(address(nftMinter), 0);
 
         //note to reviewer: I (dev) changed nudgeToken to reuse _nudgeTokenEntry
+        // Compute the reward actually deliverable to `recipient`: the full
+        // nudge-token balance when the feature is active and the threshold is
+        // met, else 0 (feature disabled, threshold not met, or pot empty).
+        // _nudgeTokenEntry guaranteed != paymentToken by the up-front guard.
         uint256 _nudgeSize = nudgeSize;
-        if (_nudgeSize != 0 && count >= _nudgeSize) {
-            // _nudgeTokenEntry guaranteed != paymentToken by the up-front guard;
-            // re-read here is a warm SLOAD.
+        uint256 nudgeAmount;
+        if (_nudgeSize != 0 && count >= _nudgeSize && _nudgeTokenEntry != address(0)) {
+            nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(address(this));
+        }
 
-            if (_nudgeTokenEntry != address(0)) {
-                uint256 nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(address(this));
-                if (nudgeAmount != 0) {
-                    IERC20(_nudgeTokenEntry).safeTransfer(recipient, nudgeAmount);
-                    emit NudgePaid(recipient, _nudgeTokenEntry, nudgeAmount);
-                }
-            }
+        // Slippage floor: if the deliverable reward is below the caller's
+        // stated minimum (front-run / pot drained / nudge inactive), revert the
+        // whole batch so the mints and payment pull roll back atomically. A
+        // `minReward` of 0 never trips this (any reward, including 0, clears it).
+        if (nudgeAmount < minReward) {
+            revert BatchMint__RewardBelowMinimum(minReward, nudgeAmount);
+        }
+
+        if (nudgeAmount != 0) {
+            IERC20(_nudgeTokenEntry).safeTransfer(recipient, nudgeAmount);
+            emit NudgePaid(recipient, _nudgeTokenEntry, nudgeAmount);
         }
 
         uint256 remaining = paymentToken.balanceOf(address(this));

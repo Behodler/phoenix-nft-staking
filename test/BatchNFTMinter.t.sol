@@ -89,7 +89,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(START_PRICE, address(batch));
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE);
+        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE, 0);
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 1, "recipient gets 1 NFT unit");
         assertEq(totalPaid, START_PRICE, "totalPaid equals starting price");
@@ -103,7 +103,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(START_PRICE, address(batch));
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__MinterNotConfigured.selector);
-        batch.batchMint(1, recipient, START_PRICE);
+        batch.batchMint(1, recipient, START_PRICE, 0);
     }
 
     function test_batchMint_revertsWhenPaused() public {
@@ -115,13 +115,13 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(START_PRICE, address(batch));
         vm.prank(caller);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        batch.batchMint(1, recipient, START_PRICE);
+        batch.batchMint(1, recipient, START_PRICE, 0);
 
         // After unpause it works again.
         vm.prank(pauser);
         batch.unpause();
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE);
+        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE, 0);
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 1, "mint resumes after unpause");
         assertEq(totalPaid, START_PRICE, "totalPaid correct after unpause");
     }
@@ -155,7 +155,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(expected, address(batch));
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "recipient gets N NFT units");
     }
@@ -172,7 +172,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, expected);
+        uint256 totalPaid = batch.batchMint(N, recipient, expected, 0);
 
         uint256 callerAfter = payToken.balanceOf(caller);
         assertEq(callerBefore - callerAfter, expected, "caller balance delta = sum of growing prices");
@@ -182,13 +182,13 @@ contract BatchNFTMinterTest is Test {
     function test_batchMint_revertsOnZeroCount() public {
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__ZeroCount.selector);
-        batch.batchMint(0, recipient, 0);
+        batch.batchMint(0, recipient, 0, 0);
     }
 
     function test_batchMint_revertsOnZeroRecipient() public {
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinter.BatchMint__ZeroRecipient.selector);
-        batch.batchMint(1, address(0), 0);
+        batch.batchMint(1, address(0), 0, 0);
     }
 
     function test_batchMint_revertsAtomicallyOnInnerRevert() public {
@@ -204,7 +204,7 @@ contract BatchNFTMinterTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(MockITokenMinterV2.MockITokenMinterV2__ForcedRevert.selector);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(payToken.balanceOf(caller), callerBefore, "caller balance unchanged on revert");
         assertEq(
@@ -220,7 +220,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(expected, address(batch));
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, expected);
+        uint256 totalPaid = batch.batchMint(N, recipient, expected, 0);
 
         assertEq(totalPaid, expected, "returned totalPaid matches geometric sum");
     }
@@ -235,7 +235,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, paid);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, 0);
 
         assertEq(totalPaid, expected, "totalPaid is dispatcher cost, not paymentAmount");
         assertEq(payToken.balanceOf(caller), callerBefore - expected, "surplus refunded to caller");
@@ -251,7 +251,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, paid);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, 0);
 
         assertEq(totalPaid, paid, "totalPaid swallows dust");
         assertEq(payToken.balanceOf(caller), callerBefore - paid, "no refund issued for sub-threshold");
@@ -270,7 +270,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
 
         assertEq(
             payToken.balanceOf(caller),
@@ -315,7 +315,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 1);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(1, recipient, expected);
+        batch.batchMint(1, recipient, expected, 0);
         vm.snapshotGasLastCall("batchMintCount1");
     }
 
@@ -330,7 +330,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 2);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(2, recipient, expected);
+        batch.batchMint(2, recipient, expected, 0);
         vm.snapshotGasLastCall("batchMintN_2");
     }
 
@@ -345,7 +345,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 5);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(5, recipient, expected);
+        batch.batchMint(5, recipient, expected, 0);
         vm.snapshotGasLastCall("batchMintN_5");
     }
 
@@ -360,7 +360,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 10);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(10, recipient, expected);
+        batch.batchMint(10, recipient, expected, 0);
         vm.snapshotGasLastCall("batchMintN_10");
     }
 
@@ -375,7 +375,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 25);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(25, recipient, expected);
+        batch.batchMint(25, recipient, expected, 0);
         vm.snapshotGasLastCall("batchMintN_25");
     }
 
@@ -400,7 +400,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected);
+        batch.batchMint(N, recipient, expected, 0);
         vm.snapshotGasLastCall("batchMintNudge_unhappyPath");
     }
 }
