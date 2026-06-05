@@ -1,13 +1,13 @@
 {
-  "batchMintCount1": "178117",
-  "batchMintN_10": "300940",
-  "batchMintN_2": "191764",
-  "batchMintN_25": "505647",
-  "batchMintN_5": "232705",
-  "batchMintNudge_unhappyPath": "226742",
-  "directMintN_10": "235867",
-  "directMintN_2": "115563",
-  "directMintN_25": "461439",
-  "directMintN_5": "160677",
-  "singleDirectMint": "94132"
+  "batchMintCount1": "178363",
+  "batchMintN_10": "303400",
+  "batchMintN_2": "192256",
+  "batchMintN_25": "511797",
+  "batchMintN_5": "233935",
+  "batchMintNudge_unhappyPath": "227972",
+  "directMintN_10": "238327",
+  "directMintN_2": "116055",
+  "directMintN_25": "467589",
+  "directMintN_5": "161907",
+  "singleDirectMint": "94378"
 }

@@ -410,6 +410,61 @@ contract BatchNFTMinterNudgeTest is Test {
     }
 
     // ----------------------------------------------------------------
+    // Self-refund regression (donation-order-fix): the nudge pot is
+    // snapshotted BEFORE the mint loop, so a qualifying batcher's own
+    // per-mint donations stay in the contract for the NEXT claimant rather
+    // than refunding straight back to them in the same transaction.
+    // ----------------------------------------------------------------
+
+    /// @dev The dispatcher donates `d` of the nudge token into this helper on
+    ///      every mint. Pre-fix, the pot was read AFTER the loop, so a
+    ///      qualifying batcher scooped the prior pot `P` PLUS its own
+    ///      `count * d` donations, leaving 0 for the next minter. After the
+    ///      snapshot-before-loop fix the batcher receives EXACTLY the prior
+    ///      pot `P`, and the `count * d` it donated mid-loop stays in the
+    ///      contract to seed the next claimant.
+    function test_batchMint_selfRefund_donationDuringLoopStaysForNextMinter() public {
+        // Prior accumulated pot `P` from earlier minters.
+        _enableNudgeFeature(NUDGE_SIZE);
+        uint256 P = nudgeToken.balanceOf(address(batch));
+        assertEq(P, NUDGE_FUNDED_AMOUNT, "prior pot funded");
+
+        uint256 N = NUDGE_SIZE; // clears the gate
+        uint256 d = 3 ether; // donation pushed into the helper per mint
+        uint256 loopDonations = N * d;
+
+        // The mock donates `d` of nudgeToken into the helper on every mint;
+        // pre-fund the mock with `count * d` so it can.
+        nudgeToken.mint(address(nftMinter), loopDonations);
+        nftMinter.setPerMintDonation(address(nudgeToken), d);
+
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+
+        uint256 recipientBefore = nudgeToken.balanceOf(recipient);
+        uint256 callerBefore = nudgeToken.balanceOf(caller);
+
+        // The batcher is paid EXACTLY the prior pot `P`, not `P + count*d`.
+        vm.expectEmit(true, true, true, true, address(batch));
+        emit NudgePaid(recipient, address(nudgeToken), P);
+
+        vm.prank(caller);
+        batch.batchMint(N, recipient, expected, 0);
+
+        assertEq(
+            nudgeToken.balanceOf(recipient),
+            recipientBefore + P,
+            "recipient receives only the PRIOR pot, not its own loop donations"
+        );
+        assertEq(
+            nudgeToken.balanceOf(address(batch)),
+            loopDonations,
+            "this batch's loop donations stay in the contract for the next minter"
+        );
+        assertEq(nudgeToken.balanceOf(caller), callerBefore, "msg.sender receives no nudge tokens");
+    }
+
+    // ----------------------------------------------------------------
     // Minter pinning — drain regression + access control
     //
     // Pre-fix, `batchMint` took the NFT minter as a caller-supplied

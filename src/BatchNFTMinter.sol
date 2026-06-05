@@ -192,9 +192,14 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
     ///         payment asset can never be passed.
     ///
     ///         When the nudge feature is active and `count >= nudgeSize`,
-    ///         the helper transfers its full `nudgePaymentToken` balance
-    ///         to `recipient` AFTER the loop (and after the V2 minter
-    ///         allowance is revoked) but BEFORE the dust refund sweep.
+    ///         the helper SNAPSHOTS its `nudgePaymentToken` balance BEFORE the
+    ///         mint loop, then transfers that snapshotted amount to `recipient`
+    ///         AFTER the loop (and after the V2 minter allowance is revoked) but
+    ///         BEFORE the dust refund sweep. Snapshotting before the loop means
+    ///         the batcher is paid only the PRIOR accumulated pot; the per-mint
+    ///         nudge-token donations made during this batch's own loop stay in
+    ///         the contract to seed the next claimant (the "donate forward"
+    ///         mechanic) instead of refunding back to the current batcher.
     ///         If `nudgePaymentToken` is configured it must be a different
     ///         address than the derived payment token — otherwise the call
     ///         reverts up-front, before any funds are pulled. With the payment
@@ -251,6 +256,24 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
             revert BatchMint__NudgeTokenMatchesPaymentToken();
         }
 
+        // Snapshot the deliverable nudge BEFORE the mint loop: the full
+        // nudge-token balance when the feature is active and the threshold is
+        // met, else 0 (feature disabled, threshold not met, or pot empty).
+        // Snapshotting first means a qualifying batcher only ever receives the
+        // PRIOR accumulated pot — its own per-mint donations (the dispatcher
+        // donates the nudge token into this contract on every mint) accrue
+        // AFTER this read and stay in the contract to seed the NEXT claimant,
+        // rather than refunding straight back to the current batcher in the
+        // same transaction. The actual nudge transfer still happens AFTER the
+        // loop (see below). `_nudgeTokenEntry` is guaranteed != paymentToken by
+        // the up-front guard, so the payment pull below cannot perturb this
+        // snapshot.
+        uint256 _nudgeSize = nudgeSize;
+        uint256 nudgeAmount;
+        if (_nudgeSize != 0 && count >= _nudgeSize && _nudgeTokenEntry != address(0)) {
+            nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(address(this));
+        }
+
         paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount);
         paymentToken.forceApprove(address(nftMinter), type(uint256).max);
 
@@ -259,17 +282,6 @@ contract BatchNFTMinter is Ownable, Pausable, IPausable {
         }
 
         paymentToken.forceApprove(address(nftMinter), 0);
-
-        //note to reviewer: I (dev) changed nudgeToken to reuse _nudgeTokenEntry
-        // Compute the reward actually deliverable to `recipient`: the full
-        // nudge-token balance when the feature is active and the threshold is
-        // met, else 0 (feature disabled, threshold not met, or pot empty).
-        // _nudgeTokenEntry guaranteed != paymentToken by the up-front guard.
-        uint256 _nudgeSize = nudgeSize;
-        uint256 nudgeAmount;
-        if (_nudgeSize != 0 && count >= _nudgeSize && _nudgeTokenEntry != address(0)) {
-            nudgeAmount = IERC20(_nudgeTokenEntry).balanceOf(address(this));
-        }
 
         // Slippage floor: if the deliverable reward is below the caller's
         // stated minimum (front-run / pot drained / nudge inactive), revert the

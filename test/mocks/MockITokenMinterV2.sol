@@ -44,6 +44,14 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
     uint256 private _revertAtCall; // 0 = disabled
     bool private _revertEnabled;
 
+    // Optional per-mint donation: on every `mint`, push `_donationPerMint` of
+    // `_donationToken` from this mock into `msg.sender` (the batch helper). This
+    // mirrors `BalancerPoolerV2` donating USDC into the configured `batchMinter`
+    // on every mint. Disabled when either field is zero. The mock must be
+    // pre-funded with `count * amountPerMint` of the donation token.
+    address private _donationToken;
+    uint256 private _donationPerMint;
+
     error MockITokenMinterV2__ForcedRevert();
 
     // ---- ITokenMinterV2 (only the surfaces BatchNFTMinter touches) ----
@@ -58,6 +66,9 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
         IERC20(_primeToken[index]).safeTransferFrom(msg.sender, address(this), price);
         stakedToken.mint(recipient, index, 1);
         c.price = price * (10_000 + c.growthBasisPoints) / 10_000;
+        if (_donationToken != address(0) && _donationPerMint != 0) {
+            IERC20(_donationToken).safeTransfer(msg.sender, _donationPerMint);
+        }
         return true;
     }
 
@@ -122,5 +133,16 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
     function setRevertAtCall(uint256 callIndex, bool enabled) external {
         _revertAtCall = callIndex;
         _revertEnabled = enabled;
+    }
+
+    /// @notice Configure an optional per-mint donation. On every `mint`, the
+    ///         mock pushes `amountPerMint` of `token` into `msg.sender` (the
+    ///         batch helper), simulating `BalancerPoolerV2`'s per-mint USDC
+    ///         donation into the configured `batchMinter`. Pass `token ==
+    ///         address(0)` or `amountPerMint == 0` to disable. The mock must be
+    ///         pre-funded with `count * amountPerMint` of `token`.
+    function setPerMintDonation(address token, uint256 amountPerMint) external {
+        _donationToken = token;
+        _donationPerMint = amountPerMint;
     }
 }
