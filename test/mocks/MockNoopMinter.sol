@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
+import {ITokenMinterV2} from "yield-claim-nft/interfaces/ITokenMinterV2.sol";
 
 /// @notice Attacker-controlled no-op minter standing in for the MEV bot's
 ///         contract in the real nudge-drain exploit. `mint(...)` does no work

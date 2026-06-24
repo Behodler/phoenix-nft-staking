@@ -7,7 +7,7 @@ import {INFTSupply} from "../src/INFTSupply.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/V2/interfaces/IBalancerPoolerMintDebtHook.sol";
+import {IBalancerPoolerMintDebtHook} from "yield-claim-nft/interfaces/IBalancerPoolerMintDebtHook.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockBalancerPoolerMintDebtHook} from "./mocks/MockBalancerPoolerMintDebtHook.sol";

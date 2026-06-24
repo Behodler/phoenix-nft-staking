@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
-import {INFTMinterV2} from "yield-claim-nft/V2/interfaces/INFTMinterV2.sol";
-import {ITokenDispatcherV2} from "yield-claim-nft/V2/interfaces/ITokenDispatcherV2.sol";
+import {ITokenMinterV2} from "yield-claim-nft/interfaces/ITokenMinterV2.sol";
+import {INFTMinterV2} from "yield-claim-nft/interfaces/INFTMinterV2.sol";
+import {ITokenDispatcherV2} from "yield-claim-nft/interfaces/ITokenDispatcherV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";

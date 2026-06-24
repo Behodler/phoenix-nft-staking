@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
-import {ITokenMinterV2} from "yield-claim-nft/V2/interfaces/ITokenMinterV2.sol";
+import {ITokenMinterV2} from "yield-claim-nft/interfaces/ITokenMinterV2.sol";
 import {BatchNFTMinter} from "../src/BatchNFTMinter.sol";
 
 /// @title DeployBatchNFTMinter

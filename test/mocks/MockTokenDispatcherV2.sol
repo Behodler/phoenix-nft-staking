@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ITokenDispatcherV2} from "yield-claim-nft/V2/interfaces/ITokenDispatcherV2.sol";
+import {ITokenDispatcherV2} from "yield-claim-nft/interfaces/ITokenDispatcherV2.sol";
 
 /// @notice Minimal test double for a V2 token dispatcher. `BatchNFTMinter`
 ///         derives the payment asset by reading this dispatcher's
