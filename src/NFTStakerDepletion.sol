@@ -810,7 +810,10 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     function pendingReward(address account) external view returns (uint256) {
         UserInfo memory user = users[account];
         uint256 acc = accRewardPerShare;
-        if (block.timestamp > lastRewardTime && totalStaked > 0) {
+        // While Migrating, emissions are frozen at the `initiateMigration`
+        // snapshot — return the fixed pending with no forward projection,
+        // matching what the migration exit settles.
+        if (poolState == PoolState.Active && block.timestamp > lastRewardTime && totalStaked > 0) {
             uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
             uint256 elapsed = end > lastRewardTime ? end - lastRewardTime : 0;
             uint256 reward = elapsed * rewardRate;
@@ -831,7 +834,8 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     ///         unpaid rewards (`committedDebt`) plus in-flight accrual since
     ///         the last `_updatePool` boundary.
     function totalDebt() external view returns (uint256) {
-        if (block.timestamp <= lastRewardTime || totalStaked == 0) {
+        // Frozen while Migrating: no forward projection past the snapshot.
+        if (poolState == PoolState.Migrating || block.timestamp <= lastRewardTime || totalStaked == 0) {
             return committedDebt;
         }
         uint256 end = block.timestamp < windowEnd ? block.timestamp : windowEnd;
