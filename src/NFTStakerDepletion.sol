@@ -421,16 +421,15 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     ///      the hook is unset, behaves like a pure recompute (still useful
     ///      after a state-changing config setter).
     function _syncBudget() internal {
-        _updatePool();
+        _updatePool();                                 // always: settle accrual
         if (address(dispatcherHook) == address(0)) {
-            _recomputeSchedule();
-            return;
+            return;                                    // no hook → no pull → no budget change → no recompute
         }
         uint256 pre = rewardToken.balanceOf(address(this));
         dispatcherHook.pull();
         uint256 inflow = rewardToken.balanceOf(address(this)) - pre;
-        _recomputeSchedule();
-        if (inflow > 0) {
+        if (inflow > 0) {                              // new NFT minted → budget grew → restart window (intended)
+            _recomputeSchedule();
             emit Pulled(inflow, rewardBudget);
         }
     }
@@ -556,13 +555,6 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
         totalStaked += amount;
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
         emit Staked(msg.sender, amount);
-        // Tail: the depletion rate is `budget / windowSeconds`, INDEPENDENT of
-        // `totalStaked`, so the tail recompute is not strictly required to
-        // re-size the rate (unlike `NFTStaker`). It is retained for parity and
-        // to keep `windowEnd` pinned to `now + windowSeconds` after the stake.
-        // No `_syncBudget` here: no time has elapsed since the head and
-        // `mintDebt` cannot change mid-call.
-        _recomputeSchedule();
     }
 
     function unstake(uint256 amount) external nonReentrant whenNotPaused {
@@ -580,9 +572,6 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_PRECISION;
         stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
         emit Unstaked(msg.sender, amount);
-        // Tail: see `stake` rationale. The rate is totalStaked-independent, so
-        // this resets `windowEnd` to `now + windowSeconds` for parity.
-        _recomputeSchedule();
     }
 
     function claim() external nonReentrant whenNotPaused {

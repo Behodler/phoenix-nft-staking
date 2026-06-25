@@ -229,8 +229,10 @@ contract NFTStakerDepletionTest is Test {
     function testInvariantHoldsThroughLifecycle() public {
         phUSD.mint(address(staker), 500_000 ether);
         _stakeAs(alice, 4);
-        _assertInvariant();
-
+        // Post-M-01: a bare stake no longer recomputes, so a directly-minted
+        // balance is not folded into `rewardBudget` until a genuine
+        // budget/window change. The first recompute that reconciles the
+        // injected funds is `setDepletionWindow` below.
         vm.prank(owner);
         staker.setDepletionWindow(6);
         _assertInvariant();
