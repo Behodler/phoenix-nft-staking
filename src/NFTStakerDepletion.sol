@@ -12,6 +12,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IPausable} from "pauser/interfaces/IPausable.sol";
 import {IUniboostMintDebtHook} from "yield-claim-nft/interfaces/IUniboostMintDebtHook.sol";
 import {INFTSupply} from "./INFTSupply.sol";
+import {INFTStakerMigratable} from "./INFTStakerMigratable.sol";
 
 /// @title  NFTStakerDepletion
 /// @notice Depletion-window standalone copy of `NFTStaker`. This contract is a
@@ -60,7 +61,7 @@ import {INFTSupply} from "./INFTSupply.sol";
 ///         exactly `depletionWindowMonths`. The strong invariant
 ///         `balance == rewardBudget + committedDebt` and floor-rounding always
 ///         in the protocol's favour are preserved from `NFTStaker`.
-contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausable {
+contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausable, INFTStakerMigratable {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -181,6 +182,32 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     mapping(address => UserInfo) public users;
 
     // ---------------------------------------------------------------------
+    // Migration state
+    // ---------------------------------------------------------------------
+
+    /// @notice Lifecycle gate for the stable-staker-style migration flow.
+    ///         `Active` is the normal operating state (stake/unstake/claim and
+    ///         `depositFor` are permitted). `Migrating` is the frozen
+    ///         settle-and-evacuate state engaged by `initiateMigration`:
+    ///         emissions are settled to that block and frozen, and the only
+    ///         exits are the permissioned `batchMigrate` and the permissionless
+    ///         `userMigrate`. The only way back to `Active` is
+    ///         `finalizeAndReset`, gated on a fully-drained pool.
+    enum PoolState {
+        Active,
+        Migrating
+    }
+
+    /// @notice Current migration lifecycle state. Defaults to `Active`.
+    PoolState public poolState;
+
+    /// @notice Address authorised to drive the migration primitives
+    ///         (`initiateMigration`, `batchMigrate`, `depositFor`). Set by the
+    ///         owner to the relevant orchestrator (`NFTStakerMigrator` /
+    ///         `InPlaceNFTStakerMigrator`).
+    address public migrator;
+
+    // ---------------------------------------------------------------------
     // Errors
     // ---------------------------------------------------------------------
 
@@ -220,12 +247,33 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     ///      `BatchNFTMinter.Rescued`.
     event Rescued(address indexed token, address indexed to, uint256 amount);
 
+    /// @dev Emitted when the owner sets/rotates the `migrator`.
+    event MigratorSet(address indexed previous, address indexed next);
+    /// @dev Emitted when `initiateMigration` freezes the pool.
+    event MigrationInitiated(uint256 totalStaked);
+    /// @dev Emitted per user evacuated by `batchMigrate`: their staked ERC1155
+    ///      amount (moved to the migrator) and the pending phUSD reward settled
+    ///      to them.
+    event MigratedOut(address indexed user, uint256 amount, uint256 reward);
+    /// @dev Emitted on a permissionless `userMigrate` self-exit: the staked
+    ///      ERC1155 amount returned to the user and the pending phUSD settled.
+    event UserMigrated(address indexed user, uint256 amount, uint256 reward);
+    /// @dev Emitted per user credited by `depositFor` on the receiving staker.
+    event DepositedFor(address indexed user, uint256 amount);
+    /// @dev Emitted when `finalizeAndReset` returns a drained pool to `Active`.
+    event PoolReset();
+
     // ---------------------------------------------------------------------
     // Modifiers
     // ---------------------------------------------------------------------
 
     modifier onlyPauser() {
         require(msg.sender == pauser, "NFTStaker: caller is not pauser");
+        _;
+    }
+
+    modifier onlyMigrator() {
+        require(msg.sender == migrator, "NFTStaker: caller is not migrator");
         _;
     }
 
@@ -254,6 +302,15 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     function setPauser(address newPauser) external onlyOwner {
         emit PauserChanged(pauser, newPauser);
         pauser = newPauser;
+    }
+
+    /// @notice Set/rotate the migration orchestrator authorised to call the
+    ///         `onlyMigrator` primitives. Setting to `address(0)` disables
+    ///         migration. No empty-pool gate — the migrator must be wired
+    ///         before `initiateMigration` is called.
+    function setMigrator(address newMigrator) external onlyOwner {
+        emit MigratorSet(migrator, newMigrator);
+        migrator = newMigrator;
     }
 
     function pause() external onlyPauser {
@@ -390,6 +447,14 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     ///      `_recomputeSchedule`. Recomputing the rate inside per-interaction
     ///      accrual was phlimbo's V1 bug.
     function _updatePool() internal {
+        // While Migrating, emissions are frozen: every user's pending phUSD is
+        // fixed at the `initiateMigration` snapshot and minted in full on their
+        // exit. Fast-forward `lastRewardTime` so the frozen gap is never
+        // retro-accrued once the pool is revived.
+        if (poolState == PoolState.Migrating) {
+            lastRewardTime = block.timestamp;
+            return;
+        }
         if (block.timestamp <= lastRewardTime) return;
         if (totalStaked == 0) {
             lastRewardTime = block.timestamp;
@@ -537,9 +602,19 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     ///      by `amount` to preserve the strong invariant
     ///      `balance == rewardBudget + committedDebt`.
     function _safePay(uint256 amount) internal returns (uint256) {
+        return _safePayTo(msg.sender, amount);
+    }
+
+    /// @dev `_safePay` variant that pays an explicit `account` rather than
+    ///      `msg.sender`. Needed by the migration paths, where `batchMigrate`'s
+    ///      `msg.sender` is the migrator but the settled phUSD reward must be
+    ///      paid to the migrating user. Solvency accounting is identical:
+    ///      decrement `(committedDebt + rewardBudget)` by `amount` to preserve
+    ///      `balance == rewardBudget + committedDebt`.
+    function _safePayTo(address account, uint256 amount) internal returns (uint256) {
         require(rewardToken.balanceOf(address(this)) >= amount, "NFTStaker: insufficient reward balance");
         if (amount > 0) {
-            rewardToken.safeTransfer(msg.sender, amount);
+            rewardToken.safeTransfer(account, amount);
             if (amount > committedDebt) {
                 rewardBudget -= (amount - committedDebt);
                 committedDebt = 0;
@@ -573,8 +648,164 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     }
 
     // ---------------------------------------------------------------------
+    // Migration primitives (onlyMigrator / onlyOwner) — stable-staker analogue
+    // ---------------------------------------------------------------------
+
+    /// @notice Engage migration: settle in-flight accrual, sweep mint debt, and
+    ///         freeze emissions by flipping `poolState` to `Migrating`. Unlike
+    ///         stable-staker's `initiateMigration` there is NO yield-strategy
+    ///         unwind — the Uniboost staker's budget is idle rewardToken + hook
+    ///         mint-debt, so this is a pure settle-and-freeze. After this,
+    ///         `_updatePool` no-ops (emissions frozen) so every user's pending
+    ///         phUSD is fixed at this snapshot and minted in full on their exit.
+    /// @dev    Permission: `onlyMigrator`. Reverts unless the pool is `Active`,
+    ///         so it runs once per engagement. The only way back to `Active` is
+    ///         `finalizeAndReset`, gated on a fully-drained pool.
+    function initiateMigration() external override nonReentrant onlyMigrator {
+        require(poolState == PoolState.Active, "NFTStaker: not active");
+        // Sweep mint debt and settle accrual to this block under the live rate,
+        // then freeze. `_syncBudget` runs `_updatePool` (still Active here) so
+        // pending is captured before the freeze.
+        _syncBudget();
+        poolState = PoolState.Migrating;
+        emit MigrationInitiated(totalStaked);
+    }
+
+    /// @notice Permissioned batched migration exit. For each non-zero user:
+    ///         settles and pays their frozen pending phUSD reward (respecting
+    ///         solvency via `_safePay`), zeroes their position, and transfers
+    ///         their staked ERC1155 amount (of `stakedId`) to the migrator.
+    /// @dev    Permission: `onlyMigrator`. Requires a prior `initiateMigration`
+    ///         (`Migrating`). Idempotent: an already-evacuated (zeroed) user
+    ///         returns 0 and is skipped — `batchMigrate` can be safely re-run.
+    ///         Callable while paused so a migration can proceed during an
+    ///         incident.
+    /// @param  accounts The users to migrate out (batched off-chain).
+    /// @return amounts Per-user staked ERC1155 amount transferred to the
+    ///         migrator, parallel to `accounts` (0 for empty / already-migrated).
+    function batchMigrate(address[] calldata accounts)
+        external
+        override
+        nonReentrant
+        onlyMigrator
+        returns (uint256[] memory amounts)
+    {
+        require(poolState == PoolState.Migrating, "NFTStaker: not migrating");
+
+        amounts = new uint256[](accounts.length);
+        uint256 totalAmount;
+        for (uint256 i = 0; i < accounts.length; i++) {
+            (uint256 amount, uint256 paid) = _exitPosition(accounts[i]);
+            amounts[i] = amount;
+            totalAmount += amount;
+            if (amount > 0) emit MigratedOut(accounts[i], amount, paid);
+        }
+        if (totalAmount > 0) {
+            stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, totalAmount, "");
+        }
+    }
+
+    /// @notice Permissionless self-exit during migration: the caller redeems
+    ///         their OWN position — staked ERC1155 returned to their wallet plus
+    ///         pending phUSD settled — without waiting for the operator.
+    /// @dev    The escape hatch for the frozen state (the `emergencyWithdraw`
+    ///         and `unstake` paths remain available too, but this one settles
+    ///         pending and is migration-scoped). Requires `Migrating` and a
+    ///         non-zero position. Strict CEI under `nonReentrant`: the position
+    ///         is zeroed inside `_exitPosition` before the ERC1155 transfer.
+    function userMigrate() external nonReentrant {
+        require(poolState == PoolState.Migrating, "NFTStaker: not migrating");
+        require(users[msg.sender].amount > 0, "NFTStaker: nothing staked");
+        (uint256 amount, uint256 paid) = _exitPosition(msg.sender);
+        stakedToken.safeTransferFrom(address(this), msg.sender, stakedId, amount, "");
+        emit UserMigrated(msg.sender, amount, paid);
+    }
+
+    /// @dev Shared migration exit for one user: settles+pays their pending
+    ///      phUSD (floored in the protocol's favour by the accrual machinery),
+    ///      zeroes their position and decrements `totalStaked`. Returns the
+    ///      staked ERC1155 `amount` (0 for an empty position) and the `paid`
+    ///      phUSD reward. Does NOT transfer the ERC1155 nor emit the exit
+    ///      event — the caller forwards the stake (CEI) and emits its own
+    ///      `MigratedOut` / `UserMigrated`.
+    function _exitPosition(address account) internal returns (uint256 amount, uint256 paid) {
+        UserInfo storage user = users[account];
+        amount = user.amount;
+        if (amount == 0) {
+            return (0, 0);
+        }
+        // Pending was frozen at the `initiateMigration` snapshot
+        // (`_updatePool` is a no-op while Migrating).
+        uint256 pending = (amount * accRewardPerShare) / ACC_PRECISION - user.rewardDebt;
+        user.amount = 0;
+        user.rewardDebt = 0;
+        totalStaked -= amount;
+        if (pending > 0) {
+            paid = _safePayTo(account, pending);
+            if (paid > 0) emit Claimed(account, paid);
+        }
+    }
+
+    /// @notice Permissioned deposit crediting `user` with `amount` ERC1155
+    ///         units pulled from the migrator. Only valid while `Active`, so it
+    ///         credits the new/healthy staker — never the frozen one (a deposit
+    ///         on a Migrating pool would corrupt the snapshot). Callable while
+    ///         paused so a freshly deployed (and possibly paused) target can be
+    ///         seeded.
+    /// @dev    Permission: `onlyMigrator`. Settles accrual and the user's
+    ///         pending before crediting, mirroring `stake`.
+    /// @param  user   The user to credit.
+    /// @param  amount The ERC1155 stake amount to deposit on the user's behalf.
+    function depositFor(address user, uint256 amount) external override nonReentrant onlyMigrator {
+        require(amount > 0, "NFTStaker: zero deposit");
+        require(poolState == PoolState.Active, "NFTStaker: not active");
+        _syncBudget();
+        UserInfo storage info = users[user];
+        if (info.amount > 0) {
+            uint256 pending = (info.amount * accRewardPerShare) / ACC_PRECISION - info.rewardDebt;
+            if (pending > 0) {
+                pending = _safePay(pending);
+                if (pending > 0) emit Claimed(user, pending);
+            }
+        }
+        stakedToken.safeTransferFrom(msg.sender, address(this), stakedId, amount, "");
+        info.amount += amount;
+        totalStaked += amount;
+        info.rewardDebt = (info.amount * accRewardPerShare) / ACC_PRECISION;
+        emit DepositedFor(user, amount);
+        // Tail recompute: rate is `budget / windowSeconds`, totalStaked-
+        // independent, but pin `windowEnd` for parity with `stake`.
+        _recomputeSchedule();
+    }
+
+    /// @notice Return a fully-drained `Migrating` pool to `Active` so the SAME
+    ///         staker can be revived (e.g. after an in-place dispatcher/hook
+    ///         rewire). Requires every position to have exited
+    ///         (`totalStaked == 0`). Fast-forwards `lastRewardTime` so the
+    ///         frozen migration gap is never retro-accrued. No (R, P) snapshot
+    ///         to clear (the Uniboost staker has none).
+    /// @dev    Permission: `onlyOwner`. No `whenNotPaused` so the operator can
+    ///         reset while paused.
+    function finalizeAndReset() external onlyOwner {
+        require(poolState == PoolState.Migrating, "NFTStaker: not migrating");
+        require(totalStaked == 0, "NFTStaker: stake outstanding");
+        lastRewardTime = block.timestamp;
+        poolState = PoolState.Active;
+        emit PoolReset();
+    }
+
+    // ---------------------------------------------------------------------
     // Views
     // ---------------------------------------------------------------------
+
+    /// @notice `INFTStakerMigratable` accessor for the public `users` mapping.
+    ///         Returns `user`'s currently-credited ERC1155 position and
+    ///         reward-debt bookkeeping value. Used by the in-place migrator to
+    ///         snapshot credited principal around a `depositFor`.
+    function userInfo(address user) external view override returns (uint256 amount, uint256 rewardDebt) {
+        UserInfo memory info = users[user];
+        return (info.amount, info.rewardDebt);
+    }
 
     function pendingReward(address account) external view returns (uint256) {
         UserInfo memory user = users[account];
