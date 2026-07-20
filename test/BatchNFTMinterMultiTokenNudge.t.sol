@@ -188,11 +188,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
             abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken))
         );
         batch.batchMint(
-            NUDGE_SIZE,
-            recipient,
-            cost,
-            _arr(address(rewardA), address(rewardB), address(payToken)),
-            _mins(0, 0, 0)
+            NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB), address(payToken)), _mins(0, 0, 0)
         );
     }
 
@@ -330,9 +326,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
             donationA * NUDGE_SIZE,
             "second batcher receives exactly the first batcher's donations"
         );
-        assertEq(
-            rewardA.balanceOf(address(batch)), donationA * NUDGE_SIZE, "batch 2's own donations stay for batch 3"
-        );
+        assertEq(rewardA.balanceOf(address(batch)), donationA * NUDGE_SIZE, "batch 2's own donations stay for batch 3");
     }
 
     // ================================================================ //
@@ -438,11 +432,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         vm.recordLogs();
         vm.prank(caller);
         batch.batchMint(
-            NUDGE_SIZE,
-            recipient,
-            cost,
-            _arr(address(rewardA), address(emptyToken), address(rewardB)),
-            _mins(0, 0, 0)
+            NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(emptyToken), address(rewardB)), _mins(0, 0, 0)
         );
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -532,9 +522,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
         vm.prank(caller);
-        batch.batchMint(
-            NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(emptyToken)), _mins(0, 0)
-        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(emptyToken)), _mins(0, 0));
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "qualifying zero-floor batch succeeded");
 
         // Non-qualifying batch, pots funded.
@@ -725,9 +713,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), count, "count units minted");
         for (uint256 i = 0; i < numTokens; i++) {
-            assertEq(
-                pool[i].balanceOf(recipient), qualifies ? pots[i] : 0, "reward delivered iff the batch qualifies"
-            );
+            assertEq(pool[i].balanceOf(recipient), qualifies ? pots[i] : 0, "reward delivered iff the batch qualifies");
         }
     }
 

@@ -8,22 +8,38 @@ import {BatchNFTMinter} from "../src/BatchNFTMinter.sol";
 
 /// @title DeployBatchNFTMinter
 /// @notice Deploys a fresh, fixed `BatchNFTMinter` and configures it:
-///         pins the trusted NFT minter, then sets the nudge knobs and the
-///         global pauser. The minter is pinned FIRST (it is the load-bearing
-///         fix), then the nudge token + size, then the pauser.
+///         pins the trusted NFT minter, then sets the nudge eligibility
+///         threshold and the global pauser. The minter is pinned FIRST (it is
+///         the load-bearing fix), then `nudgeSize`, then the pauser.
+///
+///         The script does NOT declare a reward token, because the contract
+///         no longer has one. Under the caller-selected multi-token nudge
+///         (`docs/multi-token-nudge.md`) the owner controls ELIGIBILITY only
+///         (`nudgeSize`); each caller declares which of the contract's ERC20
+///         balances they want to be paid in, per call. Funding is
+///         permissionless — any token sent here becomes claimable by a
+///         qualifying batcher.
 ///
 ///         On-chain cutover is a HUMAN/OPERATOR action and is intentionally
 ///         NOT performed here. After this deploy, an operator must (out of
 ///         band, multisig/EOA):
 ///           - StableYieldAccumulator.setNudgeAddress(<this>)   (PRIMARY 30% drip)
+///             NOTE: this funding path is UNCHANGED by the multi-token nudge.
+///             The 30% USDC drip still lands here and still funds the pot; the
+///             only difference is that the reward asset is now named by the
+///             caller at claim time rather than declared by this script.
 ///           - BalancerPoolerV2.setBatchMinter(<this>)          (secondary 10%)
 ///           - Pauser.register(<this>)                          (global pause reach)
 ///           - update mainnet-addresses.ts + progress.1.json, regen hooks
 ///           - confirm the OLD contract is no longer funded and its nudge is off
 ///
 ///         Broadcast is guarded by in-script `require`s that reject the
-///         misconfigurations the incident turned on (unset minter, nudge
-///         token == a payment token, unset pauser).
+///         misconfigurations the incident turned on (unset minter, unset
+///         dispatcher index, zero nudge size, unset pauser). The old
+///         "nudge token == payment token" deploy guard is gone: that
+///         collision is now checked ON-CHAIN, per call, against every element
+///         of the caller's `rewardTokens` array
+///         (`BatchMint__RewardTokenIsPaymentToken`).
 ///
 /// Usage (dry run, no broadcast):
 ///   forge script script/DeployBatchNFTMinter.s.sol:DeployBatchNFTMinter
@@ -34,10 +50,9 @@ contract DeployBatchNFTMinter is Script {
     /// @notice Canonical mainnet V2 NFTMinter to pin as the trusted minter.
     address internal constant TOKEN_MINTER = 0x39Af088408e815844c567037C157B31d48d2E10F;
 
-    /// @notice Mainnet USDC — the nudge payout token.
-    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
-
-    /// @notice Batch-size threshold qualifying for the nudge.
+    /// @notice Batch-size threshold qualifying for the nudge. The ONLY nudge
+    ///         knob the owner still controls — the reward asset is chosen by
+    ///         the caller, per call.
     uint256 internal constant NUDGE_SIZE = 40;
 
     /// @notice The only dispatcher index this helper mints — the
@@ -66,10 +81,10 @@ contract DeployBatchNFTMinter is Script {
 
         // --- broadcast guards: reject the incident's misconfigurations ---
         require(TOKEN_MINTER != address(0), "deploy: tokenMinter unset");
-        require(USDC != TOKEN_MINTER, "deploy: nudge token must differ from minter");
-        // The nudge token must never equal the dispatcher's payment token, or
-        // the dust sweep becomes a drain. USDC is the nudge token; mints pay in
-        // the dispatcher's prime token (e.g. USDS), which must not be USDC.
+        // No reward-token guard here any more: the reward asset is not deploy
+        // configuration. The payment-token collision that used to be an
+        // operator concern is enforced on-chain on every `batchMint` call,
+        // against every element of the caller-supplied `rewardTokens` array.
         require(NUDGE_SIZE != 0, "deploy: nudgeSize zero");
         require(DISPATCHER_INDEX != 0, "deploy: dispatcherIndex unset");
         require(pauser != address(0), "deploy: pauser unset (set PAUSER env)");
@@ -85,8 +100,7 @@ contract DeployBatchNFTMinter is Script {
         // Pin the only dispatcher index this helper mints (derives payment token).
         batch.setDispatcherIndex(DISPATCHER_INDEX);
 
-        // Then the nudge knobs.
-        batch.setNudgePaymentToken(USDC);
+        // Then the nudge eligibility threshold (the only remaining knob).
         batch.setNudgeSize(NUDGE_SIZE);
 
         // Then wire the global pauser.
@@ -97,7 +111,6 @@ contract DeployBatchNFTMinter is Script {
         // Post-conditions mirror the guards.
         require(address(batch.tokenMinter()) == TOKEN_MINTER, "deploy: minter not pinned");
         require(batch.dispatcherIndex() == DISPATCHER_INDEX, "deploy: dispatcherIndex not pinned");
-        require(batch.nudgePaymentToken() == USDC, "deploy: nudge token not set");
         require(batch.nudgeSize() == NUDGE_SIZE, "deploy: nudge size not set");
         require(batch.pauser() == pauser, "deploy: pauser not set");
 
@@ -105,9 +118,9 @@ contract DeployBatchNFTMinter is Script {
         console2.log("  owner:        ", owner);
         console2.log("  tokenMinter:  ", TOKEN_MINTER);
         console2.log("  dispatcherIdx:", DISPATCHER_INDEX);
-        console2.log("  nudgeToken:   ", USDC);
         console2.log("  nudgeSize:    ", NUDGE_SIZE);
         console2.log("  pauser:       ", pauser);
+        console2.log("  rewardAsset:   caller-selected per call (none configured on-chain)");
         console2.log("NEXT (operator): SYA.setNudgeAddress, BalancerPoolerV2.setBatchMinter, Pauser.register");
     }
 }

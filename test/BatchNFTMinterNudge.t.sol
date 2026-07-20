@@ -793,9 +793,7 @@ contract BatchNFTMinterNudgeTest is Test {
         uint256 totalPaid = batch.batchMint(N, recipient, paid, _tokens1(address(nudgeToken)), _mins1(floor));
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "minted count");
-        assertEq(
-            nudgeToken.balanceOf(recipient), recipientNudgeBefore + NUDGE_FUNDED_AMOUNT, "full nudge paid"
-        );
+        assertEq(nudgeToken.balanceOf(recipient), recipientNudgeBefore + NUDGE_FUNDED_AMOUNT, "full nudge paid");
         assertEq(nudgeToken.balanceOf(address(batch)), 0, "helper drained of nudge");
         assertEq(payToken.balanceOf(caller), callerPayBefore - expected, "surplus refunded unchanged");
         assertEq(totalPaid, expected, "totalPaid accounting unchanged");
@@ -873,9 +871,7 @@ contract BatchNFTMinterNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, address(nudgeToken), floor, 0
-            )
+            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, address(nudgeToken), floor, 0)
         );
         batch.batchMint(N, recipient, expected, _tokens1(address(nudgeToken)), _mins1(floor));
 
