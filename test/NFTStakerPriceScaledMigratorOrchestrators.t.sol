@@ -114,7 +114,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         uint256 alicePending = oldStaker.pendingReward(alice);
         assertGt(alicePending, 0, "alice accrued on the old staker");
 
-        NFTStakerMigrator mig = new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+        NFTStakerMigrator mig =
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
 
         // Wire the migrator as migrator on BOTH stakers.
         vm.prank(owner);
@@ -169,7 +170,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         NFTStakerPriceScaledMigrateReady newStaker = _newPriceScaled(ID);
         phUSD.mint(address(oldStaker), 1 ether);
 
-        NFTStakerMigrator mig = new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+        NFTStakerMigrator mig =
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         oldStaker.setMigrator(address(mig));
         vm.prank(owner);
@@ -209,7 +211,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         uint256 alicePending = oldStaker.pendingReward(alice);
         assertGt(alicePending, 0, "alice accrued under the depletion model");
 
-        NFTStakerMigrator mig = new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+        NFTStakerMigrator mig =
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         oldStaker.setMigrator(address(mig));
         vm.prank(owner);
@@ -250,7 +253,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         uint256 alicePending = s.pendingReward(alice);
         assertGt(alicePending, 0, "alice accrued");
 
-        InPlaceNFTStakerMigrator mig = new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, TIMEOUT, owner);
+        InPlaceNFTStakerMigrator mig =
+            new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, TIMEOUT, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         s.setMigrator(address(mig));
 
@@ -305,7 +309,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         _stakeAs(address(s), alice, 5);
         _fundPriceScaled(s);
 
-        InPlaceNFTStakerMigrator mig = new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, TIMEOUT, owner);
+        InPlaceNFTStakerMigrator mig =
+            new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, TIMEOUT, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         s.setMigrator(address(mig));
         vm.prank(owner);
@@ -339,7 +344,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         _stakeAs(address(oldStaker), alice, 5);
         _fundPriceScaled(oldStaker);
 
-        NFTStakerMigrator mig = new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+        NFTStakerMigrator mig =
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         oldStaker.setMigrator(address(mig));
         // Deliberately NOT wired on `newStaker`.
@@ -359,7 +365,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
     function testCrossStakerRevertsWhenMigratorNotSetOnSource() public {
         NFTStakerPriceScaledMigrateReady oldStaker = _newPriceScaled(ID);
         NFTStakerPriceScaledMigrateReady newStaker = _newPriceScaled(ID);
-        NFTStakerMigrator mig = new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+        NFTStakerMigrator mig =
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
 
         vm.expectRevert(bytes("NFTStaker: caller is not migrator"));
         vm.prank(owner);
@@ -381,7 +388,8 @@ contract NFTStakerPriceScaledMigratorOrchestratorsTest is Test {
         newStaker.initiateMigration();
         assertEq(uint256(newStaker.poolState()), 1, "target is Migrating");
 
-        NFTStakerMigrator mig = new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+        NFTStakerMigrator mig =
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         oldStaker.setMigrator(address(mig));
         vm.prank(owner);
