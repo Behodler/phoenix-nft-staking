@@ -8,6 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {INFTStakerMigratable} from "./INFTStakerMigratable.sol";
+import {IStakerViews} from "./IStakerViews.sol";
 
 /// @title  InPlaceNFTStakerMigrator
 /// @notice Swaps the `dispatcherIndex` / `dispatcherHook` wiring on a SINGLE
@@ -38,6 +39,41 @@ import {INFTStakerMigratable} from "./INFTStakerMigratable.sol";
 ///         NO HAIRCUT / NO TOP-UP — the Uniboost staker moves exact ERC1155
 ///         amounts (no underwater yield strategy), so `depositFor` credits
 ///         exactly the parked amount and no surplus-funded top-up is needed.
+///
+///         SETTLEMENT-CAPTURE FORWARDING (audit `pns20h1`) — identical
+///         mechanism to `NFTStakerMigrator`, deliberately line-for-line the
+///         same (plan decision D-6). Some deployed stakers settle the incoming
+///         user's re-accrued pending inside `depositFor` with `_safePay(...)`,
+///         which pays `msg.sender` — i.e. THIS CONTRACT — rather than the user
+///         (`NFTStakerDepletion.sol:756`); others settle correctly with
+///         `_safePayTo(user, ...)` (`NFTStakerPriceScaledMigrateReady.sol:887`).
+///         Those stakers are deployed and immutable, so `migrateIn` snapshots
+///         `pendingReward(user)` and its own reward-token balance around every
+///         `depositFor`, measures the capture as a balance delta, bounds it by
+///         the pre-call `pendingReward`, and forwards it to the user. Against a
+///         correct staker the capture is ZERO and no transfer occurs, so the
+///         branch is self-disabling and version-agnostic.
+///
+///         THE BOUND IS A TRIPWIRE, NOT A HAIRCUT. `_syncBudget()` runs
+///         `_updatePool()` before `dispatcherHook.pull()`, so the settled
+///         accrual equals what `pendingReward(user)` projects at the same
+///         timestamp. `require(captured <= owed)` fires only when foreign value
+///         lands on the migrator mid-call (e.g. a dispatcher hook whose
+///         `recipient` is mispointed here), which would otherwise be
+///         misattributed to whichever user the loop is on.
+///
+///         ESCROW-ON-FAILURE. The forward is attempted inside `try`/`catch`; a
+///         reverting or `false`-returning recipient credits `unforwarded[user]`
+///         and emits `RewardForwardFailed` rather than taking the whole batch
+///         down. The user recovers via the permissionless, self-only
+///         `claimForwarded()`. `totalUnforwarded` floors `rescueERC20` for the
+///         reward token, so no owner path can redirect escrowed value.
+///
+///         OFF-CHAIN RECONCILIATION CAVEAT. The staker still emits
+///         `Claimed(user, pending)` before the forward completes, so a settled
+///         payment can traverse TWO transfers (staker -> migrator -> user)
+///         under ONE `Claimed` event. Indexers must join `Claimed` with
+///         `RewardForwarded` / `RewardForwardFailed` to reconstruct the flow.
 contract InPlaceNFTStakerMigrator is Ownable, ReentrancyGuard, ERC1155Holder {
     using SafeERC20 for IERC20;
 
@@ -55,6 +91,13 @@ contract InPlaceNFTStakerMigrator is Ownable, ReentrancyGuard, ERC1155Holder {
     /// @notice Seconds after `migrateOut` before a parked user may invoke
     ///         `claimTimedOut`.
     uint256 public immutable migrationTimeout;
+
+    /// @notice The reward token (phUSD) the staker emits. Supplied as a
+    ///         constructor arg because `INFTStakerMigratable` does not expose
+    ///         `rewardToken()`, and cross-checked against the staker's own
+    ///         getter — a mismatch would mean the forwarding logic measures the
+    ///         wrong token and silently never fires.
+    IERC20 public immutable rewardToken;
 
     /// @notice user => parked ERC1155 stake currently held in custody.
     mapping(address => uint256) public parked;
@@ -77,6 +120,14 @@ contract InPlaceNFTStakerMigrator is Ownable, ReentrancyGuard, ERC1155Holder {
     ///         decrement.
     uint256 public totalParked;
 
+    /// @notice user => reward escrowed because the forwarding transfer failed.
+    ///         Recoverable only by that user, via `claimForwarded()`.
+    mapping(address => uint256) public unforwarded;
+
+    /// @notice Σ unforwarded[*]. The FLOOR `rescueERC20` can never cross for
+    ///         the reward token.
+    uint256 public totalUnforwarded;
+
     /// @notice Lower bound on `migrationTimeout`: rejects 0/tiny values that
     ///         would open the hatch immediately and let an impatient user
     ///         front-run `migrateIn`.
@@ -90,22 +141,38 @@ contract InPlaceNFTStakerMigrator is Ownable, ReentrancyGuard, ERC1155Holder {
     event MigratedIn(uint256 userCount, uint256 totalAmount);
     event TimedOutClaim(address indexed user, uint256 amount);
 
+    /// @notice A `depositFor` settlement captured by this contract was
+    ///         successfully forwarded on to the user it belonged to.
+    event RewardForwarded(address indexed user, uint256 amount);
+
+    /// @notice The forwarding transfer failed (revert or `false` return); the
+    ///         amount is escrowed under `unforwarded[user]` instead.
+    event RewardForwardFailed(address indexed user, uint256 amount);
+
+    /// @notice A user withdrew their escrowed forwarding failure.
+    event ForwardedClaimed(address indexed user, uint256 amount);
+
     constructor(
         INFTStakerMigratable _staker,
         IERC1155 _stakedToken,
         uint256 _stakedId,
         uint256 _migrationTimeout,
+        IERC20 _rewardToken,
         address initialOwner
     ) Ownable(initialOwner) {
         require(address(_staker) != address(0), "InPlace: zero staker");
         require(address(_stakedToken) != address(0), "InPlace: zero staked token");
+        require(_migrationTimeout >= MIN_TIMEOUT && _migrationTimeout <= MAX_TIMEOUT, "InPlace: timeout out of bounds");
+        require(address(_rewardToken) != address(0), "InPlace: zero reward token");
         require(
-            _migrationTimeout >= MIN_TIMEOUT && _migrationTimeout <= MAX_TIMEOUT, "InPlace: timeout out of bounds"
+            address(IStakerViews(address(_staker)).rewardToken()) == address(_rewardToken),
+            "InPlace: reward token mismatch"
         );
         staker = _staker;
         stakedToken = _stakedToken;
         stakedId = _stakedId;
         migrationTimeout = _migrationTimeout;
+        rewardToken = _rewardToken;
     }
 
     // ============================== INTERNAL SET ==============================
@@ -222,13 +289,68 @@ contract InPlaceNFTStakerMigrator is Ownable, ReentrancyGuard, ERC1155Holder {
             count++;
 
             // The only owner-driven exit for parked stake: back into the
-            // immutable staker, crediting the original user.
-            staker.depositFor(user, amt);
+            // immutable staker, crediting the original user — wrapped in the
+            // settlement-capture forwarding sequence.
+            _depositForAndForward(user, amt);
         }
 
         stakedToken.setApprovalForAll(address(staker), false);
 
         emit MigratedIn(count, total);
+    }
+
+    /// @dev The settlement-capture forwarding sequence. Line-for-line identical
+    ///      to `NFTStakerMigrator._depositForAndForward` (plan decision D-6 — a
+    ///      divergence here is exactly the fork drift that produced `pns20h1`).
+    ///      Source and target are the same contract here, so `owed` is read on
+    ///      `staker`.
+    ///
+    ///      `pre` is snapshotted PER ITERATION, not once before the loop —
+    ///      earlier iterations forward value out and failed forwards leave
+    ///      value in, so only a per-iteration delta is meaningful.
+    function _depositForAndForward(address user, uint256 amount) private {
+        uint256 owed = IStakerViews(address(staker)).pendingReward(user);
+        uint256 pre = rewardToken.balanceOf(address(this));
+
+        staker.depositFor(user, amount);
+
+        uint256 captured = rewardToken.balanceOf(address(this)) - pre;
+        require(captured <= owed, "Migrator: capture exceeds owed");
+
+        if (captured > 0) {
+            // Raw `transfer` inside `try`, NOT `safeTransfer`: SafeERC20
+            // reverts rather than returning, which would defeat the `catch` on
+            // non-reverting-false tokens. Both branches are handled.
+            try rewardToken.transfer(user, captured) returns (bool ok) {
+                if (ok) {
+                    emit RewardForwarded(user, captured);
+                } else {
+                    unforwarded[user] += captured;
+                    totalUnforwarded += captured;
+                    emit RewardForwardFailed(user, captured);
+                }
+            } catch {
+                unforwarded[user] += captured;
+                totalUnforwarded += captured;
+                emit RewardForwardFailed(user, captured);
+            }
+        }
+    }
+
+    /// @notice Permissionless, self-only recovery of reward escrowed by a
+    ///         failed forward. No owner path can redirect it.
+    /// @dev    Strict CEI under `nonReentrant`, modelled on `claimTimedOut`:
+    ///         the mapping is zeroed and `totalUnforwarded` decremented BEFORE
+    ///         the transfer.
+    function claimForwarded() external nonReentrant {
+        uint256 amount = unforwarded[msg.sender];
+        require(amount > 0, "InPlace: nothing unforwarded");
+
+        unforwarded[msg.sender] = 0;
+        totalUnforwarded -= amount;
+
+        rewardToken.safeTransfer(msg.sender, amount);
+        emit ForwardedClaimed(msg.sender, amount);
     }
 
     // ============================== TIMEOUT ESCAPE HATCH ==============================
@@ -257,16 +379,21 @@ contract InPlaceNFTStakerMigrator is Ownable, ReentrancyGuard, ERC1155Holder {
 
     // ============================== RESCUE ==============================
 
-    /// @notice Sweep a STRAY/DONATED ERC20 balance to `to`. The migrator never
-    ///         holds reward ERC20 as parked principal (parked principal is
-    ///         ERC1155), so this is an unconditional ERC20 sweep — the ERC1155
-    ///         stake is structurally untouchable by this function.
-    /// @dev    Owner-only. Mirrors the spirit of `InPlaceMigrator.rescueERC20`:
-    ///         the parked-principal floor is enforced for the staked token,
-    ///         which here is an ERC1155 and therefore cannot be reached by an
-    ///         ERC20 transfer at all.
+    /// @notice Sweep a STRAY/DONATED ERC20 balance to `to`. Unconditional for
+    ///         every token EXCEPT the reward token, where the sweep is floored
+    ///         by `totalUnforwarded` — reward escrowed by a failed forward
+    ///         belongs to its user and must be unreachable by the owner.
+    /// @dev    Owner-only. Parked principal is ERC1155 and therefore
+    ///         structurally untouchable by this function; the reward-token
+    ///         floor is the ERC20 analogue of the `totalParked` floor
+    ///         `rescueERC1155` applies to the staked id.
     function rescueERC20(IERC20 token, address to, uint256 amount) external onlyOwner {
         require(to != address(0), "InPlace: zero recipient");
+        if (address(token) == address(rewardToken)) {
+            uint256 balance = rewardToken.balanceOf(address(this));
+            uint256 surplus = balance - totalUnforwarded;
+            require(amount <= surplus, "InPlace: cannot touch unforwarded");
+        }
         token.safeTransfer(to, amount);
     }
 

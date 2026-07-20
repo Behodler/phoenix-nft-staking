@@ -79,7 +79,7 @@ contract NFTStakerMigratorOrchestratorsTest is Test {
         uint256 alicePending = oldStaker.pendingReward(alice);
 
         NFTStakerMigrator mig =
-            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
 
         // Wire the migrator as migrator on BOTH stakers.
         vm.prank(owner);
@@ -115,7 +115,7 @@ contract NFTStakerMigratorOrchestratorsTest is Test {
         NFTStakerDepletion newStaker = _newStaker(ID);
         phUSD.mint(address(oldStaker), 1 ether);
         NFTStakerMigrator mig =
-            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         oldStaker.setMigrator(address(mig));
         vm.prank(owner);
@@ -135,7 +135,7 @@ contract NFTStakerMigratorOrchestratorsTest is Test {
         NFTStakerDepletion oldStaker = _newStaker(ID);
         NFTStakerDepletion newStaker = _newStaker(ID);
         NFTStakerMigrator mig =
-            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, owner);
+            new NFTStakerMigrator(oldStaker, newStaker, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
         address[] memory u = new address[](1);
         u[0] = alice;
         vm.expectRevert();
@@ -147,10 +147,10 @@ contract NFTStakerMigratorOrchestratorsTest is Test {
         NFTStakerDepletion s = _newStaker(ID);
         vm.expectRevert(bytes("Migrator: zero old staker"));
         new NFTStakerMigrator(
-            INFTStakerMigratable(address(0)), s, IERC1155(address(nft)), ID, owner
+            INFTStakerMigratable(address(0)), s, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner
         );
         vm.expectRevert(bytes("Migrator: same staker"));
-        new NFTStakerMigrator(s, s, IERC1155(address(nft)), ID, owner);
+        new NFTStakerMigrator(s, s, IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner);
     }
 
     // ===================================================================
@@ -158,7 +158,7 @@ contract NFTStakerMigratorOrchestratorsTest is Test {
     // ===================================================================
 
     function _deployInPlace(NFTStakerDepletion s) internal returns (InPlaceNFTStakerMigrator mig) {
-        mig = new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, TIMEOUT, owner);
+        mig = new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, TIMEOUT, IERC20(address(phUSD)), owner);
         vm.prank(owner);
         s.setMigrator(address(mig));
     }
@@ -296,9 +296,9 @@ contract NFTStakerMigratorOrchestratorsTest is Test {
     function testInPlaceTimeoutBoundsEnforced() public {
         NFTStakerDepletion s = _newStaker(ID);
         vm.expectRevert(bytes("InPlace: timeout out of bounds"));
-        new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, 1 hours, owner);
+        new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, 1 hours, IERC20(address(phUSD)), owner);
         vm.expectRevert(bytes("InPlace: timeout out of bounds"));
-        new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, 60 days, owner);
+        new InPlaceNFTStakerMigrator(s, IERC1155(address(nft)), ID, 60 days, IERC20(address(phUSD)), owner);
     }
 
     // -------------------------------------------------------------------
