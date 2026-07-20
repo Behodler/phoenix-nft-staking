@@ -6,13 +6,13 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ITokenMinterV2} from "yield-claim-nft/interfaces/ITokenMinterV2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {BatchNFTMinter} from "../src/BatchNFTMinter.sol";
+import {BatchNFTMinterMultiToken} from "../src/BatchNFTMinterMultiToken.sol";
 import {MockITokenMinterV2} from "./mocks/MockITokenMinterV2.sol";
 import {MockTokenDispatcherV2} from "./mocks/MockTokenDispatcherV2.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
-/// @title BatchNFTMinter functional tests + gas benchmarks
+/// @title BatchNFTMinterMultiToken functional tests + gas benchmarks
 ///
 /// Functional tests exercise the helper against a fully mocked
 /// `ITokenMinterV2` (`MockITokenMinterV2`) that pulls payment, mints into a
@@ -20,8 +20,8 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 /// after each successful mint. Gas benchmarks compare wrapper overhead
 /// (count = 1) and N-mint amortisation (N in {2, 5, 10, 25}) against
 /// successive direct `nftMinter.mint(...)` calls.
-contract BatchNFTMinterTest is Test {
-    BatchNFTMinter internal batch;
+contract BatchNFTMinterMultiTokenCoreTest is Test {
+    BatchNFTMinterMultiToken internal batch;
     MockITokenMinterV2 internal nftMinter;
     MockTokenDispatcherV2 internal dispatcher;
     MockERC1155 internal nft;
@@ -36,7 +36,7 @@ contract BatchNFTMinterTest is Test {
     uint256 internal constant GROWTH_BPS = 250; // 2.5% per mint
 
     function setUp() public virtual {
-        batch = new BatchNFTMinter(owner);
+        batch = new BatchNFTMinterMultiToken(owner);
         nftMinter = new MockITokenMinterV2();
         nft = new MockERC1155();
         payToken = new MockERC20("PayToken", "PAY");
@@ -89,7 +89,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(START_PRICE, address(batch));
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE, 0);
+        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE, new address[](0), new uint256[](0));
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 1, "recipient gets 1 NFT unit");
         assertEq(totalPaid, START_PRICE, "totalPaid equals starting price");
@@ -102,8 +102,8 @@ contract BatchNFTMinterTest is Test {
 
         _fundCaller(START_PRICE, address(batch));
         vm.prank(caller);
-        vm.expectRevert(BatchNFTMinter.BatchMint__MinterNotConfigured.selector);
-        batch.batchMint(1, recipient, START_PRICE, 0);
+        vm.expectRevert(BatchNFTMinterMultiToken.BatchMint__MinterNotConfigured.selector);
+        batch.batchMint(1, recipient, START_PRICE, new address[](0), new uint256[](0));
     }
 
     function test_batchMint_revertsWhenPaused() public {
@@ -115,13 +115,13 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(START_PRICE, address(batch));
         vm.prank(caller);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        batch.batchMint(1, recipient, START_PRICE, 0);
+        batch.batchMint(1, recipient, START_PRICE, new address[](0), new uint256[](0));
 
         // After unpause it works again.
         vm.prank(pauser);
         batch.unpause();
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE, 0);
+        uint256 totalPaid = batch.batchMint(1, recipient, START_PRICE, new address[](0), new uint256[](0));
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 1, "mint resumes after unpause");
         assertEq(totalPaid, START_PRICE, "totalPaid correct after unpause");
     }
@@ -155,7 +155,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(expected, address(batch));
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected, 0);
+        batch.batchMint(N, recipient, expected, new address[](0), new uint256[](0));
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "recipient gets N NFT units");
     }
@@ -172,7 +172,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, expected, 0);
+        uint256 totalPaid = batch.batchMint(N, recipient, expected, new address[](0), new uint256[](0));
 
         uint256 callerAfter = payToken.balanceOf(caller);
         assertEq(callerBefore - callerAfter, expected, "caller balance delta = sum of growing prices");
@@ -181,14 +181,14 @@ contract BatchNFTMinterTest is Test {
 
     function test_batchMint_revertsOnZeroCount() public {
         vm.prank(caller);
-        vm.expectRevert(BatchNFTMinter.BatchMint__ZeroCount.selector);
-        batch.batchMint(0, recipient, 0, 0);
+        vm.expectRevert(BatchNFTMinterMultiToken.BatchMint__ZeroCount.selector);
+        batch.batchMint(0, recipient, 0, new address[](0), new uint256[](0));
     }
 
     function test_batchMint_revertsOnZeroRecipient() public {
         vm.prank(caller);
-        vm.expectRevert(BatchNFTMinter.BatchMint__ZeroRecipient.selector);
-        batch.batchMint(1, address(0), 0, 0);
+        vm.expectRevert(BatchNFTMinterMultiToken.BatchMint__ZeroRecipient.selector);
+        batch.batchMint(1, address(0), 0, new address[](0), new uint256[](0));
     }
 
     function test_batchMint_revertsAtomicallyOnInnerRevert() public {
@@ -204,7 +204,7 @@ contract BatchNFTMinterTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(MockITokenMinterV2.MockITokenMinterV2__ForcedRevert.selector);
-        batch.batchMint(N, recipient, expected, 0);
+        batch.batchMint(N, recipient, expected, new address[](0), new uint256[](0));
 
         assertEq(payToken.balanceOf(caller), callerBefore, "caller balance unchanged on revert");
         assertEq(
@@ -220,7 +220,7 @@ contract BatchNFTMinterTest is Test {
         _fundCaller(expected, address(batch));
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, expected, 0);
+        uint256 totalPaid = batch.batchMint(N, recipient, expected, new address[](0), new uint256[](0));
 
         assertEq(totalPaid, expected, "returned totalPaid matches geometric sum");
     }
@@ -235,7 +235,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, paid, 0);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, new address[](0), new uint256[](0));
 
         assertEq(totalPaid, expected, "totalPaid is dispatcher cost, not paymentAmount");
         assertEq(payToken.balanceOf(caller), callerBefore - expected, "surplus refunded to caller");
@@ -251,7 +251,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(N, recipient, paid, 0);
+        uint256 totalPaid = batch.batchMint(N, recipient, paid, new address[](0), new uint256[](0));
 
         assertEq(totalPaid, paid, "totalPaid swallows dust");
         assertEq(payToken.balanceOf(caller), callerBefore - paid, "no refund issued for sub-threshold");
@@ -270,7 +270,7 @@ contract BatchNFTMinterTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected, 0);
+        batch.batchMint(N, recipient, expected, new address[](0), new uint256[](0));
 
         assertEq(
             payToken.balanceOf(caller),
@@ -315,7 +315,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 1);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(1, recipient, expected, 0);
+        batch.batchMint(1, recipient, expected, new address[](0), new uint256[](0));
         vm.snapshotGasLastCall("batchMintCount1");
     }
 
@@ -330,7 +330,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 2);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(2, recipient, expected, 0);
+        batch.batchMint(2, recipient, expected, new address[](0), new uint256[](0));
         vm.snapshotGasLastCall("batchMintN_2");
     }
 
@@ -345,7 +345,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 5);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(5, recipient, expected, 0);
+        batch.batchMint(5, recipient, expected, new address[](0), new uint256[](0));
         vm.snapshotGasLastCall("batchMintN_5");
     }
 
@@ -360,7 +360,7 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 10);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(10, recipient, expected, 0);
+        batch.batchMint(10, recipient, expected, new address[](0), new uint256[](0));
         vm.snapshotGasLastCall("batchMintN_10");
     }
 
@@ -375,32 +375,80 @@ contract BatchNFTMinterTest is Test {
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, 25);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(25, recipient, expected, 0);
+        batch.batchMint(25, recipient, expected, new address[](0), new uint256[](0));
         vm.snapshotGasLastCall("batchMintN_25");
     }
 
-    /// @notice Capture the unhappy-path SLOAD overhead added by the nudge
-    ///         feature: nudge configured (so the entry-guard SLOAD pays
-    ///         cold gas), but `count` is below the threshold so the
-    ///         post-loop transfer block early-exits after one warm read.
+    /// @notice Capture the unhappy-path overhead added by the multi-token
+    ///         nudge: `nudgeSize` configured and the caller DOES list a
+    ///         reward token, but `count` is below the threshold so
+    ///         `qualifies` is false. The snapshot loop still runs the §4.1
+    ///         payment-token exclusion check on the listed element (that
+    ///         check is unconditional), skips the `balanceOf`, and the
+    ///         payout pass finds `snapshot[0] == 0` and transfers nothing.
+    ///
+    ///         Redesigned for story-022: the previous shape configured the
+    ///         reward asset through the removed `setNudgePaymentToken`
+    ///         setter. The reward asset is now caller-supplied, so the
+    ///         equivalent unhappy path is "arrays supplied, threshold not
+    ///         met".
     function test_gas_batchMintNudge_unhappyPath() public {
-        // Configure the nudge with a distinct token and a threshold the
-        // call will not meet.
+        // Threshold the call will not meet.
         MockERC20 nudgeToken = new MockERC20("NudgeToken", "NDG");
-        vm.prank(owner);
-        batch.setNudgePaymentToken(address(nudgeToken));
         vm.prank(owner);
         batch.setNudgeSize(10);
 
-        // Fund the helper with nudge tokens so SLOAD/balanceOf reads
-        // exercise hot storage in the same shape the happy path would.
+        // Fund the helper with nudge tokens so the pot exists in the same
+        // shape the happy path would see.
         nudgeToken.mint(address(batch), 1_000 ether);
+
+        address[] memory rewardTokens = new address[](1);
+        rewardTokens[0] = address(nudgeToken);
+        uint256[] memory minRewards = new uint256[](1);
 
         uint256 N = 5; // below the threshold of 10
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
         _fundCaller(expected, address(batch));
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected, 0);
+        batch.batchMint(N, recipient, expected, rewardTokens, minRewards);
         vm.snapshotGasLastCall("batchMintNudge_unhappyPath");
+    }
+
+    /// @notice Multi-token payout gas: 1 / 2 / 3 reward tokens on an
+    ///         otherwise identical qualifying batch. The §8 acceptance
+    ///         check reads the deltas between these three as the
+    ///         per-additional-token cost and requires them to be LINEAR —
+    ///         a superlinear trend means a dedupe or nested loop crept in
+    ///         (a bug against §4.5).
+    function _gasMultiToken(uint256 tokenCount, string memory label) internal {
+        vm.prank(owner);
+        batch.setNudgeSize(2);
+
+        address[] memory rewardTokens = new address[](tokenCount);
+        uint256[] memory minRewards = new uint256[](tokenCount);
+        for (uint256 i = 0; i < tokenCount; i++) {
+            MockERC20 rewardToken = new MockERC20("Reward", "RWD");
+            rewardToken.mint(address(batch), 1_000 ether);
+            rewardTokens[i] = address(rewardToken);
+        }
+
+        uint256 N = 2;
+        uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
+        _fundCaller(expected, address(batch));
+        vm.prank(caller);
+        batch.batchMint(N, recipient, expected, rewardTokens, minRewards);
+        vm.snapshotGasLastCall(label);
+    }
+
+    function test_gas_batchMintMultiToken_1() public {
+        _gasMultiToken(1, "batchMintMultiToken_1");
+    }
+
+    function test_gas_batchMintMultiToken_2() public {
+        _gasMultiToken(2, "batchMintMultiToken_2");
+    }
+
+    function test_gas_batchMintMultiToken_3() public {
+        _gasMultiToken(3, "batchMintMultiToken_3");
     }
 }

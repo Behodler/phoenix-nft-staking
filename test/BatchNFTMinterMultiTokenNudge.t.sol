@@ -6,7 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {ITokenMinterV2} from "yield-claim-nft/interfaces/ITokenMinterV2.sol";
 
-import {BatchNFTMinter} from "../src/BatchNFTMinter.sol";
+import {BatchNFTMinterMultiToken} from "../src/BatchNFTMinterMultiToken.sol";
 import {MockITokenMinterV2} from "./mocks/MockITokenMinterV2.sol";
 import {MockTokenDispatcherV2} from "./mocks/MockTokenDispatcherV2.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
@@ -14,7 +14,7 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 import {MockReentrantERC20} from "./mocks/MockReentrantERC20.sol";
 
-/// @title BatchNFTMinter — caller-selected multi-token nudge
+/// @title BatchNFTMinterMultiToken — caller-selected multi-token nudge
 ///
 /// The full §6 test plan from `docs/multi-token-nudge.md`. The owner keeps
 /// control of ELIGIBILITY (`nudgeSize`); the CALLER declares which ERC20
@@ -28,7 +28,7 @@ import {MockReentrantERC20} from "./mocks/MockReentrantERC20.sol";
 ///   §4.4  fee-on-transfer is documented, not defended
 ///   §4.5  malformed arrays are the caller's problem (no dedupe)
 contract BatchNFTMinterMultiTokenNudgeTest is Test {
-    BatchNFTMinter internal batch;
+    BatchNFTMinterMultiToken internal batch;
     MockITokenMinterV2 internal nftMinter;
     MockTokenDispatcherV2 internal dispatcher;
     MockERC1155 internal nft;
@@ -52,13 +52,13 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     uint256 internal constant POT_B = 1_00000000;
     uint256 internal constant POT_C = 7_777 ether;
 
-    /// @dev Mirrors `BatchNFTMinter.DUST_THRESHOLD` (internal there).
+    /// @dev Mirrors `BatchNFTMinterMultiToken.DUST_THRESHOLD` (internal there).
     uint256 internal constant DUST_THRESHOLD = 1e6;
 
     event NudgePaid(address indexed recipient, address indexed token, uint256 amount);
 
     function setUp() public {
-        batch = new BatchNFTMinter(owner);
+        batch = new BatchNFTMinterMultiToken(owner);
         nftMinter = new MockITokenMinterV2();
         nft = new MockERC1155();
 
@@ -171,7 +171,9 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(
-            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken))
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
+            )
         );
         batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(payToken)), _mins(0));
     }
@@ -185,7 +187,9 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(
-            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken))
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
+            )
         );
         batch.batchMint(
             NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB), address(payToken)), _mins(0, 0, 0)
@@ -203,7 +207,9 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(
-            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken))
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
+            )
         );
         batch.batchMint(belowThreshold, recipient, cost, _arr(address(payToken)), _mins(0));
     }
@@ -227,7 +233,9 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         _fund(caller2, cost2);
         vm.prank(caller2);
         vm.expectRevert(
-            abi.encodeWithSelector(BatchNFTMinter.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken))
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
+            )
         );
         batch.batchMint(NUDGE_SIZE, recipient, cost2, _arr(address(payToken)), _mins(0));
         assertEq(payToken.balanceOf(address(batch)), dust, "dust survives the attempted claim");
@@ -469,7 +477,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         vm.prank(caller);
         vm.expectRevert(
             abi.encodeWithSelector(
-                BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, address(rewardA), POT_A + 1, POT_A
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardA), POT_A + 1, POT_A
             )
         );
         batch.batchMint(
@@ -484,7 +492,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         vm.prank(caller);
         vm.expectRevert(
             abi.encodeWithSelector(
-                BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, address(rewardB), POT_B + 1, POT_B
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardB), POT_B + 1, POT_B
             )
         );
         batch.batchMint(
@@ -499,7 +507,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         vm.prank(caller);
         vm.expectRevert(
             abi.encodeWithSelector(
-                BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, address(rewardC), POT_C + 1, POT_C
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardC), POT_C + 1, POT_C
             )
         );
         batch.batchMint(
@@ -550,7 +558,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         vm.prank(caller);
         vm.expectRevert(
             abi.encodeWithSelector(
-                BatchNFTMinter.BatchMint__RewardBelowMinimum.selector, address(rewardA), POT_A + 1, POT_A
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardA), POT_A + 1, POT_A
             )
         );
         batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA)), _mins(POT_A + 1));
@@ -567,15 +575,15 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         _fund(caller, cost);
 
         vm.prank(caller);
-        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinter.BatchMint__ArrayLengthMismatch.selector, 2, 1));
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 2, 1));
         batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0));
 
         vm.prank(caller);
-        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinter.BatchMint__ArrayLengthMismatch.selector, 1, 2));
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 1, 2));
         batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA)), _mins(0, 0));
 
         vm.prank(caller);
-        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinter.BatchMint__ArrayLengthMismatch.selector, 0, 1));
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 0, 1));
         batch.batchMint(NUDGE_SIZE, recipient, cost, _none(), _mins(0));
     }
 

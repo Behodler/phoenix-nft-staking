@@ -1,8 +1,11 @@
-# BatchNFTMinter — Caller-Selected Multi-Token Nudge
+# BatchNFTMinterMultiToken — Caller-Selected Multi-Token Nudge
 
-Status: **planned** (not yet implemented)
+Status: **implemented** — landed as the sibling contract `src/BatchNFTMinterMultiToken.sol`
+(story 022, stages 0-7). The deployed `src/BatchNFTMinter.sol` is frozen and
+unchanged.
 Supersedes: the owner-set single `nudgePaymentToken` model in
-`src/BatchNFTMinter.sol`.
+`src/BatchNFTMinter.sol` (which remains deployed and frozen; the new model
+lives in `src/BatchNFTMinterMultiToken.sol`).
 
 ## 1. Motivation
 
@@ -44,7 +47,7 @@ under which claiming is profitable-in-isolation.
 
 If someone erroneously over-funds the contract beyond the mint cost and a bot
 snipes it, that is still correct behaviour — the error was in the sender, not in
-`BatchNFTMinter`. The contract makes no promise that arbitrary tokens sent to it
+`BatchNFTMinterMultiToken`. The contract makes no promise that arbitrary tokens sent to it
 are recoverable, and the docstring must say so plainly.
 
 Note the one operational consequence: `rescueERC20` stops being a reliable
@@ -234,9 +237,12 @@ scope.
 
 ## 6. Test plan (TDD — red first)
 
-New file `test/BatchNFTMinterMultiTokenNudge.t.sol`. `BatchNFTMinterNudge.t.sol`
-is ported to the new signature; `BatchNFTMinter.t.sol` needs only mechanical
-call-site updates (empty arrays).
+New file `test/BatchNFTMinterMultiTokenNudge.t.sol`. The two original suites were
+copied to `test/BatchNFTMinterMultiTokenNudgeCore.t.sol` and
+`test/BatchNFTMinterMultiTokenCore.t.sol` and ported to the new signature
+(the latter needing only mechanical call-site updates — empty arrays);
+`test/BatchNFTMinterNudge.t.sol` and `test/BatchNFTMinter.t.sol` remain as the
+regression suites for the frozen deployed contract.
 
 Mocks needed beyond the existing set: `MockFeeOnTransferERC20`,
 `MockReentrantERC20` (reenters `batchMint` from `transfer`).
@@ -332,7 +338,7 @@ own pocket, having opted in explicitly (§4.5).
 
 1. **The empty-array path is free.** One length comparison and a zero-iteration
    loop. Callers who want no reward pay nothing for the feature, which is what
-   keeps the `BatchNFTMinter.t.sol` port mechanical.
+   keeps the `BatchNFTMinterMultiTokenCore.t.sol` port mechanical.
 2. **The revert path gets cheaper than today's.** Moving the floor check ahead
    of the payment pull (§3 step 4) means a breached floor aborts before
    `safeTransferFrom` and before `count` mints, rather than after both.

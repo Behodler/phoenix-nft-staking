@@ -1,0 +1,16 @@
+{
+  "batchMintCount1": "184185",
+  "batchMintMultiToken_1": "225017",
+  "batchMintMultiToken_2": "255963",
+  "batchMintMultiToken_3": "286909",
+  "batchMintN_10": "308565",
+  "batchMintN_2": "198005",
+  "batchMintN_25": "515867",
+  "batchMintN_5": "239465",
+  "batchMintNudge_unhappyPath": "236547",
+  "directMintN_10": "239597",
+  "directMintN_2": "117909",
+  "directMintN_25": "467764",
+  "directMintN_5": "163542",
+  "singleDirectMint": "96305"
+}
