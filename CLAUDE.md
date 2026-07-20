@@ -92,10 +92,27 @@ If a feature needs a sibling's interface to change, stop work and tell the user 
 - `forge fmt` — format.
 - `forge snapshot` — gas snapshots.
 
-## Project Structure (to be created)
+## ⚠️ This is NOT a deployment or staging repo
+
+This submodule is **contract source and tests only**. It has no `script/` directory
+and must not acquire one.
+
+- **Never** add a Foundry deployment script (`script/*.s.sol`), a broadcast config,
+  an RPC URL, a private key, or anything else whose purpose is to put bytecode on a
+  chain. If a task seems to call for one, it belongs in the staging repo, not here.
+- **Never** add tests whose subject is a deploy script or a deployment sequence.
+  Tests here exercise contract behaviour, nothing more.
+- Deployment, wiring, address books and end-to-end staging live in
+  **`../phase-2-staging`** (the `phStaging2` project). Send all deploy work there.
+- A deploy script that lives here inevitably drifts out of sync with the contracts
+  and then silently mis-deploys them. `script/DeployBatchNFTMinter.s.sol` was
+  deleted in story 022 for exactly that reason: it had stopped setting a required
+  constructor-adjacent config on the contract it deployed, and nothing caught it
+  because this repo never actually runs a deployment.
+
+## Project Structure
 
 - `src/` — Solidity source.
 - `test/` — Foundry tests (TDD).
-- `script/` — deployment scripts.
 - `lib/mutable/` — sibling interfaces (`yield-claim-nft`, `pauser`).
 - `lib/immutable/` — OpenZeppelin etc.
