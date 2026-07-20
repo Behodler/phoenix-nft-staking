@@ -44,13 +44,20 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
     uint256 private _revertAtCall; // 0 = disabled
     bool private _revertEnabled;
 
-    // Optional per-mint donation: on every `mint`, push `_donationPerMint` of
-    // `_donationToken` from this mock into `msg.sender` (the batch helper). This
-    // mirrors `BalancerPoolerV2` donating USDC into the configured `batchMinter`
-    // on every mint. Disabled when either field is zero. The mock must be
-    // pre-funded with `count * amountPerMint` of the donation token.
-    address private _donationToken;
-    uint256 private _donationPerMint;
+    // Optional per-mint donations: on every `mint`, push
+    // `_donationAmounts[i]` of `_donationTokens[i]` from this mock into
+    // `msg.sender` (the batch helper). This mirrors `BalancerPoolerV2`
+    // donating USDC into the configured `batchMinter` on every mint.
+    //
+    // Story-022 widened this from a single (token, amount) pair to a LIST, so
+    // the multi-token §4.2 "donate forward" tests can prove that a batcher's
+    // own mid-loop donations stay behind for the next claimant across SEVERAL
+    // reward tokens at once, not just one. The mock must be pre-funded with
+    // `count * amount` of each donation token.
+    address[] private _donationTokens;
+    uint256[] private _donationAmounts;
+
+    error MockITokenMinterV2__DonationArrayLengthMismatch();
 
     error MockITokenMinterV2__ForcedRevert();
 
@@ -66,8 +73,9 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
         IERC20(_primeToken[index]).safeTransferFrom(msg.sender, address(this), price);
         stakedToken.mint(recipient, index, 1);
         c.price = price * (10_000 + c.growthBasisPoints) / 10_000;
-        if (_donationToken != address(0) && _donationPerMint != 0) {
-            IERC20(_donationToken).safeTransfer(msg.sender, _donationPerMint);
+        uint256 donations = _donationTokens.length;
+        for (uint256 i; i < donations; ++i) {
+            IERC20(_donationTokens[i]).safeTransfer(msg.sender, _donationAmounts[i]);
         }
         return true;
     }
@@ -135,14 +143,40 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
         _revertEnabled = enabled;
     }
 
-    /// @notice Configure an optional per-mint donation. On every `mint`, the
-    ///         mock pushes `amountPerMint` of `token` into `msg.sender` (the
-    ///         batch helper), simulating `BalancerPoolerV2`'s per-mint USDC
-    ///         donation into the configured `batchMinter`. Pass `token ==
-    ///         address(0)` or `amountPerMint == 0` to disable. The mock must be
-    ///         pre-funded with `count * amountPerMint` of `token`.
+    /// @notice Configure a single per-mint donation, replacing any previously
+    ///         configured set. On every `mint`, the mock pushes
+    ///         `amountPerMint` of `token` into `msg.sender` (the batch
+    ///         helper), simulating `BalancerPoolerV2`'s per-mint USDC donation
+    ///         into the configured `batchMinter`. Pass `token == address(0)`
+    ///         or `amountPerMint == 0` to disable. The mock must be pre-funded
+    ///         with `count * amountPerMint` of `token`.
     function setPerMintDonation(address token, uint256 amountPerMint) external {
-        _donationToken = token;
-        _donationPerMint = amountPerMint;
+        delete _donationTokens;
+        delete _donationAmounts;
+        if (token != address(0) && amountPerMint != 0) {
+            _donationTokens.push(token);
+            _donationAmounts.push(amountPerMint);
+        }
+    }
+
+    /// @notice Multi-token form of {setPerMintDonation}: on every `mint` the
+    ///         mock pushes `amounts[i]` of `tokens[i]` into `msg.sender`, for
+    ///         every `i`. Replaces any previously configured set; pass empty
+    ///         arrays to disable. The mock must be pre-funded with
+    ///         `count * amounts[i]` of each `tokens[i]`.
+    function setPerMintDonations(address[] calldata tokens, uint256[] calldata amounts) external {
+        if (tokens.length != amounts.length) revert MockITokenMinterV2__DonationArrayLengthMismatch();
+        delete _donationTokens;
+        delete _donationAmounts;
+        for (uint256 i; i < tokens.length; ++i) {
+            if (tokens[i] == address(0) || amounts[i] == 0) continue;
+            _donationTokens.push(tokens[i]);
+            _donationAmounts.push(amounts[i]);
+        }
+    }
+
+    /// @notice Number of donation entries currently configured.
+    function donationCount() external view returns (uint256) {
+        return _donationTokens.length;
     }
 }
