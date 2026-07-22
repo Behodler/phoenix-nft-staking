@@ -1,11 +1,15 @@
-# BatchNFTMinterMultiToken — Caller-Selected Multi-Token Nudge
+# BatchNFTMinterMultiToken — Whitelist-Selected Multi-Token Nudge
 
 Status: **implemented** — landed as the sibling contract `src/BatchNFTMinterMultiToken.sol`
-(story 022, stages 0-7). The deployed `src/BatchNFTMinter.sol` is frozen and
-unchanged.
+(story 022, stages 0-7; reward-token selection moved from a caller-supplied
+array to an owner-managed whitelist in story 025). The deployed
+`src/BatchNFTMinter.sol` is frozen and unchanged.
 Supersedes: the owner-set single `nudgePaymentToken` model in
 `src/BatchNFTMinter.sol` (which remains deployed and frozen; the new model
-lives in `src/BatchNFTMinterMultiToken.sol`).
+lives in `src/BatchNFTMinterMultiToken.sol`), and the story-022
+caller-selected `rewardTokens` array (replaced in story 025 — the caller now
+supplies only `minRewards`, ordered to match the on-chain whitelist view
+`getNudgeTokens()`).
 
 ## 1. Motivation
 
@@ -18,24 +22,34 @@ balance of that one token. Two consequences:
 - Any other ERC20 that lands on the contract is inert. It can only leave via
   `rescueERC20`.
 
-The new model **keeps the owner in control of eligibility and removes them from
-the choice of reward asset**:
+The new model **keeps the owner in control of eligibility and of the SET of
+reward assets, while funding stays permissionless**:
 
 - `nudgeSize` still gates *who* qualifies (batch size >= threshold). Unchanged.
-- The *caller* declares which ERC20 balances on the contract they want to be
-  paid in, and a minimum for each.
+- The owner curates an on-chain whitelist of nudge tokens
+  (`setNudgeTokenWhitelist`); the *caller* supplies only a per-token
+  `minRewards` floor, ordered to match `getNudgeTokens()`.
 
-So with 100 USDC and 10 WBTC sitting on the contract, a caller passes
-`[USDC, WBTC]`, `[100_000000, 1_00000000]`. The contract deals only in raw wei
-amounts, so decimals are a UI concern, never a contract concern.
+So with USDC and WBTC whitelisted and 100 USDC + 10 WBTC sitting on the
+contract, a caller reads `getNudgeTokens() == [USDC, WBTC]` and passes
+`[100_000000, 1_00000000]`. The contract deals only in raw wei amounts, so
+decimals are a UI concern, never a contract concern.
+
+(Story 025 note: story 022 originally let the caller name arbitrary
+reward-token addresses per call. That opened a weird-token attack surface on
+attacker-chosen addresses and made the payment-token exclusion an
+untrusted-input check; the owner-vetted whitelist removes both. Anything odd
+that lands on the contract is now simply `rescueERC20` territory.)
 
 ### Intended side effects (features, not accidents)
 
-- **Permissionless top-up.** Anyone can seed the batch incentive with any token
-  by sending it to the contract. No owner action required.
-- **Exogenous reward capture.** If the official UI doesn't surface a token, a
-  sophisticated user or bot can still enumerate the contract's balances and
-  claim them. This is deliberate — unclaimed value should not be stranded.
+- **Permissionless top-up.** Anyone can seed the batch incentive with any
+  whitelisted token by sending it to the contract. No owner action is required
+  to fund — only to curate the whitelist.
+- **Exogenous reward capture.** If the official UI doesn't surface a
+  whitelisted token, a sophisticated user or bot can still enumerate
+  `getNudgeTokens()` and the contract's balances and claim them. This is
+  deliberate — unclaimed value should not be stranded.
 
 ### Why the "honeypot" framing does not apply
 
@@ -50,10 +64,12 @@ snipes it, that is still correct behaviour — the error was in the sender, not 
 `BatchNFTMinterMultiToken`. The contract makes no promise that arbitrary tokens sent to it
 are recoverable, and the docstring must say so plainly.
 
-Note the one operational consequence: `rescueERC20` stops being a reliable
-escape hatch and becomes a **race** the owner will usually lose to a watching
-bot. It is retained for the paused case and for tokens no batch has claimed, but
-its docstring must be re-framed — it is no longer "the missing escape hatch".
+Note the operational consequence (revised in story 025): for **whitelisted**
+tokens, `rescueERC20` is still a race against watching bots — "pause first (or
+unwhitelist first), then rescue" is the dependable sequence there. For
+**non-whitelisted** tokens the race is gone: they can never be claimed through
+`batchMint`, so `rescueERC20` is now the dependable escape hatch for anything
+weird or unsupported that lands on the contract.
 
 ## 2. Interface change
 
@@ -62,16 +78,25 @@ function batchMint(
     uint256 count,
     address recipient,
     uint256 paymentAmount,
-    address[] calldata rewardTokens,
     uint256[] calldata minRewards
 ) external whenNotPaused nonReentrant returns (uint256 totalPaid);
+
+/// Owner-managed nudge-token whitelist (story 025). Hand-rolled enumerable
+/// set (address[] + 1-based index mapping, swap-and-pop removal) because OZ
+/// EnumerableSet requires solc ^0.8.24 and this repo pins 0.8.20.
+function setNudgeTokenWhitelist(address token, bool allowed) external onlyOwner;
+function getNudgeTokens() external view returns (address[] memory);
 ```
 
-Removed:
+Removed (vs the frozen `BatchNFTMinter`):
 - storage `address public nudgePaymentToken`
 - `setNudgePaymentToken(address)` / `NudgePaymentTokenChanged`
 - `error BatchMint__NudgeTokenMatchesPaymentToken` (replaced, see below)
 - the scalar `uint256 minReward` parameter
+
+Removed (vs the story-022 caller-selected shape):
+- the `address[] calldata rewardTokens` parameter — the payout set is the
+  on-chain whitelist, iterated in storage order
 
 Retained unchanged:
 - `nudgeSize`, `setNudgeSize`, `NudgeSizeChanged`
@@ -80,29 +105,38 @@ Retained unchanged:
 
 Added:
 ```solidity
-error BatchMint__RewardTokenIsPaymentToken(address token);
+error BatchMint__RewardTokenIsPaymentToken(address token); // admin-time (story 025)
 error BatchMint__ArrayLengthMismatch(uint256 tokensLength, uint256 minsLength);
 error BatchMint__RewardBelowMinimum(address token, uint256 minReward, uint256 actualReward);
+// story 025 whitelist admin:
+error BatchMint__ZeroNudgeToken();
+error BatchMint__NudgeTokenAlreadyWhitelisted(address token);
+error BatchMint__NudgeTokenNotWhitelisted(address token);
+
+event NudgeTokenWhitelistChanged(address indexed token, bool allowed);
 ```
-`NudgePaid(recipient, token, amount)` is now emitted **once per token actually
+`NudgePaid(recipient, token, amount)` is emitted **once per token actually
 transferred** (its signature is already per-token, so no ABI change).
 
-Passing empty arrays is legal and means "no reward wanted" — the batch is a
-plain mint loop.
+`minRewards.length` must equal the FULL whitelist length (including any entry
+currently equal to the derived payment token — its floor is ignored, see
+§4.1). An empty whitelist therefore demands an empty `minRewards` and the
+batch is a plain mint loop. `getNudgeTokens()` must be re-fetched immediately
+before every call: unwhitelisting uses swap-and-pop, which REORDERS the list.
 
 ## 3. Execution order (normative)
 
 The ordering below is the correctness backbone. Do not reorder.
 
 1. Validate `count != 0`, `recipient != address(0)`,
-   `rewardTokens.length == minRewards.length`.
+   `minRewards.length == _nudgeTokens.length` (the FULL whitelist).
 2. Resolve `tokenMinter`, `dispatcherIndex`, `dispatcher`, and derive
    `paymentToken = dispatcher.primeToken()`.
 3. Compute `qualifies = (nudgeSize != 0 && count >= nudgeSize)`.
-4. **Pre-loop snapshot pass** over `rewardTokens`:
-   - revert `BatchMint__RewardTokenIsPaymentToken` if the element equals
-     `paymentToken` — *this check runs unconditionally, even when `qualifies`
-     is false*, so a non-qualifying call can never probe payment-token balances;
+4. **Pre-loop snapshot pass** over the whitelist, in storage order:
+   - if the element equals `paymentToken`, `continue` — runtime SKIP, no
+     revert: the entry's snapshot stays 0 and its `minRewards[i]` is ignored
+     (see §4.1 for why this is a skip rather than a revert);
    - `snapshot[i] = qualifies ? IERC20(token).balanceOf(address(this)) : 0`;
    - revert `BatchMint__RewardBelowMinimum` if `snapshot[i] < minRewards[i]`.
 
@@ -121,19 +155,32 @@ The ordering below is the correctness backbone. Do not reorder.
 
 ### 4.1 The payment token can never be a reward token — LOAD-BEARING
 
-The existing single-token guard (`BatchMint__NudgeTokenMatchesPaymentToken`)
-was effectively a deploy-time config assertion: the owner set the nudge token,
-so a collision was operator error. **It is now an untrusted-input check on a
-value an attacker fully controls, and it is the thing standing between a caller
-and the payment-token balance held mid-transaction.**
+Story 025 splits this invariant into two halves:
 
-Two distinct failures it prevents:
+**Admin-time revert (the write-time guard).** `setNudgeTokenWhitelist(token,
+true)` derives the payment token exactly as `batchMint` does (same
+minter/dispatcher resolution, same errors when unconfigured) and reverts
+`BatchMint__RewardTokenIsPaymentToken` if `token` equals it. Because reward
+tokens can ONLY enter via this owner-gated function, a caller can no longer
+express a payment-token/nudge-token collision at all — the story-022
+untrusted-input check on attacker-controlled addresses is gone because the
+attacker-controlled addresses are gone.
+
+**Runtime skip (the drift guard).** The whitelist-time check can be
+invalidated later: the owner may repoint `tokenMinter`/`dispatcherIndex`,
+changing the derived payment token out from under an existing whitelist
+entry. The snapshot loop therefore SKIPS (`continue`, not revert) any
+whitelist element equal to the current derived payment token: its snapshot
+stays 0, its `minRewards[i]` is ignored, and nothing is paid for that slot.
+Skipping — rather than reverting — keeps `batchMint` live instead of bricking
+it until the owner notices; the payment-token balance still never enters the
+payout and instead follows the normal step-10 dust-sweep path.
+
+Two distinct failures the pair prevents:
 - claiming the contract's payment-token balance (accumulated sub-threshold dust
   from prior batches) as "reward";
 - perturbing the snapshot/refund accounting, since step 5's pull and step 10's
   sweep both operate on `paymentToken`.
-
-Enforce it inside the snapshot loop, on every element, before any funds move.
 
 ### 4.2 Snapshot BEFORE the mint loop — LOAD-BEARING, DO NOT "SIMPLIFY"
 
@@ -154,20 +201,22 @@ the property must be pinned by a dedicated test
 (`test_OwnDonationsDoNotRefundToBatcher`) whose failure message names this
 section.
 
-### 4.3 Reentrancy guard — required
+### 4.3 Reentrancy guard — retained
 
-`rewardTokens` are caller-supplied addresses that the contract calls twice
-(`balanceOf`, `transfer`). A malicious "token" can therefore execute arbitrary
-code inside `batchMint`, including reentering it. Today's single-token design
-had no such surface: the callee was owner-configured.
+Whitelisted nudge tokens are addresses the contract calls twice (`balanceOf`,
+`transfer`). Under story 025 they are owner-vetted rather than caller-chosen,
+which shrinks the surface from "arbitrary attacker code on every call" to "a
+mistakenly whitelisted malicious or compromised token" — but the payout pass
+is still an external-code hook, and an owner mistake must fail closed rather
+than interleave.
 
 The nested frame would re-snapshot balances the outer frame has already claimed
 title to. In the current code shape that happens to fail closed (the outer
 `safeTransfer` reverts on insufficient balance), but that is an accident of
 ordering and of non-zero minimums, not a designed property.
 
-Use OpenZeppelin `ReentrancyGuard` (the non-transient variant, matching
-`NFTStaker`) and apply `nonReentrant` to `batchMint`. Cheap, and it removes the
+Keep OpenZeppelin `ReentrancyGuard` (the non-transient variant, matching
+`NFTStaker`) with `nonReentrant` on `batchMint`. Cheap, and it removes the
 need to reason about the interleaving at all.
 
 `ReentrancyGuardTransient` is present in `lib/immutable/openzeppelin-contracts`
@@ -188,28 +237,34 @@ every batch to serve an asset class the protocol does not use. Instead:
 - state it explicitly in the `batchMint` NatSpec, in the caller's own terms:
   *"`minRewards` is a floor on the contract's pre-transfer balance, not on the
   amount `recipient` receives. For fee-on-transfer or rebasing tokens the
-  delivered amount will be lower. Supplying such a token is at the caller's
+  delivered amount will be lower. Whitelisting such a token is at the owner's
   discretion."*
-- the official UI will not list known fee-on-transfer tokens.
+- the official UI will not list known fee-on-transfer tokens, and the owner
+  should not whitelist them.
 
 Sophisticated callers read the source and decide whether the tax is worth it.
 
-### 4.5 Malformed arrays are the caller's problem
+### 4.5 Duplicates are structurally impossible; weird tokens are the owner's problem
 
-Duplicate entries, absurd lengths, nonsense addresses, and zero-balance tokens
-are all caller-supplied garbage. The contract validates only what protects
-*itself and other users*: length equality and the payment-token exclusion.
+Story 025 dissolves most of the old "malformed arrays" surface: the caller no
+longer supplies token addresses at all, only `minRewards`, and the only
+remaining caller-side validation is length equality against the whitelist.
 
-- **Duplicates** (`[USDC, USDC]`): both entries snapshot the same balance. The
-  first transfer drains it; the second either reverts on insufficient balance
-  or transfers into a now-empty pot. Either way it fails closed and harms only
-  the caller. No dedupe pass — that is O(n²) gas charged to every honest caller
-  to protect one careless one.
-- **Long arrays**: gas is paid by the caller; the block gas limit is the bound.
-- **Non-ERC20 addresses**: `balanceOf` reverts, batch rolls back.
-
-The NatSpec must state the policy in one line: *supply your own arrays at your
-own risk; a safe UI is provided.*
+- **Duplicates** (audit-21 M-02): the whitelist is a set —
+  `setNudgeTokenWhitelist` reverts `BatchMint__NudgeTokenAlreadyWhitelisted`
+  on a re-add — so duplicate reward entries cannot exist by construction. The
+  story-022 fail-closed-duplicate behaviour (and story-024's proposed O(n²)
+  dedupe scan) are both obsolete; no per-call scan runs.
+- **Long lists**: whitelist growth is owner-gated; snapshot/payout gas is
+  O(whitelist length) and paid by the caller, who opted in by qualifying.
+- **Non-ERC20 / reverting addresses**: an owner who whitelists one bricks the
+  qualifying path until it is unwhitelisted (`balanceOf` reverts roll the
+  batch back). Whitelist curation is an owner responsibility — the same trust
+  class as `tokenMinter` itself.
+- **Wrong `minRewards` ordering**: the caller's problem, bounded by the floor
+  semantics — at worst the batch reverts on a floor breach or the caller
+  accepts a smaller floor than intended. Re-fetch `getNudgeTokens()` before
+  every call (swap-and-pop reorders).
 
 ### 4.6 Preserved from the current contract
 
@@ -246,6 +301,18 @@ regression suites for the frozen deployed contract.
 
 Mocks needed beyond the existing set: `MockFeeOnTransferERC20`,
 `MockReentrantERC20` (reenters `batchMint` from `transfer`).
+
+> **Story 025 note:** the plan below is the historical story-022 test plan
+> for the caller-selected model. Story 025 re-targeted the suites to the
+> whitelist API: the payment-token exclusion tests became whitelist-admin
+> reverts plus runtime-skip tests, `test_DuplicateRewardTokenFailsClosed`
+> became `test_DuplicateNudgeTokensStructurallyImpossible` (duplicates now
+> revert at admin time), "empty arrays" became "empty whitelist", and a full
+> `setNudgeTokenWhitelist` admin suite (add/remove/swap-and-pop
+> reorder/re-add/zero-address/already-whitelisted/not-whitelisted/
+> payment-token/unconfigured-path/non-owner/while-paused) was added in
+> `BatchNFTMinterMultiTokenNudgeCore.t.sol`, along with
+> `test_MinRewardsOrderTracksGetNudgeTokens` for ordering correspondence.
 
 Payment-token exclusion
 1. `test_RevertWhen_RewardTokenIsPaymentToken` — single element.
@@ -305,9 +372,10 @@ Fuzz
 
 ## 8. Gas
 
-The payout path becomes **O(n)** in `rewardTokens.length`, where today it is
-O(1). That is inherent to paying out n tokens. The one shape that would have
-made it O(n²) — a dedupe pass over the array — is ruled out in §4.5.
+The payout path becomes **O(n)** in the whitelist length, where the frozen
+contract is O(1). That is inherent to paying out n tokens. The one shape that
+would have made it O(n²) — a dedupe pass — is ruled out in §4.5 (story 025:
+by set construction rather than by policy).
 
 ### Per reward token
 
