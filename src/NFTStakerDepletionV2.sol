@@ -14,65 +14,55 @@ import {IUniboostMintDebtHook} from "yield-claim-nft/interfaces/IUniboostMintDeb
 import {INFTSupply} from "./INFTSupply.sol";
 import {INFTStakerMigratable} from "./INFTStakerMigratable.sol";
 
-/// @title  NFTStakerDepletion
-/// @notice **DEPLOYED — FROZEN.** This file is the live, on-chain version of the
-///         depletion-window staker (three mainnet instances: EYE / SCX / FLX)
-///         and is kept here only so the deployed bytecode has matching source
-///         and a regression suite. Do NOT change it. All new depletion-staker
-///         work belongs in `src/NFTStakerDepletionV2.sol`, the hand-maintained
-///         bug-fixed successor. In particular, `depositFor` below carries the
-///         audit-21 M-03 settlement misroute (it pays a pre-existing
-///         position's pending reward to the MIGRATOR, not the user), so any
-///         orchestrator driving this deployed contract MUST
-///         capture-and-forward that settlement — see the warning on
-///         `depositFor` itself.
-/// @notice Depletion-window standalone copy of `NFTStaker`. This contract is a
-///         HAND-MAINTAINED copy of `src/NFTStaker.sol` that replaces the
-///         owner-set **targetAPY** emission model with an owner-set
-///         **depletion-window** model (modelled on phlimbo's
-///         `depletionDuration`). The owner sets the window (in months); the
-///         per-second emission rate is DERIVED as `budget / windowSeconds`,
-///         inverting the original where the rate is set (via APY × notional)
-///         and the window is derived (`budget / rate`).
+/// @title  NFTStakerDepletionV2
+/// @notice Bug-fixed successor of `NFTStakerDepletion`. This contract is a
+///         HAND-MAINTAINED copy of `src/NFTStakerDepletion.sol` — the
+///         DEPLOYED — FROZEN source of the three live mainnet depletion
+///         stakers (EYE / SCX / FLX) — created so the protocol can migrate
+///         those stakers onto a corrected implementation. Deploy THIS
+///         contract for all new depletion-staker instances; V1 stays
+///         byte-for-byte untouched as the matching source of the deployed
+///         bytecode.
 ///
 ///         WHY A COPY: the nft-staking repo deliberately avoids a shared base
-///         contract (see `NFTStakerPriceScaled`). The live audited `NFTStaker`
-///         stays byte-for-byte untouched; this variant is deployed alongside
-///         it for the Uniboost dispatcher.
+///         contract (see `NFTStakerPriceScaled` ->
+///         `NFTStakerPriceScaledMigrateReady` and `NFTStaker` ->
+///         `NFTStakerDepletion`). The established pattern for a fixed
+///         successor is a hand-maintained copy alongside the frozen original,
+///         with the intended deltas enumerated below.
 ///
 ///         MAINTENANCE COUPLING: this is a HAND-MAINTAINED copy of
-///         `NFTStaker`. Any future fix or audit change to `NFTStaker` is NOT
+///         `NFTStakerDepletion` (itself a hand-maintained copy of
+///         `NFTStaker`). Any future fix or audit change to either is NOT
 ///         automatically inherited here and MUST be mirrored manually. The
-///         intended deltas vs `NFTStaker` are:
-///           1. Hook field typed `IUniboostMintDebtHook` (not
-///              `IBalancerPoolerMintDebtHook`) — surface is identical
-///              (`mintDebt()` / `pull()`); ties this staker to the Uniboost
-///              mint-debt hook.
-///           2. `targetAPY` / `MAX_TARGET_APY` / `APY_PRECISION` REMOVED;
-///              replaced by `depletionWindowMonths`, `SECONDS_PER_MONTH`, and
-///              `MAX_DEPLETION_MONTHS`.
-///           3. `setTargetAPY` -> `setDepletionWindow(uint256 months)` with a
-///              `1 <= months <= MAX_DEPLETION_MONTHS` bound and a
-///              `DepletionWindowChanged` event.
-///           4. `_recomputeSchedule` rewritten: `rewardRate = budget /
-///              windowSeconds`, `windowEnd = now + windowSeconds`,
-///              `lastRewardTime = now`. The dispatcher-price / notional math
-///              (`latestPrice`, `S`, `F`) is DROPPED — the rate no longer
-///              depends on price. `dispatcherIndex` / `nftMinter` are RETAINED
-///              purely as identity/wiring parity.
-///           5. New owner-only `rescueERC20` (with the rewardToken invariant
-///              guard), `Rescued` event, and `Rescue__ZeroRecipient` error.
-///           6. `SECONDS_PER_YEAR` retained only as documentation of the
-///              `SECONDS_PER_MONTH = 365 days / 12` derivation (12 months == 1
-///              APY-year); it is no longer used by the rate path.
+///         intended deltas vs `NFTStakerDepletion` are:
+///           1. The contract name (`NFTStakerDepletionV2`).
+///           2. depositFor SETTLEMENT FIX (audit-21 M-03, fingerprint
+///              `b3243f42...`; root cause of the run-20 DRIFT-01 High): the
+///              pre-credit settlement of an existing position's pending
+///              reward pays `_safePayTo(user, pending)` instead of V1's
+///              `_safePay(pending)`. V1's `_safePay` form resolves to
+///              `_safePayTo(msg.sender, ...)` — and `msg.sender` there is
+///              always the MIGRATOR — so it routed the user's earned phUSD to
+///              the orchestrator while emitting `Claimed(user, ...)`. The
+///              fixed form matches `NFTStakerPriceScaledMigrateReady.depositFor`
+///              and this file's own exit leg (`_exitPosition`).
+///         Remaining audit-21 findings against the depletion staker are fixed
+///         by SUBSEQUENT stories in the `new-staker` sprint, each landing as
+///         its own enumerated delta on this file so every fix stays
+///         individually reviewable. Constructor signature, inheritance,
+///         interfaces and all other behaviour are intentionally identical to
+///         V1.
 ///
-///         Masterchef-style staking pool for a single ERC1155 token ID.
+/// @notice Masterchef-style staking pool for a single ERC1155 token ID.
 ///         Stakers deposit ERC1155 units of `stakedId` and earn per-second
 ///         emissions of `rewardToken` (phUSD) that drain `rewardBudget` over
-///         exactly `depletionWindowMonths`. The strong invariant
-///         `balance == rewardBudget + committedDebt` and floor-rounding always
-///         in the protocol's favour are preserved from `NFTStaker`.
-contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausable, INFTStakerMigratable {
+///         exactly `depletionWindowMonths` (the owner-set depletion-window
+///         model: the per-second rate is DERIVED as `budget / windowSeconds`).
+///         The strong invariant `balance == rewardBudget + committedDebt` and
+///         floor-rounding always in the protocol's favour are preserved from
+///         `NFTStaker` via `NFTStakerDepletion`.
+contract NFTStakerDepletionV2 is Ownable, Pausable, ReentrancyGuard, ERC1155Holder, IPausable, INFTStakerMigratable {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -755,16 +745,14 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
     /// @dev    Permission: `onlyMigrator`. Settles accrual and the user's
     ///         pending before crediting, mirroring `stake`.
     ///
-    ///         WARNING — DEPLOYED — FROZEN, KNOWN MISROUTE (audit-21 M-03):
-    ///         the pre-credit settlement below pays `_safePay(pending)` —
-    ///         i.e. `_safePayTo(msg.sender, ...)`, the MIGRATOR — instead of
-    ///         `user`, while still emitting `Claimed(user, pending)`. Do NOT
-    ///         fix it here: this file must stay byte-for-byte identical to
-    ///         the deployed bytecode. Any orchestrator driving this contract
-    ///         MUST capture-and-forward the misrouted settlement to the user
-    ///         (as `NFTStakerMigrator` / `InPlaceNFTStakerMigrator` do via
-    ///         `_depositForAndForward`). Fixed at source in
-    ///         `NFTStakerDepletionV2.depositFor` (`_safePayTo(user, pending)`).
+    ///         DELTA vs `NFTStakerDepletion.depositFor` (audit-21 M-03): the
+    ///         pre-credit settlement pays via `_safePayTo(user, ...)` rather
+    ///         than `_safePay(...)`. `msg.sender` here is the MIGRATOR, so the
+    ///         `_safePay` form would route an existing staker's earned phUSD to
+    ///         the orchestrator while emitting `Claimed(user, ...)`. Only
+    ///         reachable when the deposit target already holds a position (a
+    ///         partial `InPlaceNFTStakerMigrator` round-trip, or migrating into
+    ///         a staker the user is already in), but wrong in every case.
     /// @param  user   The user to credit.
     /// @param  amount The ERC1155 stake amount to deposit on the user's behalf.
     function depositFor(address user, uint256 amount) external override nonReentrant onlyMigrator {
@@ -775,7 +763,7 @@ contract NFTStakerDepletion is Ownable, Pausable, ReentrancyGuard, ERC1155Holder
         if (info.amount > 0) {
             uint256 pending = (info.amount * accRewardPerShare) / ACC_PRECISION - info.rewardDebt;
             if (pending > 0) {
-                pending = _safePay(pending);
+                pending = _safePayTo(user, pending);
                 if (pending > 0) emit Claimed(user, pending);
             }
         }

@@ -41,6 +41,24 @@ interface INFTStakerMigratable {
     ///         units pulled from the caller (the migrator). Only valid while the
     ///         pool is `Active`, so it credits the new/healthy staker, never the
     ///         frozen one.
+    /// @dev    SETTLEMENT OBLIGATION (audit-21 M-03 / F-21-01): when the
+    ///         target already holds a position for `user`, implementations
+    ///         MUST settle that position's pre-existing pending yield to
+    ///         `user` — NOT to `msg.sender` (the migrator/orchestrator). The
+    ///         DEPLOYED `NFTStakerDepletion` (V1) VIOLATES this obligation:
+    ///         it pays the pending to `msg.sender` while still emitting
+    ///         `Claimed(user, ...)`, so any orchestrator driving it must
+    ///         capture-and-forward the misrouted settlement back to the user
+    ///         (as `NFTStakerMigrator` / `InPlaceNFTStakerMigrator` do via
+    ///         `_depositForAndForward`). `NFTStakerDepletionV2` and
+    ///         `NFTStakerPriceScaledMigrateReady` CONFORM (they settle via
+    ///         `_safePayTo(user, pending)`), against which the migrators'
+    ///         capture-and-forward leg self-disables (captured == 0).
+    ///
+    ///         This note is DOCUMENTATION IN LIEU OF a structural interface
+    ///         change (e.g. a version getter or conformance probe), which was
+    ///         ruled out of scope; the interface surface is deliberately
+    ///         unchanged.
     /// @param  user   The user to credit.
     /// @param  amount The ERC1155 stake amount to deposit on the user's behalf.
     function depositFor(address user, uint256 amount) external;
