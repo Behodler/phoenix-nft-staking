@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test, Vm} from "forge-std/Test.sol";
 import {NFTStakerDepletion} from "../src/NFTStakerDepletion.sol";
+import {NFTStakerDepletionV2} from "../src/NFTStakerDepletionV2.sol";
 import {NFTStakerPriceScaledMigrateReady} from "../src/NFTStakerPriceScaledMigrateReady.sol";
 import {NFTStakerMigrator} from "../src/NFTStakerMigrator.sol";
 import {InPlaceNFTStakerMigrator} from "../src/InPlaceNFTStakerMigrator.sol";
@@ -138,6 +139,18 @@ contract MigratorRewardForwardingTest is Test {
         );
         (bool ok,) = address(token).call(abi.encodeWithSignature("mint(address,uint256)", address(s), BUDGET));
         require(ok, "mint failed");
+        vm.prank(owner);
+        s.setDepletionWindow(12);
+    }
+
+    /// @dev Story-026 fixture: `NFTStakerDepletionV2` shares V1's constructor
+    ///      signature exactly, but settles `depositFor` pending to the USER
+    ///      via `_safePayTo(user, ...)` (audit-21 M-03 fix).
+    function _newDepletionV2() internal returns (NFTStakerDepletionV2 s) {
+        s = new NFTStakerDepletionV2(
+            IERC1155(address(nft)), ID, IERC20(address(phUSD)), owner, INFTSupply(address(nftMinter)), DISPATCHER_INDEX
+        );
+        phUSD.mint(address(s), BUDGET);
         vm.prank(owner);
         s.setDepletionWindow(12);
     }
@@ -723,6 +736,78 @@ contract MigratorRewardForwardingTest is Test {
         mig.migrateIn(0, 1);
 
         assertEq(_countForwardEvents(vm.getRecordedLogs(), address(mig)), 0, "_safePayTo staker: captured == 0");
+        assertEq(phUSD.balanceOf(alice) - a0, owed, "exact pending delivered without any forward");
+        assertEq(phUSD.balanceOf(address(mig)), 0, "residual 0");
+    }
+
+    /// @dev Story-026: the SAME version-agnostic property against
+    ///      `NFTStakerDepletionV2` — like `NFTStakerPriceScaledMigrateReady`,
+    ///      a `_safePayTo(user, ...)` staker (audit-21 M-03 fixed). The
+    ///      cross-staker migrator's capture-and-forward leg must SELF-DISABLE
+    ///      (captured == 0, no `RewardForwarded` event) while the user still
+    ///      receives their exact pending on both legs. Same shape as
+    ///      `testVersionAgnosticPairDepletionVsPriceScaled` leg 2.
+    function testVersionAgnosticCrossMigratorAgainstDepletionV2() public {
+        NFTStakerDepletionV2 oldS = _newDepletionV2();
+        NFTStakerDepletionV2 newS = _newDepletionV2();
+        NFTStakerMigrator mig = _newCrossMigrator(address(oldS), address(newS), IERC20(address(phUSD)));
+
+        _stakeAs(address(oldS), alice, 10);
+        _stakeAs(address(newS), alice, 4);
+        vm.warp(block.timestamp + 30 days);
+
+        uint256 owed = oldS.pendingReward(alice) + newS.pendingReward(alice);
+        assertGt(newS.pendingReward(alice), 0, "target-side accrual exists on the V2 pair");
+        uint256 a0 = phUSD.balanceOf(alice);
+
+        vm.startPrank(owner);
+        mig.initiateMigration();
+        vm.recordLogs();
+        mig.migrate(_one(alice));
+        vm.stopPrank();
+
+        // THE version-agnostic assertion: the forwarding branch never ran,
+        // because V2's `depositFor` settled the pending to the user directly.
+        assertEq(_countForwardEvents(vm.getRecordedLogs(), address(mig)), 0, "V2 staker: captured == 0");
+        assertEq(phUSD.balanceOf(alice) - a0, owed, "V2 pair: exact pending delivered without any forward");
+        assertEq(phUSD.balanceOf(address(mig)), 0, "V2 pair: residual 0");
+        (uint256 amt,) = newS.userInfo(alice);
+        assertEq(amt, 14, "stake credited (4 pre-existing + 10 migrated)");
+    }
+
+    /// @dev Story-026: the in-place orchestrator against `NFTStakerDepletionV2`
+    ///      — the forwarding branch must likewise self-disable (captured == 0)
+    ///      and the user receives their exact pending. Same shape as
+    ///      `testVersionAgnosticInPlaceAgainstPriceScaled`.
+    function testVersionAgnosticInPlaceAgainstDepletionV2() public {
+        NFTStakerDepletionV2 s = _newDepletionV2();
+        InPlaceNFTStakerMigrator mig = new InPlaceNFTStakerMigrator(
+            INFTStakerMigratable(address(s)), IERC1155(address(nft)), ID, TIMEOUT, IERC20(address(phUSD)), owner
+        );
+        vm.prank(owner);
+        s.setMigrator(address(mig));
+
+        _stakeAs(address(s), alice, 10);
+        vm.warp(block.timestamp + 30 days);
+
+        vm.startPrank(owner);
+        mig.initiateMigration();
+        mig.migrateOut(_one(alice));
+        s.finalizeAndReset();
+        vm.stopPrank();
+
+        _stakeAs(address(s), alice, 3);
+        vm.warp(block.timestamp + 3 days);
+
+        uint256 owed = s.pendingReward(alice);
+        assertGt(owed, 0, "alice re-accrued before her slice ran");
+        uint256 a0 = phUSD.balanceOf(alice);
+
+        vm.recordLogs();
+        vm.prank(owner);
+        mig.migrateIn(0, 1);
+
+        assertEq(_countForwardEvents(vm.getRecordedLogs(), address(mig)), 0, "V2 staker: captured == 0");
         assertEq(phUSD.balanceOf(alice) - a0, owed, "exact pending delivered without any forward");
         assertEq(phUSD.balanceOf(address(mig)), 0, "residual 0");
     }
