@@ -241,6 +241,7 @@ contract NFTStakerPriceScaledMigrateReadyTest is Test {
 
     function testStakeAndUnstakeDoNotRecomputeWhileMigrating() public {
         _stakeAs(alice, 5);
+        _stakeAs(bob, 10);
         _fundAndStart(BUDGET);
         vm.prank(migrator);
         staker.initiateMigration();
@@ -248,16 +249,26 @@ contract NFTStakerPriceScaledMigrateReadyTest is Test {
         uint256 rate = staker.rewardRate();
         uint256 windowEnd = staker.windowEnd();
 
-        // A stake while frozen still mutates `totalStaked` (the rate BASIS),
-        // but must not re-size the frozen schedule.
-        _stakeAs(bob, 10);
-        assertEq(staker.totalStaked(), 15, "totalStaked mutated");
-        assertEq(staker.rewardRate(), rate, "rate pinned across stake");
-        assertEq(staker.windowEnd(), windowEnd, "windowEnd pinned across stake");
+        // Audit-20 M-05: a fresh stake while frozen is REJECTED outright (it
+        // could otherwise wedge `finalizeAndReset` and would accrue nothing),
+        // so it can neither mutate `totalStaked` nor disturb the schedule.
+        nft.mint(carol, ID, 10);
+        vm.prank(carol);
+        nft.setApprovalForAll(address(staker), true);
+        vm.expectRevert(bytes("NFTStaker: not active"));
+        vm.prank(carol);
+        staker.stake(10);
+        assertEq(staker.totalStaked(), 15, "totalStaked untouched by rejected stake");
+        assertEq(staker.rewardRate(), rate, "rate pinned across rejected stake");
+        assertEq(staker.windowEnd(), windowEnd, "windowEnd pinned across rejected stake");
 
+        // A PRE-EXISTING stake exits during `Migrating` (load-bearing: this is
+        // how `totalStaked` drains to 0) without perturbing the frozen
+        // schedule — the unstake tail routes through
+        // `_recomputeScheduleIfActive` and is suppressed.
         vm.prank(bob);
         staker.unstake(10);
-        assertEq(staker.totalStaked(), 5, "totalStaked restored");
+        assertEq(staker.totalStaked(), 5, "totalStaked drained by unstake");
         assertEq(staker.rewardRate(), rate, "rate pinned across unstake");
         assertEq(staker.windowEnd(), windowEnd, "windowEnd pinned across unstake");
     }
@@ -461,6 +472,61 @@ contract NFTStakerPriceScaledMigrateReadyTest is Test {
         vm.expectRevert(bytes("NFTStaker: zero deposit"));
         vm.prank(migrator);
         staker.depositFor(alice, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // stake — Active-only (audit-20 M-05)
+    // -------------------------------------------------------------------
+
+    function testStakeBlockedWhileMigrating() public {
+        _stakeAs(alice, 1);
+        _fundAndStart(BUDGET);
+        vm.prank(migrator);
+        staker.initiateMigration();
+
+        nft.mint(bob, ID, 3);
+        vm.prank(bob);
+        nft.setApprovalForAll(address(staker), true);
+        vm.expectRevert(bytes("NFTStaker: not active"));
+        vm.prank(bob);
+        staker.stake(3);
+    }
+
+    /// @dev Audit-20 M-05 availability leg (inverse of the run-20 PoC
+    ///      `testGrieferBlocksFinalizeAndReset`): a griefer's permissionless
+    ///      stake during `Migrating` reverts, so `totalStaked` can still be
+    ///      drained to 0, `finalizeAndReset` stays reachable, and staking
+    ///      resumes once the pool is `Active` again.
+    function testGrieferCannotWedgeFinalizeAndReset() public {
+        _stakeAs(alice, 5);
+        _fundAndStart(BUDGET);
+        vm.prank(migrator);
+        staker.initiateMigration();
+
+        // The would-be griefer's stake reverts instead of wedging the pool.
+        nft.mint(stranger, ID, 1);
+        vm.prank(stranger);
+        nft.setApprovalForAll(address(staker), true);
+        vm.expectRevert(bytes("NFTStaker: not active"));
+        vm.prank(stranger);
+        staker.stake(1);
+
+        // Drain every existing stake so the pool empties.
+        address[] memory u = new address[](1);
+        u[0] = alice;
+        vm.prank(migrator);
+        staker.batchMigrate(u);
+        assertEq(staker.totalStaked(), 0, "drained to zero despite griefer attempt");
+
+        // finalizeAndReset is NOT wedged.
+        vm.prank(owner);
+        staker.finalizeAndReset();
+        assertEq(uint256(staker.poolState()), 0, "back to Active");
+
+        // Staking works again after the reset.
+        vm.prank(stranger);
+        staker.stake(1);
+        assertEq(staker.totalStaked(), 1, "stake accepted once Active again");
     }
 
     // -------------------------------------------------------------------

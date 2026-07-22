@@ -47,6 +47,17 @@ import {INFTStakerMigratable} from "./INFTStakerMigratable.sol";
 ///              the orchestrator while emitting `Claimed(user, ...)`. The
 ///              fixed form matches `NFTStakerPriceScaledMigrateReady.depositFor`
 ///              and this file's own exit leg (`_exitPosition`).
+///           3. `stake` gated on `poolState == PoolState.Active` (audit-20
+///              M-05, fingerprint `bdf84579…`) so a permissionless stake
+///              during `Migrating` can neither wedge `finalizeAndReset`
+///              (`require(totalStaked == 0)`) nor be silently accepted into a
+///              frozen-accrual pool. `unstake` and `claim` stay UNGATED —
+///              unstake-while-Migrating is how `totalStaked` drains to 0 so
+///              `finalizeAndReset` is reachable, and both settle benignly
+///              against the frozen `accRewardPerShare`. V1's DEPLOYED — FROZEN
+///              instances retain the ungated `stake` and rely on the
+///              pause-before-migrate operational remedy (audit-20 L-03, proven
+///              complete by `testPauseRemedyIsComplete`).
 ///         Remaining audit-21 findings against the depletion staker are fixed
 ///         by SUBSEQUENT stories in the `new-staker` sprint, each landing as
 ///         its own enumerated delta on this file so every fix stays
@@ -539,6 +550,11 @@ contract NFTStakerDepletionV2 is Ownable, Pausable, ReentrancyGuard, ERC1155Hold
 
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero stake");
+        // Audit-20 M-05: block permissionless stakes while `Migrating` — a
+        // stake there would make `totalStaked > 0`, wedging `finalizeAndReset`
+        // (which requires an empty pool), and would be silently accepted into
+        // a frozen-accrual pool. Same gate `depositFor` already carries.
+        require(poolState == PoolState.Active, "NFTStaker: not active");
         // Head: settle accrual at the OLD rate (preserves "late stakers never
         // get retroactive rewards"). Sweeps mint debt and recomputes too; we
         // re-recompute at the tail.

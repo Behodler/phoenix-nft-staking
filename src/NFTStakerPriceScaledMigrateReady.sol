@@ -62,6 +62,15 @@ import {INFTStakerMigratable} from "./INFTStakerMigratable.sol";
 ///                c. `finalizeAndReset` re-derives the schedule against the
 ///                   post-migration (empty) pool, exactly as an
 ///                   `unstake`-to-zero does.
+///           7. `stake` gated on `poolState == PoolState.Active` (audit-20
+///              M-05, fingerprint `bdf84579…`) so a permissionless stake
+///              during `Migrating` can neither wedge `finalizeAndReset`
+///              (`require(totalStaked == 0)`) nor be silently accepted into a
+///              frozen-accrual pool. `unstake` and `claim` stay UNGATED:
+///              unstake-while-Migrating is load-bearing (it is how
+///              `totalStaked` drains to 0 so `finalizeAndReset` is reachable)
+///              and both settle benignly against the frozen
+///              `accRewardPerShare`.
 ///
 /// @notice Masterchef-style staking pool for a single ERC1155 token ID.
 ///         Stakers deposit ERC1155 units of `stakedId` and earn per-second
@@ -616,6 +625,11 @@ contract NFTStakerPriceScaledMigrateReady is
 
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "NFTStaker: zero stake");
+        // Audit-20 M-05: block permissionless stakes while `Migrating` — a
+        // stake there would make `totalStaked > 0`, wedging `finalizeAndReset`
+        // (which requires an empty pool), and would be silently accepted into
+        // a frozen-accrual pool. Same gate `depositFor` already carries.
+        require(poolState == PoolState.Active, "NFTStaker: not active");
         // Head: settle accrual at the OLD rate against the OLD totalStaked
         // (preserves "late stakers never get retroactive rewards"). Sweeps
         // mint debt and recomputes too; we re-recompute at the tail.
