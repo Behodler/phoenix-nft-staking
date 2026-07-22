@@ -31,31 +31,39 @@ import {IPausable} from "pauser/interfaces/IPausable.sol";
 /// dispatcher's ramping price, and a faked/mismatched `paymentToken` reverts the
 /// real `mint()` and rolls the whole batch back.
 ///
-/// ### Caller-selected multi-token nudge
+/// ### Whitelist-selected multi-token nudge (story-025)
 ///
-/// The owner controls **eligibility** and nothing else. `nudgeSize` gates *who*
-/// qualifies (batch size >= threshold; `0` disables the feature outright). The
-/// **caller** declares *which* ERC20 balances held by this contract they want
-/// to be paid in, via the `rewardTokens` array, together with a per-token
-/// `minRewards` floor. A qualifying caller receives this contract's entire
-/// **pre-loop** balance of every listed token.
+/// The owner controls **eligibility** and the **set of reward assets**.
+/// `nudgeSize` gates *who* qualifies (batch size >= threshold; `0` disables
+/// the feature outright). An owner-managed whitelist
+/// (`setNudgeTokenWhitelist`) declares *which* ERC20 balances held by this
+/// contract are paid out; the caller supplies only a per-token `minRewards`
+/// floor, ordered to match `getNudgeTokens()`. A qualifying caller receives
+/// this contract's entire **pre-loop** balance of every whitelisted token.
 ///
-/// Two consequences of that design, both intended:
+/// This supersedes the story-022 caller-selected model, in which the caller
+/// named arbitrary reward-token addresses per call. Vetting the token set at
+/// admin time (1) makes a payment-token/nudge-token conflict structurally
+/// impossible to exploit, and (2) removes the weird-token attack surface that
+/// attacker-chosen addresses opened — anything odd that lands here is simply
+/// left to `rescueERC20`.
+///
+/// Two properties of the design, both intended:
 ///
 /// - **Permissionless top-up.** Anyone can seed the batch incentive with any
-///   ERC20 simply by sending it here. No owner transaction is involved.
-/// - **Exogenous reward capture.** A caller (or bot) that enumerates this
-///   contract's balances can claim tokens no official UI lists. Deliberate:
-///   unclaimed value should not be stranded.
+///   whitelisted ERC20 simply by sending it here. No owner transaction is
+///   involved in funding (only in curating the whitelist).
+/// - **Winner-take-all capture.** Whoever qualifies first takes the entire
+///   balance of every whitelisted token. Deliberate: unclaimed value should
+///   not be stranded.
 ///
-/// @dev **WARNING — tokens sent to this contract may be claimed by anyone who
-///      qualifies.** This contract makes NO promise that arbitrary ERC20s
-///      transferred to it are recoverable. Any balance it holds (other than the
-///      dispatcher's payment token, which is excluded by an explicit guard) can
-///      be swept in full by the next caller who clears the `nudgeSize` gate and
-///      lists that token. Do not use this address as custody. The "honeypot"
-///      framing does not apply, because the pot is by construction a fraction of
-///      the cost of the `nudgeSize` mints required to qualify — every claim is
+/// @dev **WARNING — whitelisted tokens sent to this contract may be claimed
+///      by anyone who qualifies.** Any balance of a whitelisted token can be
+///      swept in full by the next caller who clears the `nudgeSize` gate. Do
+///      not use this address as custody. Non-whitelisted tokens are inert and
+///      recoverable only via `rescueERC20`. The "honeypot" framing does not
+///      apply, because the pot is by construction a fraction of the cost of
+///      the `nudgeSize` mints required to qualify — every claim is
 ///      net-positive for the protocol. If someone over-funds this contract
 ///      beyond the mint cost and a bot snipes it, that is still correct
 ///      behaviour; the error was in the sender.
@@ -75,10 +83,11 @@ import {IPausable} from "pauser/interfaces/IPausable.sol";
 /// address may `pause()`/`unpause()`, and only `batchMint` is gated by
 /// `whenNotPaused`. Admin setters and `rescueERC20` stay callable while paused.
 ///
-/// `ReentrancyGuard` is required rather than optional: `rewardTokens` are
-/// caller-supplied addresses this contract calls twice (`balanceOf` and
-/// `transfer`), so the payout pass is an arbitrary-code hook the caller
-/// controls. See the note on `batchMint`.
+/// `ReentrancyGuard` is retained even though reward tokens are now
+/// owner-vetted rather than caller-chosen: the payout pass still executes
+/// whatever code the whitelisted token addresses carry (`balanceOf`,
+/// `transfer`), so a mistakenly whitelisted malicious/compromised token must
+/// fail closed instead of interleaving. See the note on `batchMint`.
 contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausable {
     using SafeERC20 for IERC20;
 
@@ -101,29 +110,49 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     uint256 public dispatcherIndex;
 
     /// @notice Batch sizes >= this value qualify for the nudge payout. `0`
-    ///         disables the incentive entirely. This is the owner's ONLY lever
-    ///         over the nudge — the reward asset itself is caller-selected.
+    ///         disables the incentive entirely. Eligibility lever; the set of
+    ///         reward assets is the owner-managed whitelist below.
     uint256 public nudgeSize;
 
     /// @notice Address authorised to pause/unpause via the global pauser.
     ///         Settable by the owner; `address(0)` disables pausing.
     address public pauser;
 
+    /// @dev Ordered whitelist of nudge-reward tokens. Maintained as a manual
+    ///      swap-remove set because OZ EnumerableSet requires solc ^0.8.24
+    ///      while this repo targets 0.8.20 (same precedent as
+    ///      `InPlaceNFTStakerMigrator`).
+    address[] private _nudgeTokens;
+
+    /// @dev 1-based index into `_nudgeTokens`; `0` == not whitelisted.
+    mapping(address => uint256) private _nudgeTokenIndex;
+
     /// @dev Reverted when `count == 0`.
     error BatchMint__ZeroCount();
     /// @dev Reverted when `recipient == address(0)`.
     error BatchMint__ZeroRecipient();
-    /// @dev Reverted when a `rewardTokens` element equals the dispatcher's
-    ///      derived payment token. Fires unconditionally, on every element,
-    ///      before any funds move — see the `batchMint` docs.
+    /// @dev Reverted when `setNudgeTokenWhitelist` tries to whitelist the
+    ///      dispatcher's derived payment token. Admin-time guard; the runtime
+    ///      counterpart is the skip in `_snapshotRewards` (see there).
     error BatchMint__RewardTokenIsPaymentToken(address token);
-    /// @dev Reverted when `rewardTokens` and `minRewards` have different lengths.
+    /// @dev Reverted when `minRewards` does not cover the FULL whitelist
+    ///      (`minRewards.length != getNudgeTokens().length`).
     error BatchMint__ArrayLengthMismatch(uint256 tokensLength, uint256 minsLength);
     /// @dev Reverted when `batchMint` is called while `tokenMinter` is unset.
     error BatchMint__MinterNotConfigured();
     /// @dev Reverted when `batchMint` is called while `dispatcherIndex` is unset
     ///      (`0`) or the pinned index resolves to a zero dispatcher.
     error BatchMint__DispatcherNotConfigured();
+    /// @dev Reverted when `setNudgeTokenWhitelist` is given the zero address
+    ///      to whitelist.
+    error BatchMint__ZeroNudgeToken();
+    /// @dev Reverted when whitelisting a token that is already whitelisted.
+    ///      Loud by design (no silent no-op) — and the reason duplicate
+    ///      reward entries are structurally impossible (audit-21 M-02).
+    error BatchMint__NudgeTokenAlreadyWhitelisted(address token);
+    /// @dev Reverted when unwhitelisting a token that is not whitelisted.
+    ///      Loud by design (no silent no-op).
+    error BatchMint__NudgeTokenNotWhitelisted(address token);
     /// @dev Reverted when `rescueERC20` is given a zero destination.
     error Rescue__ZeroRecipient();
     /// @dev Reverted when the deliverable reward for `token` is below the
@@ -133,6 +162,7 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     error BatchMint__RewardBelowMinimum(address token, uint256 minReward, uint256 actualReward);
 
     event NudgeSizeChanged(uint256 newSize);
+    event NudgeTokenWhitelistChanged(address indexed token, bool allowed);
     event NudgePaid(address indexed recipient, address indexed token, uint256 amount);
     event TokenMinterSet(address indexed newMinter);
     event DispatcherIndexSet(uint256 indexed dispatcherIndex);
@@ -168,6 +198,56 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         emit NudgeSizeChanged(newSize);
     }
 
+    /// @notice Ordered list of whitelisted nudge-reward tokens. The order of
+    ///         `minRewards` in `batchMint` MUST match this order. Note:
+    ///         unwhitelisting uses swap-and-pop, which REORDERS the list —
+    ///         callers/UI must re-fetch before every `batchMint`.
+    function getNudgeTokens() external view returns (address[] memory) {
+        return _nudgeTokens;
+    }
+
+    /// @notice Owner-gated add/remove of a nudge-reward token. Stays callable
+    ///         while paused (matches the other setters).
+    ///
+    /// @dev    Adding (`allowed == true`) derives the payment token EXACTLY
+    ///         as `batchMint` does (via `_resolvePaymentPath`) and rejects
+    ///         the dispatcher's prime token — the admin-time half of the §4.1
+    ///         payment-token exclusion. Re-adding an existing entry and
+    ///         removing an absent one both revert loudly rather than
+    ///         silently no-op'ing.
+    ///
+    ///         Removal is swap-and-pop (O(1)): the LAST token moves into the
+    ///         removed slot, so the `getNudgeTokens()` ordering changes.
+    ///         Removal deliberately performs no payment-token derivation, so
+    ///         the owner can always shrink the whitelist even while the
+    ///         minter/dispatcher are unconfigured.
+    function setNudgeTokenWhitelist(address token, bool allowed) external onlyOwner {
+        if (allowed) {
+            if (token == address(0)) revert BatchMint__ZeroNudgeToken();
+            (,, IERC20 paymentToken) = _resolvePaymentPath();
+            if (token == address(paymentToken)) {
+                revert BatchMint__RewardTokenIsPaymentToken(token);
+            }
+            if (_nudgeTokenIndex[token] != 0) {
+                revert BatchMint__NudgeTokenAlreadyWhitelisted(token);
+            }
+            _nudgeTokens.push(token);
+            _nudgeTokenIndex[token] = _nudgeTokens.length;
+        } else {
+            uint256 oneBasedIndex = _nudgeTokenIndex[token];
+            if (oneBasedIndex == 0) revert BatchMint__NudgeTokenNotWhitelisted(token);
+            uint256 length = _nudgeTokens.length;
+            if (oneBasedIndex != length) {
+                address lastToken = _nudgeTokens[length - 1];
+                _nudgeTokens[oneBasedIndex - 1] = lastToken;
+                _nudgeTokenIndex[lastToken] = oneBasedIndex;
+            }
+            _nudgeTokens.pop();
+            delete _nudgeTokenIndex[token];
+        }
+        emit NudgeTokenWhitelistChanged(token, allowed);
+    }
+
     /// @notice Owner-gated update of the pauser address. Setting `address(0)`
     ///         disables pausing. Stays callable while paused.
     function setPauser(address newPauser) external onlyOwner {
@@ -188,23 +268,21 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     }
 
     /// @notice Owner-only recovery of an arbitrary ERC20.
-    /// @dev    **This is NOT a reliable escape hatch.** Under the
-    ///         caller-selected nudge model, every ERC20 balance this contract
-    ///         holds (except the dispatcher's payment token) is claimable in
-    ///         full by the next caller who clears the `nudgeSize` gate and
-    ///         lists that token. `rescueERC20` therefore competes with every
-    ///         watching bot in the mempool and is a **race the owner will
-    ///         usually lose**. It is retained for two cases where it still
-    ///         works: while `batchMint` is paused (no caller can claim
-    ///         anything), and for tokens no batch has bothered to claim.
-    ///         Treat "pause first, then rescue" as the only dependable
-    ///         sequence.
+    /// @dev    Under the whitelist model this is the **dependable escape
+    ///         hatch for anything not on the whitelist**: non-whitelisted
+    ///         tokens sent here can never be claimed through `batchMint`, so
+    ///         rescuing them is no longer a race against watching bots —
+    ///         weird/unsupported tokens are explicitly left to this function.
+    ///         Only balances of currently whitelisted tokens (and the
+    ///         payment token's sweepable residue) compete with callers; for
+    ///         those, "pause first (or unwhitelist), then rescue" remains the
+    ///         dependable sequence.
     ///
-    ///         Owner-trusted (the owner can already zero `nudgeSize` and stop
-    ///         all payouts), so no token restriction is needed; an explicit
-    ///         `amount` is preferred over a full-balance sweep so it composes
-    ///         with the nudge pot. Stays callable while paused (mirrors
-    ///         `NFTStaker.emergencyWithdraw`).
+    ///         Owner-trusted (the owner can already zero `nudgeSize`, edit
+    ///         the whitelist, and stop all payouts), so no token restriction
+    ///         is needed; an explicit `amount` is preferred over a
+    ///         full-balance sweep so it composes with the nudge pot. Stays
+    ///         callable while paused (mirrors `NFTStaker.emergencyWithdraw`).
     function rescueERC20(IERC20 token, address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert Rescue__ZeroRecipient();
         token.safeTransfer(to, amount);
@@ -215,7 +293,8 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     ///         to `recipient`, pulling `paymentAmount` of the dispatcher's
     ///         prime token from `msg.sender` upfront and refunding any surplus.
     ///         When `count >= nudgeSize`, also pays `recipient` this contract's
-    ///         entire pre-loop balance of every ERC20 listed in `rewardTokens`.
+    ///         entire pre-loop balance of every whitelisted nudge token
+    ///         (see `getNudgeTokens`).
     ///
     /// @dev    Forwards to the trusted, owner-pinned `tokenMinter`; reverts
     ///         `BatchMint__MinterNotConfigured` if it is unset. The dispatcher
@@ -227,43 +306,32 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     ///         it is no longer a caller-supplied parameter, so a wrong/zero
     ///         payment asset can never be passed.
     ///
-    ///         **The derived payment token may never appear in
-    ///         `rewardTokens`.** That guard runs on every element of the array,
-    ///         inside the snapshot pass, before any funds move — and
-    ///         unconditionally, including on calls that do not qualify, so a
-    ///         cheap sub-threshold call cannot be used to probe payment-token
-    ///         balances. It is the only thing standing between a caller and
-    ///         the payment-token balance held mid-transaction, and it prevents
-    ///         two distinct failures: claiming accumulated sub-threshold
-    ///         payment-token dust as "reward", and perturbing the
-    ///         snapshot/refund accounting (both the upfront pull and the final
-    ///         dust sweep operate on the payment token).
+    ///         **The derived payment token can never be whitelisted** —
+    ///         `setNudgeTokenWhitelist` rejects it at admin time. If the
+    ///         owner later repoints `tokenMinter`/`dispatcherIndex` so that
+    ///         an already-whitelisted token BECOMES the derived payment
+    ///         token, the snapshot loop SKIPS that entry at runtime (no
+    ///         snapshot, no payout, its `minRewards[i]` ignored) instead of
+    ///         reverting — keeping `batchMint` live rather than bricked while
+    ///         still keeping the payment-token balance out of the payout
+    ///         (that balance follows the normal dust-sweep path).
     ///
     ///         **Reward balances are SNAPSHOTTED BEFORE the mint loop and paid
     ///         AFTER it.** See the inline comments at both sites; this is the
     ///         "donate forward" mechanic and it is load-bearing.
     ///
-    ///         **Reentrancy:** `rewardTokens` are caller-supplied addresses
-    ///         this contract calls twice (`balanceOf`, then `transfer`), so a
-    ///         malicious "token" can execute arbitrary code inside this
-    ///         function, including reentering it. `nonReentrant` removes the
-    ///         need to reason about the interleaving at all.
+    ///         **Reentrancy:** whitelisted tokens are addresses this contract
+    ///         calls twice (`balanceOf`, then `transfer`). They are
+    ///         owner-vetted rather than caller-chosen, but a mistakenly
+    ///         whitelisted malicious token could still execute arbitrary code
+    ///         inside this function; `nonReentrant` removes the need to
+    ///         reason about the interleaving at all.
     ///
     ///         **Fee-on-transfer / rebasing tokens:** `minRewards` is a floor
     ///         on the contract's pre-transfer balance, not on the amount
     ///         `recipient` receives. For fee-on-transfer or rebasing tokens the
-    ///         delivered amount will be lower. Supplying such a token is at the
-    ///         caller's discretion.
-    ///
-    ///         **Array hygiene is the caller's responsibility:** supply your
-    ///         own arrays at your own risk; a safe UI is provided. Only length
-    ///         equality and the payment-token exclusion are validated.
-    ///         Duplicate entries both snapshot the same balance and the second
-    ///         transfer fails closed; a non-ERC20 address reverts on
-    ///         `balanceOf`; absurdly long arrays are bounded only by the block
-    ///         gas limit and are paid for by the caller. There is deliberately
-    ///         no dedupe pass — it would be O(n^2) gas charged to every honest
-    ///         caller to protect one careless one.
+    ///         delivered amount will be lower. Whitelisting such a token is at
+    ///         the owner's discretion.
     ///
     /// @param  count            Number of mints (>0).
     /// @param  recipient        ERC1155 recipient (non-zero). Also the
@@ -273,85 +341,73 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     ///                          cost across `count` iterations or an
     ///                          inner mint reverts. Surplus >=
     ///                          `DUST_THRESHOLD` is refunded.
-    /// @param  rewardTokens     ERC20s the caller wants to be paid in. Empty
-    ///                          is legal and means "no reward wanted" — a plain
-    ///                          mint loop. Must not contain the derived payment
-    ///                          token.
     /// @param  minRewards       Per-token slippage floor, parallel to
-    ///                          `rewardTokens` (equal length required). If this
-    ///                          contract's pre-loop balance of `rewardTokens[i]`
+    ///                          `getNudgeTokens()` (equal length required —
+    ///                          the FULL whitelist, including any entry
+    ///                          currently equal to the derived payment token,
+    ///                          whose floor is ignored). Fetch the token list
+    ///                          immediately before calling: unwhitelisting
+    ///                          REORDERS it (swap-and-pop). If this
+    ///                          contract's pre-loop balance of token `i`
     ///                          is `< minRewards[i]` the WHOLE batch reverts
     ///                          `BatchMint__RewardBelowMinimum` before anything
     ///                          is pulled or minted, so the caller never pays
-    ///                          mint costs for a pot that was front-run out from
-    ///                          under them. `0` = no floor. NOTE: this does NOT
-    ///                          stop a front-runner from winning the pot —
-    ///                          whoever qualifies first still takes the entire
-    ///                          balance-based payout; the floor only stops the
-    ///                          loser from minting for less than they declared.
+    ///                          mint costs for a pot that was front-run out
+    ///                          from under them. `0` = no floor. NOTE: this
+    ///                          does NOT stop a front-runner from winning the
+    ///                          pot — whoever qualifies first still takes the
+    ///                          entire balance-based payout; the floor only
+    ///                          stops the loser from minting for less than
+    ///                          they declared.
     /// @return totalPaid        Caller's net spend (`paymentAmount`
     ///                          minus any refunded surplus).
-    function batchMint(
-        uint256 count,
-        address recipient,
-        uint256 paymentAmount,
-        address[] calldata rewardTokens,
-        uint256[] calldata minRewards
-    ) external whenNotPaused nonReentrant returns (uint256 totalPaid) {
+    function batchMint(uint256 count, address recipient, uint256 paymentAmount, uint256[] calldata minRewards)
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 totalPaid)
+    {
         // --- 1. Validate the caller's inputs. ---
         if (count == 0) revert BatchMint__ZeroCount();
         if (recipient == address(0)) revert BatchMint__ZeroRecipient();
-        if (rewardTokens.length != minRewards.length) {
-            revert BatchMint__ArrayLengthMismatch(rewardTokens.length, minRewards.length);
+        if (_nudgeTokens.length != minRewards.length) {
+            revert BatchMint__ArrayLengthMismatch(_nudgeTokens.length, minRewards.length);
         }
 
         // --- 2. Resolve the owner-pinned minter/dispatcher and DERIVE the
         //        payment asset from it. ---
-        ITokenMinterV2 nftMinter = tokenMinter;
-        if (address(nftMinter) == address(0)) {
-            revert BatchMint__MinterNotConfigured();
-        }
-
-        uint256 _dispatcherIndex = dispatcherIndex;
-        if (_dispatcherIndex == 0) revert BatchMint__DispatcherNotConfigured();
-
-        IERC20 paymentToken;
-        {
-            (address dispatcher,,,) = INFTMinterV2(address(nftMinter)).configs(_dispatcherIndex);
-            if (dispatcher == address(0)) revert BatchMint__DispatcherNotConfigured();
-            paymentToken = IERC20(ITokenDispatcherV2(dispatcher).primeToken());
-        }
+        (ITokenMinterV2 nftMinter, uint256 _dispatcherIndex, IERC20 paymentToken) = _resolvePaymentPath();
 
         // --- 3 + 4. Eligibility, then the PRE-LOOP snapshot pass. ---
         //
         // DO NOT "SIMPLIFY" THIS BY MOVING THE BALANCE READ TO THE PAYOUT SITE.
         //
-        // `_snapshotRewards` reads every listed reward balance HERE, before the
-        // mint loop, and those figures are paid out AFTER it (step 9). The
-        // dispatcher donates reward token into this contract on EVERY mint, so
-        // the gap between this read and the payout is exactly this batch's own
-        // donations. Reading before the loop means the batcher is paid only the
-        // PRIOR accumulated pot; the donations generated by their own batch stay
-        // behind to seed the next claimant. That "donate forward" mechanic is
-        // the only thing preventing a caller from funding their own reward
-        // inside a single transaction — a post-loop read would refund a batch's
-        // own donations straight back to the batcher and collapse the incentive
-        // to a no-op round-trip.
+        // `_snapshotRewards` reads every whitelisted reward balance HERE,
+        // before the mint loop, and those figures are paid out AFTER it
+        // (step 9). The dispatcher donates reward token into this contract on
+        // EVERY mint, so the gap between this read and the payout is exactly
+        // this batch's own donations. Reading before the loop means the
+        // batcher is paid only the PRIOR accumulated pot; the donations
+        // generated by their own batch stay behind to seed the next claimant.
+        // That "donate forward" mechanic is the only thing preventing a caller
+        // from funding their own reward inside a single transaction — a
+        // post-loop read would refund a batch's own donations straight back to
+        // the batcher and collapse the incentive to a no-op round-trip.
         //
         // Reading the balance immediately before the transfer looks obviously
         // cleaner and is silently wrong. Pinned by
         // `test_OwnDonationsDoNotRefundToBatcher`. See §4.2 of
         // `docs/multi-token-nudge.md`.
         //
-        // The pass also runs the §4.1 payment-token exclusion on every element
-        // UNCONDITIONALLY, and the per-token floor check — both ahead of the
-        // pull and the mint loop, so nothing moves on a rejected call.
+        // The pass also runs the §4.1 runtime payment-token SKIP on every
+        // element, and the per-token floor check — both ahead of the pull and
+        // the mint loop, so nothing moves on a rejected call.
         bool qualifies;
         {
             uint256 _nudgeSize = nudgeSize;
             qualifies = _nudgeSize != 0 && count >= _nudgeSize;
         }
-        uint256[] memory snapshot = _snapshotRewards(rewardTokens, minRewards, address(paymentToken), qualifies);
+        uint256[] memory snapshot = _snapshotRewards(minRewards, address(paymentToken), qualifies);
 
         // --- 5. Pull the caller's payment budget. ---
         paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount);
@@ -375,7 +431,7 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         // self-funded round-trip. The stale-looking figures are the whole point
         // — see the §4.2 note at the snapshot site above and in
         // `docs/multi-token-nudge.md`.
-        _payRewards(recipient, rewardTokens, snapshot);
+        _payRewards(recipient, snapshot);
 
         // --- 10. Dust sweep of residual payment token back to msg.sender. ---
         uint256 remaining = paymentToken.balanceOf(address(this));
@@ -387,7 +443,32 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         }
     }
 
-    /// @dev Step 4 of the normative execution order: the PRE-LOOP snapshot pass.
+    /// @dev Shared resolution of the owner-pinned minter/dispatcher and the
+    ///      DERIVED payment token. Used by both `batchMint` (step 2) and
+    ///      `setNudgeTokenWhitelist`'s add branch, so the admin-time
+    ///      payment-token exclusion is checked against exactly the token
+    ///      `batchMint` would derive — by construction, not by convention.
+    function _resolvePaymentPath()
+        private
+        view
+        returns (ITokenMinterV2 nftMinter, uint256 _dispatcherIndex, IERC20 paymentToken)
+    {
+        nftMinter = tokenMinter;
+        if (address(nftMinter) == address(0)) {
+            revert BatchMint__MinterNotConfigured();
+        }
+
+        _dispatcherIndex = dispatcherIndex;
+        if (_dispatcherIndex == 0) revert BatchMint__DispatcherNotConfigured();
+
+        (address dispatcher,,,) = INFTMinterV2(address(nftMinter)).configs(_dispatcherIndex);
+        if (dispatcher == address(0)) revert BatchMint__DispatcherNotConfigured();
+        paymentToken = IERC20(ITokenDispatcherV2(dispatcher).primeToken());
+    }
+
+    /// @dev Step 4 of the normative execution order: the PRE-LOOP snapshot
+    ///      pass, iterating the owner-managed whitelist in storage order
+    ///      (`minRewards[i]` binds to `_nudgeTokens[i]`).
     ///
     ///      **These balances are read BEFORE the mint loop and paid out after
     ///      it (§4.2).** The dispatcher donates reward token into this contract
@@ -398,34 +479,40 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     ///      `test_OwnDonationsDoNotRefundToBatcher` exists to catch exactly
     ///      that refactor.
     ///
+    ///      Reading the whitelist from storage inside the loop is fine now:
+    ///      the story-022 design kept reward tokens out of storage because
+    ///      they were attacker-supplied per call; under the whitelist model
+    ///      the addresses are owner-vetted state, and the storage reads are
+    ///      the point (the caller cannot substitute their own list).
+    ///
     ///      Three things happen per element, in this order:
-    ///      1. §4.1 payment-token exclusion — UNCONDITIONAL. It runs even when
-    ///         `qualifies` is false, so a cheap sub-threshold call can never be
-    ///         used to probe this contract's payment-token balance, and it runs
-    ///         before any funds move.
+    ///      1. §4.1 runtime payment-token SKIP: an entry equal to the derived
+    ///         payment token is `continue`d — snapshot stays 0, its
+    ///         `minRewards[i]` is IGNORED, no revert. The admin-time check in
+    ///         `setNudgeTokenWhitelist` prevents this at write time, but the
+    ///         owner can later repoint `tokenMinter`/`dispatcherIndex` and
+    ///         change the derived payment token out from under an existing
+    ///         entry; skipping keeps `batchMint` live instead of bricking it,
+    ///         while the payment-token balance stays out of the payout.
     ///      2. The balance read, but only when the batch qualifies; otherwise
     ///         the entry is pinned to `0`.
     ///      3. The per-token floor. Failing here — ahead of the payment pull
     ///         and the mint loop — is a pure gas improvement; the atomic
     ///         rollback guarantee is identical either way.
     ///
-    ///      Duplicate entries are NOT deduped (§4.5): both snapshot the same
-    ///      balance, the first transfer drains it and the second fails closed,
-    ///      harming only the careless caller. A dedupe pass would be O(n^2) gas
-    ///      charged to every honest caller.
-    function _snapshotRewards(
-        address[] calldata rewardTokens,
-        uint256[] calldata minRewards,
-        address paymentToken,
-        bool qualifies
-    ) private view returns (uint256[] memory snapshot) {
-        uint256 tokenCount = rewardTokens.length;
+    ///      Duplicate entries are structurally impossible (§4.5): the
+    ///      whitelist is a set, and `setNudgeTokenWhitelist` reverts on
+    ///      re-add. No dedupe pass is needed — by construction, not by scan.
+    function _snapshotRewards(uint256[] calldata minRewards, address paymentToken, bool qualifies)
+        private
+        view
+        returns (uint256[] memory snapshot)
+    {
+        uint256 tokenCount = _nudgeTokens.length;
         snapshot = new uint256[](tokenCount);
         for (uint256 i; i < tokenCount; ++i) {
-            address rewardToken = rewardTokens[i];
-            if (rewardToken == paymentToken) {
-                revert BatchMint__RewardTokenIsPaymentToken(rewardToken);
-            }
+            address rewardToken = _nudgeTokens[i];
+            if (rewardToken == paymentToken) continue;
             uint256 available = qualifies ? IERC20(rewardToken).balanceOf(address(this)) : 0;
             uint256 minReward = minRewards[i];
             if (available < minReward) {
@@ -435,7 +522,8 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         }
     }
 
-    /// @dev Step 9 of the normative execution order: the payout pass.
+    /// @dev Step 9 of the normative execution order: the payout pass, walking
+    ///      the same whitelist storage order as `_snapshotRewards`.
     ///
     ///      **`snapshot` was captured BEFORE the mint loop (§4.2) and must NOT
     ///      be recomputed here.** Re-reading `balanceOf` at this point would
@@ -446,15 +534,16 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     ///      note on `_snapshotRewards` and §4.2 of
     ///      `docs/multi-token-nudge.md`.
     ///
-    ///      A zero entry means either the batch did not qualify or the pot was
-    ///      empty; both are silent no-ops with no transfer and no event.
-    ///      `NudgePaid` is emitted once per token ACTUALLY transferred.
-    function _payRewards(address recipient, address[] calldata rewardTokens, uint256[] memory snapshot) private {
+    ///      A zero entry means the batch did not qualify, the pot was empty,
+    ///      or the entry was runtime-skipped as the current payment token;
+    ///      all are silent no-ops with no transfer and no event. `NudgePaid`
+    ///      is emitted once per token ACTUALLY transferred.
+    function _payRewards(address recipient, uint256[] memory snapshot) private {
         uint256 tokenCount = snapshot.length;
         for (uint256 i; i < tokenCount; ++i) {
             uint256 amount = snapshot[i];
             if (amount == 0) continue;
-            address rewardToken = rewardTokens[i];
+            address rewardToken = _nudgeTokens[i];
             IERC20(rewardToken).safeTransfer(recipient, amount);
             emit NudgePaid(recipient, rewardToken, amount);
         }

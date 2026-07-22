@@ -6,14 +6,14 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 /// @notice Malicious "reward token" that reenters `BatchNFTMinter.batchMint`
 ///         from inside its own `transfer`.
 ///
-///         `rewardTokens` are caller-supplied addresses that `BatchNFTMinter`
+///         Whitelisted nudge tokens are addresses that `BatchNFTMinter`
 ///         calls twice (`balanceOf` during the snapshot pass, `transfer`
-///         during the payout pass). The second of those is an arbitrary-code
-///         hook the attacker controls, so the payout pass is a reentrancy
-///         surface that the previous owner-configured single-token design did
-///         not have. §4.3 of `docs/multi-token-nudge.md` mandates
-///         `nonReentrant` on `batchMint`; this mock is what proves it is
-///         wired.
+///         during the payout pass). Under the story-025 whitelist model the
+///         addresses are owner-vetted rather than caller-chosen, but the
+///         payout pass is still an arbitrary-code hook if the owner ever
+///         whitelists a malicious or compromised token. §4.3 of
+///         `docs/multi-token-nudge.md` mandates `nonReentrant` on
+///         `batchMint`; this mock is what proves it is wired.
 ///
 ///         The reentrant call is made with a raw `call` (rather than a typed
 ///         import of `BatchNFTMinter`) so the revert data bubbles verbatim —
@@ -53,12 +53,7 @@ contract MockReentrantERC20 is ERC20 {
             reentryAttempts += 1;
             (bool ok, bytes memory ret) = target.call(
                 abi.encodeWithSignature(
-                    "batchMint(uint256,address,uint256,address[],uint256[])",
-                    _count,
-                    _recipient,
-                    _paymentAmount,
-                    new address[](0),
-                    new uint256[](0)
+                    "batchMint(uint256,address,uint256,uint256[])", _count, _recipient, _paymentAmount, new uint256[](0)
                 )
             );
             if (!ok) {

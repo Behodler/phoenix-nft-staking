@@ -14,19 +14,20 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 import {MockReentrantERC20} from "./mocks/MockReentrantERC20.sol";
 
-/// @title BatchNFTMinterMultiToken — caller-selected multi-token nudge
+/// @title BatchNFTMinterMultiToken — whitelist-selected multi-token nudge
 ///
-/// The full §6 test plan from `docs/multi-token-nudge.md`. The owner keeps
-/// control of ELIGIBILITY (`nudgeSize`); the CALLER declares which ERC20
-/// balances held by the contract they want to be paid in (`rewardTokens`)
-/// and a per-token floor (`minRewards`).
+/// The §4 invariant suite from `docs/multi-token-nudge.md`, re-targeted for
+/// the story-025 whitelist model. The owner controls ELIGIBILITY
+/// (`nudgeSize`) and the SET of nudge-reward tokens (an owner-managed
+/// whitelist, `setNudgeTokenWhitelist`); the caller supplies only the
+/// per-token `minRewards` floors, ordered to match `getNudgeTokens()`.
 ///
 /// The suite is organised by the invariant each group pins:
-///   §4.1  payment-token exclusion (unconditional, pre-funds-moving)
+///   §4.1  payment-token exclusion (admin-time revert + runtime skip)
 ///   §4.2  snapshot BEFORE the mint loop ("donate forward")
 ///   §4.3  reentrancy guard
 ///   §4.4  fee-on-transfer is documented, not defended
-///   §4.5  malformed arrays are the caller's problem (no dedupe)
+///   §4.5  duplicates are structurally impossible (set semantics)
 contract BatchNFTMinterMultiTokenNudgeTest is Test {
     BatchNFTMinterMultiToken internal batch;
     MockITokenMinterV2 internal nftMinter;
@@ -36,7 +37,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     MockERC20 internal payToken;
     MockERC20 internal rewardA; // "USDC"
     MockERC20 internal rewardB; // "WBTC"
-    MockERC20 internal rewardC; // present on the contract, never requested
+    MockERC20 internal rewardC; // present on the contract, never whitelisted
 
     address internal owner = makeAddr("batchOwner");
     address internal caller = makeAddr("batchCaller");
@@ -115,6 +116,12 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         rewardC.mint(address(batch), POT_C);
     }
 
+    /// @dev Owner-whitelist a nudge token.
+    function _whitelist(address token) internal {
+        vm.prank(owner);
+        batch.setNudgeTokenWhitelist(token, true);
+    }
+
     function _arr(address a) internal pure returns (address[] memory out) {
         out = new address[](1);
         out[0] = a;
@@ -124,13 +131,6 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         out = new address[](2);
         out[0] = a;
         out[1] = b;
-    }
-
-    function _arr(address a, address b, address c) internal pure returns (address[] memory out) {
-        out = new address[](3);
-        out[0] = a;
-        out[1] = b;
-        out[2] = c;
     }
 
     function _mins(uint256 a) internal pure returns (uint256[] memory out) {
@@ -151,73 +151,99 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         out[2] = c;
     }
 
-    function _none() internal pure returns (address[] memory) {
-        return new address[](0);
-    }
-
     function _noMins() internal pure returns (uint256[] memory) {
         return new uint256[](0);
     }
 
     // ================================================================ //
-    // §4.1 — payment-token exclusion
+    // §4.1 — payment-token exclusion (admin-time revert + runtime skip)
     // ================================================================ //
 
-    /// @dev 1. The derived payment token is never a legal reward token.
-    function test_RevertWhen_RewardTokenIsPaymentToken() public {
-        _fundPots();
-        uint256 cost = _costNow(NUDGE_SIZE);
-        _fund(caller, cost);
-
-        vm.prank(caller);
+    /// @dev 1. The derived payment token can never be WHITELISTED — the
+    ///      collision is rejected at admin time, before it could ever reach
+    ///      a mint. (The full admin-suite lives in
+    ///      `BatchNFTMinterMultiTokenNudgeCore.t.sol`; this is the §4.1
+    ///      anchor.)
+    function test_RevertWhen_WhitelistingPaymentToken() public {
+        vm.prank(owner);
         vm.expectRevert(
             abi.encodeWithSelector(
                 BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
             )
         );
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(payToken)), _mins(0));
+        batch.setNudgeTokenWhitelist(address(payToken), true);
+
+        assertEq(batch.getNudgeTokens().length, 0, "payment token never lands on the whitelist");
     }
 
-    /// @dev 2. The check runs on EVERY element, not just the first — here the
-    ///      offending entry is the third of three.
-    function test_RevertWhen_RewardTokenIsPaymentTokenAmongOthers() public {
+    /// @dev 2. Runtime skip: the owner whitelists token A while the payment
+    ///      token is P, then repoints the dispatcher so A BECOMES the derived
+    ///      payment token. batchMint must not brick — it SKIPS the stale
+    ///      whitelist entry (no snapshot, no payout, its minReward ignored)
+    ///      and pays the remaining entries normally. A's balance follows the
+    ///      normal payment-token dust-sweep path instead.
+    function test_RuntimePaymentTokenCollisionIsSkippedNotReverted() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
-        uint256 cost = _costNow(NUDGE_SIZE);
-        _fund(caller, cost);
 
+        // Owner repoints the dispatcher: rewardA is now the derived payment
+        // token, out from under the existing whitelist entry.
+        dispatcher.setPrimeToken(address(rewardA));
+        nftMinter.setPrimeToken(DISPATCHER_INDEX, address(rewardA));
+
+        uint256 cost = _costNow(NUDGE_SIZE);
+        rewardA.mint(caller, cost);
         vm.prank(caller);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
-            )
+        rewardA.approve(address(batch), cost);
+        uint256 callerABefore = rewardA.balanceOf(caller);
+
+        // minRewards[0] (rewardA's slot) is an impossible floor — it MUST be
+        // ignored because the entry is skipped. minRewards[1] (rewardB) is
+        // honoured as usual.
+        vm.prank(caller);
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(type(uint256).max, 0));
+
+        assertEq(rewardA.balanceOf(recipient), 0, "skipped entry pays nothing to the recipient");
+        assertEq(rewardB.balanceOf(recipient), POT_B, "non-colliding entry still pays in full");
+        // The pre-existing rewardA pot is now PAYMENT-token balance and takes
+        // the documented donation/dust-sweep path back to msg.sender.
+        assertEq(
+            rewardA.balanceOf(caller),
+            callerABefore - cost + POT_A,
+            "colliding token's balance follows the payment-token sweep, not the nudge payout"
         );
-        batch.batchMint(
-            NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB), address(payToken)), _mins(0, 0, 0)
-        );
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "batch stays live despite the collision");
     }
 
-    /// @dev 3. The exclusion is UNCONDITIONAL: it must fire even when
-    ///      `qualifies` is false, so a cheap sub-threshold call cannot be used
-    ///      to probe the contract's payment-token balance.
-    function test_RevertWhen_RewardTokenIsPaymentToken_EvenWhenNotQualifying() public {
+    /// @dev 3. The runtime skip is unconditional on qualification: a
+    ///      sub-threshold batch with a colliding whitelist entry also
+    ///      succeeds (snapshot pinned to 0, floor of 0 passes).
+    function test_RuntimeSkipAlsoAppliesBelowThreshold() public {
+        _whitelist(address(rewardA));
         _fundPots();
-        uint256 belowThreshold = NUDGE_SIZE - 1;
-        uint256 cost = _costNow(belowThreshold);
-        _fund(caller, cost);
+
+        dispatcher.setPrimeToken(address(rewardA));
+        nftMinter.setPrimeToken(DISPATCHER_INDEX, address(rewardA));
+
+        uint256 below = NUDGE_SIZE - 1;
+        uint256 cost = _costNow(below);
+        rewardA.mint(caller, cost);
+        vm.prank(caller);
+        rewardA.approve(address(batch), cost);
 
         vm.prank(caller);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
-            )
-        );
-        batch.batchMint(belowThreshold, recipient, cost, _arr(address(payToken)), _mins(0));
+        batch.batchMint(below, recipient, cost, _mins(type(uint256).max));
+
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), below, "sub-threshold batch minted despite collision");
+        assertEq(rewardA.balanceOf(recipient), 0, "nothing paid below threshold");
     }
 
     /// @dev 4. Sub-threshold payment-token dust left by a prior batch is not
-    ///      claimable as "reward" — listing the payment token reverts — and it
-    ///      continues to be swept by the normal dust mechanism instead.
+    ///      claimable as "reward" — the payment token cannot be whitelisted —
+    ///      and it continues to be swept by the normal dust mechanism.
     function test_PaymentTokenDustNotClaimableAsReward() public {
+        _whitelist(address(rewardA));
         _fundPots();
 
         // Batch 1 leaves sub-threshold dust behind.
@@ -225,28 +251,28 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         uint256 cost1 = _costNow(1);
         _fund(caller, cost1 + dust);
         vm.prank(caller);
-        batch.batchMint(1, recipient, cost1 + dust, _none(), _noMins());
+        batch.batchMint(1, recipient, cost1 + dust, _mins(0));
         assertEq(payToken.balanceOf(address(batch)), dust, "sub-threshold dust retained");
 
-        // The dust cannot be requested as a reward.
-        uint256 cost2 = _costNow(NUDGE_SIZE);
-        _fund(caller2, cost2);
-        vm.prank(caller2);
+        // The dust cannot be turned into a nudge pot: whitelisting the
+        // payment token reverts at admin time.
+        vm.prank(owner);
         vm.expectRevert(
             abi.encodeWithSelector(
                 BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
             )
         );
-        batch.batchMint(NUDGE_SIZE, recipient, cost2, _arr(address(payToken)), _mins(0));
-        assertEq(payToken.balanceOf(address(batch)), dust, "dust survives the attempted claim");
+        batch.setNudgeTokenWhitelist(address(payToken), true);
+        assertEq(payToken.balanceOf(address(batch)), dust, "dust survives the attempted whitelist");
 
         // It is still swept normally by a batch that leaves a supra-threshold
         // surplus: the sweep pays out `dust + surplus` to msg.sender.
         uint256 surplus = 5 ether;
+        uint256 cost2 = _costNow(NUDGE_SIZE);
         _fund(caller2, cost2 + surplus);
         uint256 caller2Before = payToken.balanceOf(caller2);
         vm.prank(caller2);
-        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost2 + surplus, _arr(address(rewardA)), _mins(0));
+        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost2 + surplus, _mins(0));
 
         assertEq(payToken.balanceOf(address(batch)), 0, "dust swept with the surplus");
         assertEq(
@@ -267,6 +293,8 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     ///      donations straight back to the batcher and collapse the incentive
     ///      to a no-op round-trip.
     function test_OwnDonationsDoNotRefundToBatcher() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
         uint256 priorPotA = rewardA.balanceOf(address(batch));
         uint256 priorPotB = rewardB.balanceOf(address(batch));
@@ -282,7 +310,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         _fund(caller, cost);
 
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0, 0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0));
 
         assertEq(
             rewardA.balanceOf(recipient),
@@ -310,6 +338,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     ///      the SECOND batcher's payout is exactly the FIRST batcher's mid-loop
     ///      donations.
     function test_SecondBatcherReceivesFirstBatchersDonations() public {
+        _whitelist(address(rewardA));
         uint256 donationA = 3e6;
         rewardA.mint(address(nftMinter), donationA * NUDGE_SIZE * 2);
         nftMinter.setPerMintDonation(address(rewardA), donationA);
@@ -318,7 +347,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         uint256 cost1 = _costNow(NUDGE_SIZE);
         _fund(caller, cost1);
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost1, _arr(address(rewardA)), _mins(0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost1, _mins(0));
         assertEq(rewardA.balanceOf(recipient), 0, "first batcher into an empty pot earns nothing");
         assertEq(rewardA.balanceOf(address(batch)), donationA * NUDGE_SIZE, "batch 1 donations accumulate");
 
@@ -327,7 +356,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         uint256 cost2 = _costNow(NUDGE_SIZE);
         _fund(caller2, cost2);
         vm.prank(caller2);
-        batch.batchMint(NUDGE_SIZE, recipient2, cost2, _arr(address(rewardA)), _mins(0));
+        batch.batchMint(NUDGE_SIZE, recipient2, cost2, _mins(0));
 
         assertEq(
             rewardA.balanceOf(recipient2),
@@ -341,10 +370,14 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     // §4.3 — reentrancy
     // ================================================================ //
 
-    /// @dev 7. A caller-supplied "reward token" that reenters `batchMint` from
-    ///      its `transfer` hook must be stopped by `nonReentrant`.
+    /// @dev 7. A whitelisted "reward token" that reenters `batchMint` from
+    ///      its `transfer` hook must be stopped by `nonReentrant`. Under the
+    ///      whitelist model the token address is owner-vetted rather than
+    ///      attacker-chosen, but the guard is retained as defence in depth —
+    ///      an owner mistake must fail closed, not interleave.
     function test_RevertWhen_RewardTokenReentersBatchMint() public {
         MockReentrantERC20 evil = new MockReentrantERC20("Evil", "EVL");
+        _whitelist(address(evil));
         evil.mint(address(batch), 1_000 ether);
 
         uint256 cost = _costNow(NUDGE_SIZE);
@@ -355,7 +388,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.prank(caller);
         vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(evil)), _mins(0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0));
 
         assertEq(evil.balanceOf(recipient), 0, "no reward delivered on the reentrant path");
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 0, "batch rolled back atomically");
@@ -365,14 +398,16 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     // Multi-token payout
     // ================================================================ //
 
-    /// @dev 8. Both requested balances are delivered in full.
-    function test_PaysAllRequestedTokens() public {
+    /// @dev 8. Every whitelisted balance is delivered in full.
+    function test_PaysAllWhitelistedTokens() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
 
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0, 0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0));
 
         assertEq(rewardA.balanceOf(recipient), POT_A, "full rewardA pot delivered");
         assertEq(rewardB.balanceOf(recipient), POT_B, "full rewardB pot delivered");
@@ -380,29 +415,33 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         assertEq(rewardB.balanceOf(address(batch)), 0, "rewardB drained");
     }
 
-    /// @dev 9. A token the contract holds but the caller did NOT list is
-    ///      untouched — the caller declares the payout set, nothing else.
-    function test_PaysOnlyRequestedTokens() public {
+    /// @dev 9. A token the contract holds but the owner did NOT whitelist is
+    ///      untouched — the whitelist declares the payout set, nothing else.
+    ///      Non-whitelisted balances are `rescueERC20` territory.
+    function test_PaysOnlyWhitelistedTokens() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
 
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0, 0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0));
 
-        assertEq(rewardC.balanceOf(recipient), 0, "unlisted token never leaves the contract");
-        assertEq(rewardC.balanceOf(address(batch)), POT_C, "unlisted token pot intact");
+        assertEq(rewardC.balanceOf(recipient), 0, "non-whitelisted token never leaves the contract");
+        assertEq(rewardC.balanceOf(address(batch)), POT_C, "non-whitelisted token pot intact");
     }
 
-    /// @dev 10. Empty arrays are legal and mean "no reward wanted".
-    function test_EmptyArraysMintWithoutReward() public {
+    /// @dev 10. An empty whitelist means empty `minRewards` and a pure mint
+    ///      loop — no reward machinery runs.
+    function test_EmptyWhitelistMintsWithoutReward() public {
         _fundPots();
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
 
         vm.recordLogs();
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost, _none(), _noMins());
+        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost, _noMins());
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "mints still happen");
         assertEq(totalPaid, cost, "totalPaid unaffected");
@@ -411,10 +450,11 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         _assertNoNudgePaid();
     }
 
-    /// @dev 11. A listed token the contract holds none of is a silent no-op:
-    ///      no transfer, no event, no revert (given `min == 0`).
+    /// @dev 11. A whitelisted token the contract holds none of is a silent
+    ///      no-op: no transfer, no event, no revert (given `min == 0`).
     function test_ZeroBalanceTokenIsNoOp() public {
         MockERC20 emptyToken = new MockERC20("Empty", "EMT");
+        _whitelist(address(emptyToken));
         rewardA.mint(address(batch), POT_A);
 
         uint256 cost = _costNow(NUDGE_SIZE);
@@ -422,7 +462,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(emptyToken)), _mins(0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0));
 
         assertEq(emptyToken.balanceOf(recipient), 0, "nothing delivered for an empty pot");
         _assertNoNudgePaid();
@@ -431,17 +471,18 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     /// @dev 12. `NudgePaid` fires once per token ACTUALLY transferred — so the
     ///      zero-balance entry in the middle produces no event.
     function test_EmitsNudgePaidPerToken() public {
-        _fundPots();
         MockERC20 emptyToken = new MockERC20("Empty", "EMT");
+        _whitelist(address(rewardA));
+        _whitelist(address(emptyToken));
+        _whitelist(address(rewardB));
+        _fundPots();
 
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
 
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(
-            NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(emptyToken), address(rewardB)), _mins(0, 0, 0)
-        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0, 0));
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 sig = keccak256("NudgePaid(address,address,uint256)");
@@ -462,13 +503,59 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         assertEq(seenAmounts[1], POT_B, "second event carries the full rewardB pot");
     }
 
+    /// @dev 13. Ordering correspondence: `minRewards[i]` binds to
+    ///      `getNudgeTokens()[i]` — including AFTER a swap-and-pop removal
+    ///      reorders the list. Removing the head moves the tail into its
+    ///      slot; a floor breach must then name the token at the NEW index.
+    function test_MinRewardsOrderTracksGetNudgeTokens() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
+        _whitelist(address(rewardC));
+        _fundPots();
+
+        // Remove the head: swap-and-pop moves rewardC into slot 0.
+        vm.prank(owner);
+        batch.setNudgeTokenWhitelist(address(rewardA), false);
+
+        address[] memory listed = batch.getNudgeTokens();
+        assertEq(listed.length, 2, "two tokens remain");
+        assertEq(listed[0], address(rewardC), "swap-and-pop moved the LAST token into the removed slot");
+        assertEq(listed[1], address(rewardB), "unaffected token keeps its slot");
+
+        uint256 cost = _costNow(NUDGE_SIZE);
+        _fund(caller, cost);
+
+        // Floors keyed to the OLD order would breach: index 0 is now rewardC
+        // (pot POT_C), so a floor of POT_C + 1 at index 0 must revert NAMING
+        // rewardC — proving the loop walks the reordered storage array.
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardC), POT_C + 1, POT_C
+            )
+        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(POT_C + 1, 0));
+
+        // Floors keyed to the NEW order succeed and pay per the new order.
+        vm.prank(caller);
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(POT_C, POT_B));
+
+        assertEq(rewardC.balanceOf(recipient), POT_C, "slot 0 (rewardC) paid in full");
+        assertEq(rewardB.balanceOf(recipient), POT_B, "slot 1 (rewardB) paid in full");
+        assertEq(rewardA.balanceOf(address(batch)), POT_A, "removed token's pot untouched");
+    }
+
     // ================================================================ //
     // Floors
     // ================================================================ //
 
-    /// @dev 13. A breached floor anywhere in the array reverts the whole batch,
-    ///      naming the offending token, its floor and the actual balance.
+    /// @dev 14. A breached floor anywhere in the whitelist reverts the whole
+    ///      batch, naming the offending token, its floor and the actual
+    ///      balance.
     function test_RevertWhen_AnyMinRewardExceedsBalance() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
+        _whitelist(address(rewardC));
         _fundPots();
         uint256 cost = _costNow(NUDGE_SIZE);
 
@@ -480,13 +567,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
                 BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardA), POT_A + 1, POT_A
             )
         );
-        batch.batchMint(
-            NUDGE_SIZE,
-            recipient,
-            cost,
-            _arr(address(rewardA), address(rewardB), address(rewardC)),
-            _mins(POT_A + 1, 0, 0)
-        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(POT_A + 1, 0, 0));
 
         // Middle element breached.
         vm.prank(caller);
@@ -495,13 +576,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
                 BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardB), POT_B + 1, POT_B
             )
         );
-        batch.batchMint(
-            NUDGE_SIZE,
-            recipient,
-            cost,
-            _arr(address(rewardA), address(rewardB), address(rewardC)),
-            _mins(0, POT_B + 1, 0)
-        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, POT_B + 1, 0));
 
         // Last element breached.
         vm.prank(caller);
@@ -510,27 +585,23 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
                 BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardC), POT_C + 1, POT_C
             )
         );
-        batch.batchMint(
-            NUDGE_SIZE,
-            recipient,
-            cost,
-            _arr(address(rewardA), address(rewardB), address(rewardC)),
-            _mins(0, 0, POT_C + 1)
-        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0, POT_C + 1));
 
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 0, "no mints survived any floor breach");
     }
 
-    /// @dev 14. All-zero floors never revert — including when nothing at all is
+    /// @dev 15. All-zero floors never revert — including when nothing at all is
     ///      deliverable (empty pots, or a non-qualifying batch).
     function test_ZeroMinRewardsNeverRevert() public {
         MockERC20 emptyToken = new MockERC20("Empty", "EMT");
+        _whitelist(address(rewardA));
+        _whitelist(address(emptyToken));
 
         // Qualifying batch, every pot empty.
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(emptyToken)), _mins(0, 0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0));
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "qualifying zero-floor batch succeeded");
 
         // Non-qualifying batch, pots funded.
@@ -539,17 +610,18 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         uint256 cost2 = _costNow(below);
         _fund(caller, cost2);
         vm.prank(caller);
-        batch.batchMint(below, recipient, cost2, _arr(address(rewardA), address(rewardB)), _mins(0, 0));
+        batch.batchMint(below, recipient, cost2, _mins(0, 0));
         assertEq(
             nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE + below, "non-qualifying zero-floor batch succeeded"
         );
     }
 
-    /// @dev 15. §3 step 4 runs BEFORE step 5's `safeTransferFrom`. Proven by
+    /// @dev 16. §3 step 4 runs BEFORE step 5's `safeTransferFrom`. Proven by
     ///      giving the caller funds but NO allowance: if the floor check ran
     ///      after the pull, the revert would be an allowance failure. It is the
     ///      floor error, so the check is genuinely pre-pull.
     function test_FloorCheckedBeforePaymentPull() public {
+        _whitelist(address(rewardA));
         _fundPots();
         uint256 cost = _costNow(NUDGE_SIZE);
         payToken.mint(caller, cost); // funded but deliberately NOT approved
@@ -561,39 +633,50 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
                 BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardA), POT_A + 1, POT_A
             )
         );
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA)), _mins(POT_A + 1));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(POT_A + 1));
 
         assertEq(payToken.balanceOf(caller), callerBefore, "caller's payment token untouched on a floor revert");
         assertEq(payToken.balanceOf(address(batch)), 0, "nothing was pulled into the contract");
     }
 
-    /// @dev 16. Length equality is one of only two things the contract
-    ///      validates about the arrays.
+    /// @dev 17. `minRewards.length` must equal the FULL whitelist length —
+    ///      too short, too long, and non-empty-against-empty all revert with
+    ///      `(whitelistLength, minsLength)`.
     function test_RevertWhen_ArrayLengthMismatch() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
         uint256 cost = _costNow(NUDGE_SIZE);
         _fund(caller, cost);
 
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 2, 1));
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0));
 
         vm.prank(caller);
-        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 1, 2));
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA)), _mins(0, 0));
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 2, 3));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0, 0));
+
+        // Empty whitelist demands empty minRewards.
+        vm.prank(owner);
+        batch.setNudgeTokenWhitelist(address(rewardA), false);
+        vm.prank(owner);
+        batch.setNudgeTokenWhitelist(address(rewardB), false);
 
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__ArrayLengthMismatch.selector, 0, 1));
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _none(), _mins(0));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0));
     }
 
     // ================================================================ //
     // Eligibility (owner-controlled)
     // ================================================================ //
 
-    /// @dev 17. Arrays supplied but `count < nudgeSize` — nothing is paid and
-    ///      the call still succeeds.
+    /// @dev 18. Whitelist populated but `count < nudgeSize` — nothing is paid
+    ///      and the call still succeeds.
     function test_NoRewardWhenCountBelowNudgeSize() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
         uint256 below = NUDGE_SIZE - 1;
         uint256 cost = _costNow(below);
@@ -601,7 +684,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(below, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0, 0));
+        batch.batchMint(below, recipient, cost, _mins(0, 0));
 
         assertEq(rewardA.balanceOf(recipient), 0, "no reward below the threshold");
         assertEq(rewardB.balanceOf(recipient), 0, "no reward below the threshold");
@@ -609,9 +692,10 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         _assertNoNudgePaid();
     }
 
-    /// @dev 18. `nudgeSize == 0` disables the incentive entirely — the owner's
-    ///      one remaining lever.
+    /// @dev 19. `nudgeSize == 0` disables the incentive entirely.
     function test_NoRewardWhenNudgeSizeZero() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
         _fundPots();
         vm.prank(owner);
         batch.setNudgeSize(0);
@@ -622,7 +706,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(count, recipient, cost, _arr(address(rewardA), address(rewardB)), _mins(0, 0));
+        batch.batchMint(count, recipient, cost, _mins(0, 0));
 
         assertEq(rewardA.balanceOf(recipient), 0, "no reward when nudgeSize is zero");
         assertEq(rewardA.balanceOf(address(batch)), POT_A, "pot A intact when nudgeSize is zero");
@@ -633,7 +717,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     // Documented-behaviour witnesses (§4.4 / §4.5)
     // ================================================================ //
 
-    /// @dev 19. §4.4 witness. `minRewards[i]` is a floor on the CONTRACT'S
+    /// @dev 20. §4.4 witness. `minRewards[i]` is a floor on the CONTRACT'S
     ///      PRE-TRANSFER BALANCE, not on what `recipient` receives. A
     ///      fee-on-transfer token therefore clears the floor and still delivers
     ///      below it — documented, deliberately not defended. If this test ever
@@ -641,6 +725,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     ///      must be rewritten before the change lands.
     function test_FeeOnTransferDeliversBelowMinReward() public {
         MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 500); // 5%
+        _whitelist(address(taxed));
         uint256 pot = 1_000 ether;
         taxed.mint(address(batch), pot);
 
@@ -649,7 +734,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
 
         // Floor set to the FULL pot — the snapshot equals it, so no revert.
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(taxed)), _mins(pot));
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(pot));
 
         uint256 delivered = taxed.balanceOf(recipient);
         assertEq(delivered, pot - (pot * 500) / 10_000, "recipient receives the post-fee amount");
@@ -657,32 +742,33 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         assertEq(taxed.balanceOf(address(batch)), 0, "contract's whole snapshot left the contract");
     }
 
-    /// @dev 20. §4.5 witness. Duplicate entries both snapshot the same balance;
-    ///      the first transfer drains it and the second fails on insufficient
-    ///      balance. The batch rolls back — it fails CLOSED, harming only the
-    ///      careless caller. This is why there is no O(n^2) dedupe pass.
-    function test_DuplicateRewardTokenFailsClosed() public {
-        _fundPots();
-        uint256 cost = _costNow(NUDGE_SIZE);
-        _fund(caller, cost);
-        uint256 callerBefore = payToken.balanceOf(caller);
+    /// @dev 21. §4.5 witness (story-025 replacement for the old
+    ///      fail-closed-duplicate test). With a set-backed whitelist,
+    ///      duplicate reward entries are STRUCTURALLY IMPOSSIBLE: the only
+    ///      way to introduce one is `setNudgeTokenWhitelist`, which reverts
+    ///      on a re-add. Audit-21 M-02 is resolved by construction.
+    function test_DuplicateNudgeTokensStructurallyImpossible() public {
+        _whitelist(address(rewardA));
 
-        vm.prank(caller);
-        vm.expectRevert(); // ERC20InsufficientBalance from the second transfer
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _arr(address(rewardA), address(rewardA)), _mins(0, 0));
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__NudgeTokenAlreadyWhitelisted.selector, address(rewardA)
+            )
+        );
+        batch.setNudgeTokenWhitelist(address(rewardA), true);
 
-        assertEq(rewardA.balanceOf(recipient), 0, "duplicate entry pays nothing");
-        assertEq(rewardA.balanceOf(address(batch)), POT_A, "pot intact after the failed-closed batch");
-        assertEq(payToken.balanceOf(caller), callerBefore, "caller's payment rolled back");
-        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 0, "no mints survived");
+        address[] memory listed = batch.getNudgeTokens();
+        assertEq(listed.length, 1, "the set never holds a duplicate");
+        assertEq(listed[0], address(rewardA), "single entry preserved");
     }
 
     // ================================================================ //
     // Fuzz
     // ================================================================ //
 
-    /// @dev 21. The §4.6 sweep / `totalPaid` invariant holds for arbitrary
-    ///      `count`, `paymentAmount` surplus and reward-array shape:
+    /// @dev 22. The §4.6 sweep / `totalPaid` invariant holds for arbitrary
+    ///      `count`, `paymentAmount` surplus and whitelist shape:
     ///        - surplus >= DUST_THRESHOLD  -> refunded, `totalPaid == cost`
     ///        - surplus <  DUST_THRESHOLD  -> retained, `totalPaid == paymentAmount`
     ///      and the reward payout never perturbs either side of that ledger.
@@ -691,13 +777,12 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         surplus = bound(surplus, 0, 10 ether);
         uint256 numTokens = bound(uint256(shape), 0, 3);
 
-        address[] memory tokens = new address[](numTokens);
         uint256[] memory minRewards = new uint256[](numTokens);
         MockERC20[3] memory pool = [rewardA, rewardB, rewardC];
         uint256[3] memory pots = [POT_A, POT_B, POT_C];
         for (uint256 i = 0; i < numTokens; i++) {
             pool[i].mint(address(batch), pots[i]);
-            tokens[i] = address(pool[i]);
+            _whitelist(address(pool[i]));
         }
 
         uint256 cost = _costNow(count);
@@ -706,7 +791,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        uint256 totalPaid = batch.batchMint(count, recipient, paymentAmount, tokens, minRewards);
+        uint256 totalPaid = batch.batchMint(count, recipient, paymentAmount, minRewards);
 
         bool qualifies = count >= NUDGE_SIZE;
         if (surplus >= DUST_THRESHOLD) {
