@@ -10,6 +10,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IPausable} from "pauser/interfaces/IPausable.sol";
+import {INudgeStreamer} from "./INudgeStreamer.sol";
 
 /// @title BatchNFTMinterMultiToken
 /// @notice Helper that loops `ITokenMinterV2.mint(...)` `count` times in a single
@@ -127,6 +128,13 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     /// @dev 1-based index into `_nudgeTokens`; `0` == not whitelisted.
     mapping(address => uint256) private _nudgeTokenIndex;
 
+    /// @notice Optional linear streamer that meters bursty donations into this
+    ///         contract's nudge pot. `batchMint` flushes each whitelisted
+    ///         token's accrued stream (via `pullPendingStream`) into the pot
+    ///         right before it snapshots balances. `address(0)` disables the
+    ///         integration, keeping the whole feature optional/backward-safe.
+    address public nudgeStreamer;
+
     /// @dev Reverted when `count == 0`.
     error BatchMint__ZeroCount();
     /// @dev Reverted when `recipient == address(0)`.
@@ -168,6 +176,7 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     event DispatcherIndexSet(uint256 indexed dispatcherIndex);
     event Rescued(address indexed token, address indexed to, uint256 amount);
     event PauserChanged(address indexed previousPauser, address indexed newPauser);
+    event NudgeStreamerChanged(address indexed previousStreamer, address indexed newStreamer);
 
     modifier onlyPauser() {
         require(msg.sender == pauser, "BatchNFTMinter: caller is not pauser");
@@ -204,6 +213,23 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     ///         callers/UI must re-fetch before every `batchMint`.
     function getNudgeTokens() external view returns (address[] memory) {
         return _nudgeTokens;
+    }
+
+    /// @notice O(1) membership check against the nudge-token whitelist. Used by
+    ///         `NudgeStreamer.registerStream` to confirm both that `token` is a
+    ///         whitelisted reward asset and (by the mere existence of this
+    ///         function) that this is a MultiToken batchMinter.
+    function isNudgeToken(address token) external view returns (bool) {
+        return _nudgeTokenIndex[token] != 0;
+    }
+
+    /// @notice Owner-gated update of the optional nudge streamer. Setting
+    ///         `address(0)` disables the streamer flush in `batchMint`, leaving
+    ///         all other behaviour unchanged. Stays callable while paused
+    ///         (matches the other setters).
+    function setNudgeStreamer(address newStreamer) external onlyOwner {
+        emit NudgeStreamerChanged(nudgeStreamer, newStreamer);
+        nudgeStreamer = newStreamer;
     }
 
     /// @notice Owner-gated add/remove of a nudge-reward token. Stays callable
@@ -407,6 +433,23 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
             uint256 _nudgeSize = nudgeSize;
             qualifies = _nudgeSize != 0 && count >= _nudgeSize;
         }
+
+        // --- 3.5. Flush accrued streams into the pot BEFORE the snapshot. ---
+        //
+        // If a NudgeStreamer is configured, settle each whitelisted token's
+        // linearly-metered stream into this contract so the funds are counted
+        // by the `_snapshotRewards` read below. Unregistered tokens are a cheap
+        // no-op on the streamer side, so we can loop blindly over the whole
+        // whitelist. This runs inside `batchMint`'s existing `nonReentrant`
+        // guard.
+        address _nudgeStreamer = nudgeStreamer;
+        if (_nudgeStreamer != address(0)) {
+            uint256 nudgeCount = _nudgeTokens.length;
+            for (uint256 i; i < nudgeCount; ++i) {
+                INudgeStreamer(_nudgeStreamer).pullPendingStream(_nudgeTokens[i]);
+            }
+        }
+
         uint256[] memory snapshot = _snapshotRewards(minRewards, address(paymentToken), qualifies);
 
         // --- 5. Pull the caller's payment budget. ---
