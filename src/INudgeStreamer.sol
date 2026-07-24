@@ -6,11 +6,14 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// @title  INudgeStreamer
 interface INudgeStreamer {
     ///@dev msg.sender is the donor to the batchMinter
-    function pullPendingStream(
+    function collectNudge(
         address recipientBatchMinter,
         address token,
         uint amount
     ) external;
+
+    ///@dev msg.sender is a batchMinter
+    function pullPendingStream(address token) external;
 
     function pendingStream(
         address batchMinter,
