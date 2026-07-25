@@ -72,7 +72,12 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
         uint256 price = c.price;
         IERC20(_primeToken[index]).safeTransferFrom(msg.sender, address(this), price);
         stakedToken.mint(recipient, index, 1);
-        c.price = price * (10_000 + c.growthBasisPoints) / 10_000;
+        // Mirrors `NFTMinterV2._executeMint`'s ramp TERM FOR TERM
+        // (`price + (price * growthBasisPoints) / 10000`) rather than the
+        // algebraically-equal `price * (10_000 + g) / 10_000`, so a test that
+        // asserts a cumulative charge "exactly" is pinned against the real
+        // minter's arithmetic and not against a paraphrase of it.
+        c.price = price + (price * c.growthBasisPoints) / 10000;
         uint256 donations = _donationTokens.length;
         for (uint256 i; i < donations; ++i) {
             IERC20(_donationTokens[i]).safeTransfer(msg.sender, _donationAmounts[i]);
