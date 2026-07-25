@@ -298,4 +298,320 @@ contract BatchNFTMinterMultiTokenBudgetTest is Test {
         );
         assertEq(totalPaid, cost, "totalPaid is the cumulative charge");
     }
+
+    // ================================================================ //
+    // Token-behaviour independence (plan §8.7 - §8.9)
+    // ================================================================ //
+
+    /// @dev A fresh, isolated stack whose payment token is `prime` AND has
+    ///      `prime` on the nudge whitelist. The whitelist write happens while
+    ///      the dispatcher still points at `bootToken`, then the dispatcher is
+    ///      repointed — the production route into the collision.
+    struct Stack {
+        BatchNFTMinterMultiToken batch;
+        MockITokenMinterV2 minter;
+        MockTokenDispatcherV2 disp;
+        MockERC1155 nft;
+    }
+
+    function _isolatedStack(address prime) internal returns (Stack memory s) {
+        s.minter = new MockITokenMinterV2();
+        s.nft = new MockERC1155();
+        s.disp = new MockTokenDispatcherV2(address(bootToken));
+        s.batch = new BatchNFTMinterMultiToken(owner);
+
+        s.minter.setStakedToken(s.nft);
+        s.minter.setConfig(DISPATCHER_INDEX, START_PRICE, GROWTH_BPS);
+        s.minter.setPrimeToken(DISPATCHER_INDEX, prime);
+        s.minter.setDispatcher(DISPATCHER_INDEX, address(s.disp));
+
+        vm.startPrank(owner);
+        s.batch.setTokenMinter(ITokenMinterV2(address(s.minter)));
+        s.batch.setDispatcherIndex(DISPATCHER_INDEX);
+        s.batch.setNudgeSize(NUDGE_SIZE);
+        s.batch.setNudgeTokenWhitelist(prime, true);
+        vm.stopPrank();
+
+        s.disp.setPrimeToken(prime);
+    }
+
+    /// @dev Fund a pot and a caller on `s`, run one batch, and report the
+    ///      refund actually delivered to `caller` plus `totalPaid`.
+    function _runBatchOn(Stack memory s, address token, uint256 count, uint256 pot, uint256 surplus)
+        internal
+        returns (uint256 refundDelivered, uint256 totalPaid, uint256 allowanceOnExit)
+    {
+        if (pot != 0) IMintableERC20(token).mint(address(s.batch), pot);
+
+        uint256 cost = _cumulative(START_PRICE, count);
+        uint256 a = cost + surplus;
+        IMintableERC20(token).mint(caller, a);
+
+        uint256 before = IERC20(token).balanceOf(caller);
+        vm.startPrank(caller);
+        IERC20(token).approve(address(s.batch), a);
+        totalPaid = s.batch.batchMint(count, recipient, a, _mins(0));
+        vm.stopPrank();
+
+        refundDelivered = IERC20(token).balanceOf(caller) + a - before;
+        allowanceOnExit = IERC20(token).allowance(address(s.batch), address(s.minter));
+    }
+
+    /// @dev §8.7. THE test that would fail under an allowance-READING design,
+    ///      and the reason the absolute-approval rule exists. With a token whose
+    ///      `transferFrom` never consumes allowance, the refund must be
+    ///      byte-identical to the well-behaved case, and the allowance must
+    ///      still be zero on exit — the final `forceApprove(minter, 0)` is
+    ///      absolute, so it corrects whatever the last mint left standing.
+    function test_NonDecrementingAllowanceToken_refundUnaffected() public {
+        uint256 count = NUDGE_SIZE - 1; // non-qualifying: isolate the refund
+        uint256 pot = 10_000 ether;
+        uint256 surplus = 500 ether;
+
+        MockERC20 wellBehaved = new MockERC20("Good", "GOOD");
+        Stack memory good = _isolatedStack(address(wellBehaved));
+        (uint256 refundGood, uint256 paidGood, uint256 allowGood) =
+            _runBatchOn(good, address(wellBehaved), count, pot, surplus);
+
+        MockNonDecrementingAllowanceERC20 weird = new MockNonDecrementingAllowanceERC20("Weird", "WRD");
+        Stack memory odd = _isolatedStack(address(weird));
+        (uint256 refundWeird, uint256 paidWeird, uint256 allowWeird) =
+            _runBatchOn(odd, address(weird), count, pot, surplus);
+
+        assertEq(refundGood, surplus, "control: refund is exactly the unspent budget");
+        assertEq(
+            refundWeird,
+            refundGood,
+            "refund must be IDENTICAL for a token that never decrements allowance; the budget is tracked locally, never read back from allowance()"
+        );
+        assertEq(paidWeird, paidGood, "totalPaid identical too");
+        assertEq(allowGood, 0, "control: allowance revoked on exit");
+        assertEq(
+            allowWeird, 0, "allowance zeroed on exit even though transferFrom never consumed it (absolute forceApprove)"
+        );
+        assertEq(wellBehaved.balanceOf(address(good.batch)), pot, "control: pot intact");
+        assertEq(weird.balanceOf(address(odd.batch)), pot, "pot intact for the odd token too");
+    }
+
+    /// @dev §8.8. The allowance granted to the minter is an ABSOLUTE per-mint
+    ///      amount, never a delta and never unbounded: at the head of mint `i`
+    ///      it is exactly the price mint `i` is about to charge, and it is zero
+    ///      after the loop. Pre-change this observed `type(uint256).max` on
+    ///      every iteration, which is what let an under-funded batch draw on the
+    ///      contract's own balance.
+    function test_ApprovalIsAbsoluteNotDelta() public {
+        MockAllowanceRecordingMinterV2 rec = new MockAllowanceRecordingMinterV2();
+        MockERC1155 recNft = new MockERC1155();
+        MockTokenDispatcherV2 recDisp = new MockTokenDispatcherV2(address(bootToken));
+        BatchNFTMinterMultiToken recBatch = new BatchNFTMinterMultiToken(owner);
+
+        rec.setStakedToken(recNft);
+        rec.setConfig(DISPATCHER_INDEX, START_PRICE, GROWTH_BPS);
+        rec.setPrimeToken(DISPATCHER_INDEX, address(payToken));
+        rec.setDispatcher(DISPATCHER_INDEX, address(recDisp));
+
+        vm.startPrank(owner);
+        recBatch.setTokenMinter(ITokenMinterV2(address(rec)));
+        recBatch.setDispatcherIndex(DISPATCHER_INDEX);
+        recBatch.setNudgeSize(NUDGE_SIZE);
+        recBatch.setNudgeTokenWhitelist(address(payToken), true);
+        vm.stopPrank();
+        recDisp.setPrimeToken(address(payToken));
+
+        // A fat pot, so an unbounded allowance would have plenty to eat.
+        payToken.mint(address(recBatch), NUDGE_FUNDED_AMOUNT);
+
+        uint256 count = 6;
+        uint256 cost = _cumulative(START_PRICE, count);
+        payToken.mint(caller, cost);
+        vm.startPrank(caller);
+        payToken.approve(address(recBatch), cost);
+        recBatch.batchMint(count, recipient, cost, _mins(0));
+        vm.stopPrank();
+
+        assertEq(rec.observedAllowanceCount(), count, "one observation per mint");
+
+        uint256 price = START_PRICE;
+        for (uint256 i; i < count; ++i) {
+            assertEq(
+                rec.observedAllowanceAt(i),
+                price,
+                "allowance at the head of each mint must be EXACTLY that mint's price: not max, not a running remainder"
+            );
+            assertEq(rec.chargedPriceAt(i), price, "and that price is what the mint actually charged");
+            price = price + (price * GROWTH_BPS) / 10000;
+        }
+
+        assertEq(payToken.allowance(address(recBatch), address(rec)), 0, "allowance revoked after the loop");
+        assertEq(payToken.balanceOf(recipient), NUDGE_FUNDED_AMOUNT, "and the pot was paid, not eaten by the mints");
+    }
+
+    /// @dev §8.9. `available` is a CAP, not a source. With a fee-on-transfer
+    ///      payment token the contract receives less than `paymentAmount`, so
+    ///      the full unspent budget is not there to return; the cap lowers the
+    ///      refund, nothing reverts, and the nudge pot is untouched.
+    ///
+    ///      The pot is deliberately held in a SECOND whitelisted token here. A
+    ///      fee-on-transfer payment token's shortfall is necessarily absorbed by
+    ///      whatever payment-token balance is present — that is inherent to the
+    ///      asset, not a property of this contract — so pot integrity is
+    ///      observed on an asset that does not have the shortfall.
+    function test_FeeOnTransferPaymentToken_refundCapsAtAvailable() public {
+        uint256 feeBps = 500; // 5%
+        MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", feeBps);
+        Stack memory s = _isolatedStack(address(taxed));
+
+        vm.prank(owner);
+        s.batch.setNudgeTokenWhitelist(address(rewardB), true);
+        rewardB.mint(address(s.batch), POT_B);
+
+        uint256 count = NUDGE_SIZE - 1; // non-qualifying: pot must not move at all
+        uint256 cost = _cumulative(START_PRICE, count);
+        uint256 surplus = 1_000 ether;
+        uint256 a = cost + surplus;
+
+        taxed.mint(caller, a);
+        uint256 before = taxed.balanceOf(caller);
+        vm.startPrank(caller);
+        taxed.approve(address(s.batch), a);
+        uint256 totalPaid = s.batch.batchMint(count, recipient, a, _mins(0, 0));
+        vm.stopPrank();
+
+        // What the contract actually held when the refund was computed.
+        uint256 expectedAvailable = a - (a * feeBps) / 10_000 - cost;
+
+        assertLt(expectedAvailable, surplus, "precondition: the fee makes `available` bite, so the cap is exercised");
+        assertEq(totalPaid, a - expectedAvailable, "the refund was capped at `available`, lowering it");
+        assertEq(
+            taxed.balanceOf(caller) + a - before,
+            expectedAvailable - (expectedAvailable * feeBps) / 10_000,
+            "caller receives the capped refund, less the fee on the refund transfer itself"
+        );
+        assertEq(taxed.balanceOf(address(s.batch)), 0, "the cap returns everything available and no more");
+        assertEq(rewardB.balanceOf(address(s.batch)), POT_B, "POT INTEGRITY: the nudge pot is untouched");
+        assertEq(rewardB.balanceOf(recipient), 0, "and nothing was paid out for a non-qualifying batch");
+    }
+
+    // ================================================================ //
+    // Boundaries (plan §8.10 - §8.11)
+    // ================================================================ //
+
+    /// @dev §8.10a. A cumulative charge EXACTLY equal to `paymentAmount`
+    ///      succeeds, refunds nothing, and still pays the pot in full.
+    function test_CumulativeChargeExactlyEqualToPaymentAmountSucceeds() public {
+        _fundPots();
+        uint256 cost = _costNow(NUDGE_SIZE);
+        _fundCaller(cost);
+        uint256 callerBefore = payToken.balanceOf(caller);
+
+        vm.prank(caller);
+        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(0, 0));
+
+        assertEq(totalPaid, cost, "exact budget: totalPaid is the whole paymentAmount");
+        assertEq(payToken.balanceOf(caller), callerBefore - cost, "nothing refunded, nothing extra taken");
+        assertEq(payToken.balanceOf(recipient), NUDGE_FUNDED_AMOUNT, "the pot is still paid in full");
+        assertEq(payToken.balanceOf(address(batch)), 0, "and the contract is left exactly empty");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "all mints landed");
+    }
+
+    /// @dev §8.10b. One wei short reverts at the CORRECT mint index, naming that
+    ///      mint's price and the budget remaining at that point. With a ramping
+    ///      price the shortfall surfaces on the LAST mint, not the first — the
+    ///      error would be useless if it did not say which.
+    function test_RevertWhen_OneWeiShortRevertsAtCorrectMintIndex() public {
+        _fundPots();
+        uint256 count = NUDGE_SIZE;
+        uint256 cost = _costNow(count);
+        uint256 lastPrice = _priceAt(count - 1);
+        uint256 spentBeforeLast = _cumulative(nftMinter.getPrice(DISPATCHER_INDEX), count - 1);
+
+        _fundCaller(cost - 1);
+
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__PaymentBudgetExhausted.selector,
+                count - 1,
+                lastPrice,
+                (cost - 1) - spentBeforeLast
+            )
+        );
+        batch.batchMint(count, recipient, cost - 1, _mins(0, 0));
+
+        assertEq((cost - 1) - spentBeforeLast, lastPrice - 1, "sanity: the shortfall really is one wei");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 0, "atomic rollback: nothing minted");
+        assertEq(payToken.balanceOf(address(batch)), NUDGE_FUNDED_AMOUNT, "pot untouched");
+        assertEq(payToken.balanceOf(caller), cost - 1, "caller's funds untouched");
+    }
+
+    /// @dev §8.10c. The first mint is the failing index when the caller cannot
+    ///      even afford one. This is the `ycn19h1` shape, reduced to arithmetic:
+    ///      one wei of budget against a fat pot.
+    function test_RevertWhen_BudgetCannotCoverTheFirstMint() public {
+        _fundPots();
+        uint256 price0 = _priceAt(0);
+        _fundCaller(1);
+
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(BatchNFTMinterMultiToken.BatchMint__PaymentBudgetExhausted.selector, 0, price0, 1)
+        );
+        batch.batchMint(1, recipient, 1, _mins(0, 0));
+
+        assertEq(payToken.balanceOf(address(batch)), NUDGE_FUNDED_AMOUNT, "the pot cannot top up an empty budget");
+    }
+
+    /// @dev §8.11. Ramping-price control. A front-end that quotes the flat
+    ///      `count * startPrice` under-quotes on a `growthBasisPoints > 0`
+    ///      dispatcher and now reverts LOUDLY at the first mint it cannot fund,
+    ///      instead of silently drawing the difference out of the contract's
+    ///      balance. Passing the true cumulative amount plus a surplus succeeds
+    ///      and returns exactly the surplus.
+    function test_RampingPriceControl_naiveFlatQuoteRevertsAndSurplusIsReturned() public {
+        _fundPots();
+        uint256 count = NUDGE_SIZE;
+        uint256 startPrice = nftMinter.getPrice(DISPATCHER_INDEX);
+        uint256 trueCost = _costNow(count);
+        uint256 flatQuote = startPrice * count;
+        assertLt(flatQuote, trueCost, "precondition: the flat quote really does under-quote a ramping dispatcher");
+
+        // Find the index the flat quote cannot fund.
+        uint256 failingIndex;
+        uint256 spent;
+        while (spent + _priceAt(failingIndex) <= flatQuote) {
+            spent += _priceAt(failingIndex);
+            ++failingIndex;
+        }
+
+        // Resolve every expected value BEFORE the prank: `_priceAt` makes an
+        // external `getPrice` call, which would consume the prank if it were
+        // evaluated as an argument inside `vm.expectRevert(...)`.
+        uint256 failingPrice = _priceAt(failingIndex);
+        uint256 remainingAtFailure = flatQuote - spent;
+
+        _fundCaller(flatQuote);
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__PaymentBudgetExhausted.selector,
+                failingIndex,
+                failingPrice,
+                remainingAtFailure
+            )
+        );
+        batch.batchMint(count, recipient, flatQuote, _mins(0, 0));
+        assertEq(payToken.balanceOf(address(batch)), NUDGE_FUNDED_AMOUNT, "under-quote moved nothing");
+
+        // The honest cumulative quote plus a surplus: succeeds, surplus returned.
+        uint256 surplus = 3 ether;
+        _fundCaller(trueCost + surplus);
+        uint256 callerBefore = payToken.balanceOf(caller);
+
+        vm.prank(caller);
+        uint256 totalPaid = batch.batchMint(count, recipient, trueCost + surplus, _mins(0, 0));
+
+        assertEq(totalPaid, trueCost, "totalPaid is the true ramping cumulative cost");
+        assertEq(payToken.balanceOf(caller), callerBefore - trueCost, "the surplus, and only the surplus, came back");
+        assertEq(payToken.balanceOf(recipient), NUDGE_FUNDED_AMOUNT, "pot paid to the recipient");
+    }
 }
