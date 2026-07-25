@@ -12,6 +12,7 @@ import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 import {MockNonDecrementingAllowanceERC20} from "./mocks/MockNonDecrementingAllowanceERC20.sol";
+import {MockDonatingOnPullERC20} from "./mocks/MockDonatingOnPullERC20.sol";
 import {MockAllowanceRecordingMinterV2} from "./mocks/MockAllowanceRecordingMinterV2.sol";
 
 /// @dev The `mint(address,uint256)` faculty every mock ERC20 in this repo
@@ -446,17 +447,25 @@ contract BatchNFTMinterMultiTokenBudgetTest is Test {
         assertEq(payToken.balanceOf(recipient), NUDGE_FUNDED_AMOUNT, "and the pot was paid, not eaten by the mints");
     }
 
-    /// @dev §8.9. `available` is a CAP, not a source. With a fee-on-transfer
-    ///      payment token the contract receives less than `paymentAmount`, so
-    ///      the full unspent budget is not there to return; the cap lowers the
-    ///      refund, nothing reverts, and the nudge pot is untouched.
+    /// @dev §8.9, first arm. With a fee-on-transfer payment token the contract
+    ///      is credited less than `paymentAmount`, and the refund is the
+    ///      CREDITED budget — measured across the step-5 pull — not the quoted
+    ///      one. Nothing reverts and the caller gets back exactly what of their
+    ///      money survived the pull and the mints.
     ///
-    ///      The pot is deliberately held in a SECOND whitelisted token here. A
-    ///      fee-on-transfer payment token's shortfall is necessarily absorbed by
-    ///      whatever payment-token balance is present — that is inherent to the
-    ///      asset, not a property of this contract — so pot integrity is
-    ///      observed on an asset that does not have the shortfall.
-    function test_FeeOnTransferPaymentToken_refundCapsAtAvailable() public {
+    ///      The pot is held in a SECOND whitelisted token here, so this arm says
+    ///      nothing about pot integrity under a taxed token; that is
+    ///      `test_FeeOnTransferPaymentToken_potIsUntouchedWhenItHoldsThePot`
+    ///      below, which puts the tax and the pot in the SAME asset. Before the
+    ///      credited-delta measurement, `budget` was the quoted `paymentAmount`
+    ///      and the `available` cap was the only thing standing between the
+    ///      shortfall and the pot — which is why this arm's numbers are
+    ///      unchanged while that one's are not.
+    ///
+    ///      `available` is now belt-and-braces: it is asserted here to be
+    ///      NON-BINDING, i.e. the refund is sourced from the measured budget and
+    ///      the cap never has to lower it.
+    function test_FeeOnTransferPaymentToken_refundIsTheCreditedBudget() public {
         uint256 feeBps = 500; // 5%
         MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", feeBps);
         Stack memory s = _isolatedStack(address(taxed));
@@ -477,19 +486,160 @@ contract BatchNFTMinterMultiTokenBudgetTest is Test {
         uint256 totalPaid = s.batch.batchMint(count, recipient, a, _mins(0, 0));
         vm.stopPrank();
 
-        // What the contract actually held when the refund was computed.
-        uint256 expectedAvailable = a - (a * feeBps) / 10_000 - cost;
+        // The caller's money that actually arrived, less what the mints charged.
+        uint256 creditedSurplus = a - (a * feeBps) / 10_000 - cost;
 
-        assertLt(expectedAvailable, surplus, "precondition: the fee makes `available` bite, so the cap is exercised");
-        assertEq(totalPaid, a - expectedAvailable, "the refund was capped at `available`, lowering it");
+        assertLt(creditedSurplus, surplus, "precondition: the fee really did shrink the caller's credited budget");
+        assertEq(totalPaid, a - creditedSurplus, "the refund is the credited budget, not the quoted one");
         assertEq(
             taxed.balanceOf(caller) + a - before,
-            expectedAvailable - (expectedAvailable * feeBps) / 10_000,
-            "caller receives the capped refund, less the fee on the refund transfer itself"
+            creditedSurplus - (creditedSurplus * feeBps) / 10_000,
+            "caller receives the credited surplus, less the fee on the refund transfer itself"
         );
-        assertEq(taxed.balanceOf(address(s.batch)), 0, "the cap returns everything available and no more");
-        assertEq(rewardB.balanceOf(address(s.batch)), POT_B, "POT INTEGRITY: the nudge pot is untouched");
+        assertEq(taxed.balanceOf(address(s.batch)), 0, "everything the caller was credited and did not spend went back");
+        assertEq(rewardB.balanceOf(address(s.batch)), POT_B, "the SECOND token's pot is untouched (see note above)");
         assertEq(rewardB.balanceOf(recipient), 0, "and nothing was paid out for a non-qualifying batch");
+    }
+
+    // ================================================================ //
+    // The budget is MEASURED, not trusted (review finding A)
+    // ================================================================ //
+
+    /// @dev The taxed token is the payment token AND holds the pot — the case
+    ///      the arm above deliberately does not cover. `budget` is measured
+    ///      across the step-5 pull, so the fee is charged to the caller's own
+    ///      credit and the pot is not asked to make up the difference.
+    ///
+    ///      Pre-measurement this took `paymentAmount - cost` out of a balance
+    ///      that only ever held `credited - cost` of the caller's money, so the
+    ///      remainder came out of `P`: a non-qualifying batch shrank the pot by
+    ///      the fee, repeatably, with the shortfall landing in the token's fee
+    ///      sink. Griefing where the sink is a third party; direct extraction
+    ///      where the attacker controls it — the "pot leaves without the caller
+    ///      paying for `nudgeSize` real mints" carve-out of the 2026-07-25
+    ///      arbitrage acceptance.
+    function test_FeeOnTransferPaymentToken_potIsUntouchedWhenItHoldsThePot() public {
+        uint256 feeBps = 500; // 5%
+        MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", feeBps);
+        Stack memory s = _isolatedStack(address(taxed));
+
+        uint256 pot = 10_000 ether;
+        taxed.mint(address(s.batch), pot);
+        // The mint is the zero-address branch, so the pot arrives untaxed.
+        assertEq(taxed.balanceOf(address(s.batch)), pot, "fixture: the pot is P exactly");
+
+        uint256 count = NUDGE_SIZE - 1; // non-qualifying: the pot must not move AT ALL
+        uint256 cost = _cumulative(START_PRICE, count);
+        uint256 a = cost + 1_000 ether;
+        uint256 credited = a - (a * feeBps) / 10_000;
+
+        taxed.mint(caller, a);
+        uint256 callerBefore = taxed.balanceOf(caller);
+        uint256 sinkBefore = taxed.balanceOf(taxed.FEE_SINK());
+
+        vm.startPrank(caller);
+        taxed.approve(address(s.batch), a);
+        uint256 totalPaid = s.batch.batchMint(count, recipient, a, _mins(0));
+        vm.stopPrank();
+
+        uint256 refund = credited - cost;
+
+        assertEq(
+            taxed.balanceOf(address(s.batch)),
+            pot,
+            "POT INTEGRITY: a non-qualifying batch leaves P EXACTLY where it was, taxed token or not"
+        );
+        assertEq(totalPaid, a - refund, "totalPaid is the quoted amount less the measured refund");
+        assertEq(
+            taxed.balanceOf(caller),
+            callerBefore - a + (refund - (refund * feeBps) / 10_000),
+            "the caller alone bears the token's fee on their own money"
+        );
+        assertGt(taxed.balanceOf(taxed.FEE_SINK()), sinkBefore, "the fee sink was fed, but only out of the caller");
+        assertEq(taxed.balanceOf(recipient), 0, "non-qualifying: nothing paid out");
+    }
+
+    /// @dev The inverted second arm of the same defect. With the shortfall taken
+    ///      out of the pot, a QUALIFYING batch in this configuration cannot pay
+    ///      the snapshot it captured — `_payRewards` reverts on the balance and
+    ///      the whole batch rolls back, so the taxed-payment-token config was
+    ///      not merely leaky, it was bricked at `count >= nudgeSize`.
+    ///
+    ///      Measuring the budget restores it: after the refund the contract
+    ///      holds exactly `P`, which is exactly what the snapshot promised.
+    function test_FeeOnTransferPaymentToken_qualifyingBatchStillPaysThePot() public {
+        uint256 feeBps = 500; // 5%
+        MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", feeBps);
+        Stack memory s = _isolatedStack(address(taxed));
+
+        uint256 pot = 10_000 ether;
+        taxed.mint(address(s.batch), pot);
+
+        uint256 count = NUDGE_SIZE; // qualifying
+        uint256 cost = _cumulative(START_PRICE, count);
+        uint256 a = cost + 1_000 ether;
+
+        taxed.mint(caller, a);
+        vm.startPrank(caller);
+        taxed.approve(address(s.batch), a);
+        s.batch.batchMint(count, recipient, a, _mins(0));
+        vm.stopPrank();
+
+        assertEq(
+            taxed.balanceOf(recipient),
+            pot - (pot * feeBps) / 10_000,
+            "the qualifying batch is paid the WHOLE pot; only the token's own fee is deducted in flight"
+        );
+        assertEq(taxed.balanceOf(address(s.batch)), 0, "P paid out, credited surplus refunded, nothing stranded");
+    }
+
+    /// @dev The measurement is a CEILING at `paymentAmount`, never a floor.
+    ///
+    ///      `budget = balanceAfter - balanceBefore` alone is unbounded above: a
+    ///      token with a transfer callback lets a third party push funds into
+    ///      this contract DURING the pull, and `nonReentrant` does not stop it
+    ///      (it blocks re-entering `batchMint`, not an inbound transfer). Those
+    ///      funds would land inside the measurement window and be refundable to
+    ///      `msg.sender` — donate-forward `D` re-routed to the batcher, which is
+    ///      the `ycn19h1` mechanism reached through a narrower door.
+    ///
+    ///      `min(credited, paymentAmount)` takes the tighter of measured and
+    ///      quoted, so the donation stays behind for the next claimant exactly
+    ///      as a donation arriving during the mint loop does.
+    function test_DonationDuringPullCannotInflateBudget() public {
+        MockDonatingOnPullERC20 hooked = new MockDonatingOnPullERC20("Hooked", "HOOK");
+        Stack memory s = _isolatedStack(address(hooked));
+
+        address benefactor = makeAddr("benefactor");
+        uint256 donation = 4_321 ether;
+        hooked.mint(benefactor, donation);
+        hooked.setDonation(benefactor, donation);
+
+        uint256 count = NUDGE_SIZE - 1; // non-qualifying, so nothing legitimately leaves
+        uint256 cost = _cumulative(START_PRICE, count);
+        uint256 surplus = 500 ether;
+        uint256 a = cost + surplus;
+
+        hooked.mint(caller, a);
+        uint256 callerBefore = hooked.balanceOf(caller);
+
+        vm.startPrank(caller);
+        hooked.approve(address(s.batch), a);
+        uint256 totalPaid = s.batch.batchMint(count, recipient, a, _mins(0));
+        vm.stopPrank();
+
+        assertEq(
+            hooked.balanceOf(caller),
+            callerBefore - cost,
+            "the caller gets back their OWN unspent budget and not one wei of the benefactor's"
+        );
+        assertEq(totalPaid, cost, "totalPaid is unaffected by money that was never theirs");
+        assertEq(
+            hooked.balanceOf(address(s.batch)),
+            donation,
+            "the donation stays behind for the next qualifying claimant, like any other donate-forward"
+        );
+        assertEq(hooked.balanceOf(recipient), 0, "non-qualifying: no payout");
     }
 
     // ================================================================ //

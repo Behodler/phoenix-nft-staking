@@ -119,9 +119,9 @@ event NudgeTokenWhitelistChanged(address indexed token, bool allowed);
 `NudgePaid(recipient, token, amount)` is emitted **once per token actually
 transferred** (its signature is already per-token, so no ABI change).
 
-`minRewards.length` must equal the FULL whitelist length (including any entry
-currently equal to the derived payment token — its floor is ignored, see
-§4.1). An empty whitelist therefore demands an empty `minRewards` and the
+`minRewards.length` must equal the FULL whitelist length. **Every entry's
+floor is live, including one currently equal to the derived payment token**
+(story 029 removed the runtime skip that used to ignore it — see §4.1). An empty whitelist therefore demands an empty `minRewards` and the
 batch is a plain mint loop. `getNudgeTokens()` must be re-fetched immediately
 before every call: unwhitelisting uses swap-and-pop, which REORDERS the list.
 
@@ -148,8 +148,25 @@ The ordering below is the correctness backbone. Do not reorder.
    arrived yet, `paymentToken.balanceOf(address(this))` here is the
    uncontaminated pot, exactly as clean as any other whitelisted token's — and
    the caller's own money can never be paid back to them as a reward.
-5. `paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount)`.
-6 + 7. **Mint loop with a tracked budget.** `budget = paymentAmount`, then for
+5. **Pull, and measure what arrived.**
+   `before = paymentToken.balanceOf(address(this))`;
+   `safeTransferFrom(msg.sender, address(this), paymentAmount)`;
+   `budget = min(balanceOf(address(this)) - before, paymentAmount)`.
+
+   The credit is **measured, not quoted**. `paymentAmount` is what the caller
+   asked to send, not what the contract received: a fee-on-transfer payment
+   token credits less, and a `budget` seeded with the quote refunds more than
+   the caller ever contributed — with the difference necessarily coming out of
+   `P`. The `min` keeps the measurement one-sided, so a token with a transfer
+   callback cannot let a third party's funds land inside this window and be
+   credited to `msg.sender`.
+
+   **This is the ONLY place `balanceOf` may inform `budget`, and only as a
+   difference across this one transfer.** `P` appears in both readings and
+   cancels; `D` has not happened yet. Widen the bracket to span the mint loop
+   and the measurement swallows `D`; take a single absolute reading anywhere
+   after this point and it is the three-pool conflation of §4.1 again.
+6 + 7. **Mint loop with a tracked budget.** Starting from that `budget`, for
    each of `count` iterations: re-read `(, price,,) = configs(dispatcherIndex)`;
    revert `BatchMint__PaymentBudgetExhausted(i, price, budget)` if
    `price > budget`; `forceApprove(minter, price)`; `budget -= price`; `mint`.
@@ -161,9 +178,14 @@ The ordering below is the correctness backbone. Do not reorder.
 9. **Budget refund**: `available = paymentToken.balanceOf(address(this))`;
    `refund = min(budget, available)`; transfer it to `msg.sender` if it clears
    `DUST_THRESHOLD`; `totalPaid = paymentAmount - refund`. This is a refund of
-   the caller's UNSPENT BUDGET, **not** a balance sweep. `available` is a
-   fail-safe for fee-on-transfer / rounding shortfall only: it can lower the
-   refund, never raise it, and is never its source.
+   the caller's UNSPENT BUDGET, **not** a balance sweep. `available` is now
+   **belt-and-braces**: with `budget` measured at step 5 it is non-binding on
+   every constructible path, and it is retained only so that an unforeseen
+   shortfall degrades into a smaller refund rather than a revert. It can lower
+   the refund, never raise it, and is never its source. It is emphatically not
+   the fee-on-transfer defence — capping at the balance still lets the refund
+   reach past the caller's credit and into `P`; only measuring the credit
+   stops that.
 10. **Payout pass**: for each `i` with `snapshot[i] != 0`,
     `safeTransfer(recipient, snapshot[i])` and emit `NudgePaid`.
 
@@ -207,10 +229,15 @@ Handing back `P + (A − C) + D` as "residual" is the whole bug.
 
 **The two changes.**
 
-1. **Budget tracking (step 6+7).** `budget` starts at `paymentAmount` and is
-   decremented by the authoritative price the minter is about to charge. It is
-   the ONLY source of the refund. It never observes the pot and never observes
-   this batch's own donations.
+1. **Budget tracking (steps 5-7).** `budget` starts at what the step-5 pull
+   actually credited — `min(balance delta over that one transfer,
+   paymentAmount)` — and is decremented by the authoritative price the minter is
+   about to charge. It is the ONLY source of the refund. It never observes the
+   pot and never observes this batch's own donations. Measuring the credit
+   rather than trusting `paymentAmount` is what makes the pot-integrity claim
+   below hold for a fee-on-transfer payment token instead of merely for a
+   well-behaved one; the `min` is what stops the same measurement crediting the
+   caller with someone else's mid-transfer donation.
 2. **Absolute per-mint allowance.** The minter is approved for the EXACT price
    of the single mint it is about to make, re-asserted absolutely every
    iteration, instead of `type(uint256).max` for the whole loop. An under-funded
@@ -222,14 +249,20 @@ Handing back `P + (A − C) + D` as "residual" is the whole bug.
 | step | payment-token balance |
 |---|---|
 | after flush + snapshot (`P` captured) | `P` |
-| after pull | `P + A` |
-| after loop | `P + A − C + D` |
-| after refund of `A − C` (step 9) | `P + D` |
+| after pull of `A`, crediting `A'` | `P + A'` |
+| after loop | `P + A' − C + D` |
+| after refund of `A' − C` (step 9) | `P + D` |
 | after payout of `P` (step 10, qualifying) | `D` |
 
-- **Solvency** — the refund needs `A − C`; the balance holds
-  `P + A − C + D ≥ A − C`. Always solvent.
-- **Pot integrity** — `refund ≤ budget ≤ A`. The pot can never leave through the
+`A'` is the **credited** amount, `A' ≤ A`, and `budget = A'`. For an ordinary
+ERC20 `A' = A` and the table reads exactly as before. The distinction only
+becomes visible for a token that skims its own transfers — and there it is the
+whole ballgame, because refunding `A − C` out of a balance holding `A' − C` of
+the caller's money takes the difference from `P`.
+
+- **Solvency** — the refund needs `A' − C`; the balance holds
+  `P + A' − C + D ≥ A' − C`. Always solvent.
+- **Pot integrity** — `refund ≤ budget = A' ≤ A`. The pot can never leave through the
   refund, for any `count`, any `nudgeSize`, any dispatcher index. `totalPaid`
   consequently loses its `paymentAmount > remaining ? … : 0` floor guard:
   `paymentAmount - refund` is unconditionally safe now, and the guard's absence

@@ -76,6 +76,18 @@ import {INudgeStreamer} from "./INudgeStreamer.sol";
 /// payment token is paid out through the ordinary reward path like every other
 /// whitelisted token.
 ///
+/// `budget` is **measured across the pull, not quoted**: it is
+/// `min(balance delta over the step-5 transfer, paymentAmount)`. This is what
+/// makes the claim above unconditional rather than merely usual. Seeding it
+/// with `paymentAmount` would trust a number the token never has to honour: a
+/// fee-on-transfer payment token credits less than it is asked for, the refund
+/// then overdraws by the fee, and the only balance able to cover the difference
+/// is `P` — a non-qualifying batch shrinking the pot on every call. Measuring
+/// charges the shortfall to the caller who incurred it. The `min` keeps the
+/// measurement one-sided, so a token with a transfer callback cannot have a
+/// third party's funds land inside the pull window and be refunded to the
+/// batcher.
+///
 /// Two properties of the design, both intended:
 ///
 /// - **Permissionless top-up.** Anyone can seed the batch incentive with any
@@ -96,12 +108,14 @@ import {INudgeStreamer} from "./INudgeStreamer.sol";
 ///      beyond the mint cost and a bot snipes it, that is still correct
 ///      behaviour; the error was in the sender.
 ///
-/// The caller's UNSPENT BUDGET — `paymentAmount` minus the prices the mint loop
-/// actually charged — is refunded to `msg.sender` provided it is at least
-/// `DUST_THRESHOLD` wei. This is a budget refund, NOT a balance sweep: it is
-/// computed from a locally-tracked counter, so dispatcher-side dust, a
-/// third-party donation and the standing nudge pot are all invisible to it and
-/// none of them can leave this way. Sub-threshold surplus is intentionally left
+/// The caller's UNSPENT BUDGET — what the pull actually credited, minus the
+/// prices the mint loop actually charged — is refunded to `msg.sender` provided
+/// it is at least `DUST_THRESHOLD` wei. For an ordinary ERC20 the credit is
+/// `paymentAmount`; it is lower only for a token that skims its own transfers,
+/// and the difference is borne by the caller rather than by the pot. This is a
+/// budget refund, NOT a balance sweep: it is computed from a locally-tracked
+/// counter, so dispatcher-side dust, a third-party donation and the standing
+/// nudge pot are all invisible to it and none of them can leave this way. Sub-threshold surplus is intentionally left
 /// behind to absorb JS-side rounding noise, where it becomes part of the pot for
 /// the next qualifying claimant. A griefer who pre-deposits payment-token to
 /// this contract simply donates to that claimant.
@@ -520,8 +534,51 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
 
         uint256[] memory snapshot = _snapshotRewards(minRewards, qualifies);
 
-        // --- 5. Pull the caller's payment budget. ---
-        paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount);
+        // --- 5. Pull the caller's payment budget, and MEASURE what arrived. ---
+        //
+        // `budget` is the caller's credit, and it is the ONLY thing the refund
+        // in step 9 is allowed to draw on. It is therefore measured, not quoted:
+        //
+        //     budget = min(balanceAfterPull - balanceBeforePull, paymentAmount)
+        //
+        // THIS IS NOT THE FORBIDDEN `balanceOf` DERIVATION (see the warning at
+        // the loop below). The difference is what the reading is OF. A single
+        // absolute reading taken anywhere after step 5 sees `P + (A - C) + D` —
+        // three pools, three owners, inseparable after the fact. A DIFFERENCE of
+        // two readings taken immediately either side of ONE transfer sees only
+        // that transfer's effect: `P` is in both readings and cancels, and `D`
+        // has not happened yet. Bracketing this narrowly is the whole of the
+        // distinction; widen the brackets to span the mint loop and the
+        // measurement swallows `D` and the property is gone.
+        //
+        // - The LOWER side is why this is measured at all. `paymentAmount` is a
+        //   quote, not a receipt: a fee-on-transfer payment token credits less
+        //   than it is asked for. Trusting the quote made the refund overdraw by
+        //   the fee, and the only balance available to cover the difference is
+        //   `P`. That is a non-qualifying batch shrinking the pot, repeatably —
+        //   and where the attacker controls the token's fee sink, extracting it.
+        //   Pinned by `test_FeeOnTransferPaymentToken_potIsUntouchedWhenItHoldsThePot`.
+        //
+        // - The UPPER side — the `min` — is why the measurement is a ceiling and
+        //   not a floor. A token with a transfer callback lets a third party push
+        //   funds in DURING this call; `nonReentrant` blocks re-entering
+        //   `batchMint`, not an inbound transfer landing mid-transfer. Un-capped,
+        //   that donation would be credited to `msg.sender` and refunded to them
+        //   — `D` re-routed to the batcher, which is `ycn19h1` through a narrower
+        //   door. Capping at `paymentAmount` takes the TIGHTER of measured and
+        //   quoted, so `budget <= paymentAmount` still holds by construction and
+        //   `totalPaid = paymentAmount - refund` cannot underflow. Pinned by
+        //   `test_DonationDuringPullCannotInflateBudget`.
+        //
+        // Block-scoped: `batchMint` is at the legacy code generator's stack
+        // limit and only `budget` may survive.
+        uint256 budget;
+        {
+            uint256 heldBeforePull = paymentToken.balanceOf(address(this));
+            paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount);
+            uint256 credited = paymentToken.balanceOf(address(this)) - heldBeforePull;
+            budget = credited < paymentAmount ? credited : paymentAmount;
+        }
 
         // --- 6 + 7. Mint loop, allowance held at the EXACT next mint price. ---
         //
@@ -537,6 +594,16 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         // `P + (A - C) + D`, three pools with three different owners, and no
         // reordering can separate them after the fact.
         //
+        // The one permitted use of `balanceOf` for `budget` is the step-5 pull
+        // bracket above, and ONLY there: a difference across a single transfer
+        // measures that transfer, whereas any reading from here on measures the
+        // conflation. In particular DO NOT bracket this loop the same way. The
+        // mints themselves generate `D` (the dispatcher donates back per mint),
+        // so a delta taken around an iteration reads `-price + D` and credits
+        // the caller with the next claimant's money. The loop decrements by the
+        // price the minter is about to charge, which is the caller's outflow and
+        // nothing else.
+        //
         // The price MUST be re-read every iteration. `NFTMinterV2._executeMint`
         // charges exactly `config.price` and THEN ramps it by
         // `growthBasisPoints`, so a pre-mint `configs()` read returns exactly
@@ -551,7 +618,6 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         // allowance-decrement behaviour at all — pinned by
         // `test_NonDecrementingAllowanceToken_refundUnaffected` and
         // `test_ApprovalIsAbsoluteNotDelta`.
-        uint256 budget = paymentAmount;
         for (uint256 i; i < count; ++i) {
             (, uint256 price,,) = INFTMinterV2(address(nftMinter)).configs(_dispatcherIndex);
             if (price > budget) revert BatchMint__PaymentBudgetExhausted(i, price, budget);
@@ -575,12 +641,21 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         // Two ordering constraints hold this function up, not one.
         //
         // `refund <= paymentAmount` HOLDS BY CONSTRUCTION, because `budget`
-        // starts at `paymentAmount` and only ever decreases. The `available`
-        // cap is a fail-safe for fee-on-transfer / rounding shortfall ONLY: it
-        // can lower the refund, never raise it, and is never the source.
+        // starts at no more than `paymentAmount` (step 5 takes the tighter of
+        // the credited and the quoted amount) and only ever decreases.
         //
-        // Solvency is likewise structural: the refund needs `A - C` and the
-        // balance holds `P + (A - C) + D`, which is never smaller.
+        // The `available` cap is BELT-AND-BRACES, not a mechanism. Step 5 used
+        // to trust `paymentAmount`, which made this cap the only thing standing
+        // between a fee-on-transfer shortfall and the pot — and it was standing
+        // in the wrong place, because capping at the balance still lets the
+        // refund reach past the caller's credit and into `P`. Now that `budget`
+        // is measured, the cap is non-binding on every path we can construct;
+        // it is retained only so an unforeseen shortfall degrades into a smaller
+        // refund rather than a revert. It can lower the refund, never raise it,
+        // and is never its source.
+        //
+        // Solvency is likewise structural: the refund needs `credited - C` and
+        // the balance holds `P + (credited - C) + D`, which is never smaller.
         {
             uint256 available = paymentToken.balanceOf(address(this));
             uint256 refund = budget > available ? available : budget;
