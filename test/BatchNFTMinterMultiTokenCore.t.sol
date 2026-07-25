@@ -258,7 +258,19 @@ contract BatchNFTMinterMultiTokenCoreTest is Test {
         assertEq(payToken.balanceOf(address(batch)), dust, "dust retained in helper");
     }
 
-    function test_batchMint_donationToHelperFlowsToCaller() public {
+    /// @dev Story-029 inverted this. The refund is now the caller's UNSPENT
+    ///      BUDGET, computed from a locally-tracked counter, not a sweep of
+    ///      `paymentToken.balanceOf(address(this))`. A third-party donation of
+    ///      payment token is therefore NOT the caller's money and does not come
+    ///      back to them as a windfall — it stays behind as pot, exactly as a
+    ///      donation of any other token does.
+    ///
+    ///      This test previously asserted the windfall (`callerBefore - expected
+    ///      + donation`). That behaviour was the mechanism behind
+    ///      yield-claim-nft `ycn19h1`: once the payment token was also a nudge
+    ///      token, "donation" included the entire standing nudge pot, and a
+    ///      `count = 1` batch paying one wei collected it.
+    function test_batchMint_donationToHelperStaysForTheNextClaimant() public {
         uint256 N = 3;
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
         uint256 donation = 100 ether;
@@ -270,14 +282,19 @@ contract BatchNFTMinterMultiTokenCoreTest is Test {
         uint256 callerBefore = payToken.balanceOf(caller);
 
         vm.prank(caller);
-        batch.batchMint(N, recipient, expected, new uint256[](0));
+        uint256 totalPaid = batch.batchMint(N, recipient, expected, new uint256[](0));
 
         assertEq(
             payToken.balanceOf(caller),
-            callerBefore - expected + donation,
-            "caller receives the donor's tokens as a windfall"
+            callerBefore - expected,
+            "caller is charged exactly the cumulative price and refunded exactly the unspent budget (zero here)"
         );
-        assertEq(payToken.balanceOf(address(batch)), 0, "helper drained after sweep");
+        assertEq(
+            payToken.balanceOf(address(batch)),
+            donation,
+            "a third-party donation is NOT the caller's budget and must stay behind as pot"
+        );
+        assertEq(totalPaid, expected, "totalPaid is the cumulative charge");
     }
 
     // ----------------------------------------------------------------

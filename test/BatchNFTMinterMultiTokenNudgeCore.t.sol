@@ -361,10 +361,16 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
     }
 
     // ----------------------------------------------------------------
-    // Nudge before refund sweep ordering / event coexistence
+    // Budget refund and nudge payout coexist
+    //
+    // Story-029 SWAPPED these two steps: the caller's unspent budget is
+    // refunded at step 9 and the nudge is paid at step 10, so a payout can
+    // never be funded out of a refund that is owed, and vice versa. The
+    // assertions below are order-agnostic on purpose — they pin that both
+    // transfers happen, in the right assets, to the right parties.
     // ----------------------------------------------------------------
 
-    function test_batchMint_paysNudgeBeforeRefundSweep() public {
+    function test_batchMint_refundsBudgetAndPaysNudge() public {
         _enableNudgeFeature(NUDGE_SIZE);
 
         uint256 N = NUDGE_SIZE;
@@ -376,8 +382,9 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
         uint256 callerPayBefore = payToken.balanceOf(caller);
         uint256 recipientNudgeBefore = nudgeToken.balanceOf(recipient);
 
-        // Both events should fire — ordering is implementation detail
-        // covered by the inline natspec; assert both are emitted.
+        // Both transfers must happen. The step order (refund at 9, payout at 10)
+        // is covered by the inline NatSpec's ORDER IS LOAD-BEARING note; here we
+        // assert only that the nudge event fires and both assets land correctly.
         vm.expectEmit(true, true, true, true, address(batch));
         emit NudgePaid(recipient, address(nudgeToken), NUDGE_FUNDED_AMOUNT);
 
@@ -580,8 +587,11 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
     //   (a) a DispatcherNotConfigured test (index 0 AND zero-dispatcher), and
     //   (b) a derived-token assertion that the funded prime token is what
     //       moves, proving a wrong/zero payment asset cannot drain the pot.
-    // The nudge-token == prime-token config invariant (dust-sweep vector) is
-    // retained as a deploy-time check that owner misconfiguration reverts.
+    // The nudge-token == prime-token admin check is retained as a deploy-time
+    // check that a single whitelist call cannot create the collision. Since
+    // story-029 that is DEFENCE IN DEPTH only — the old "dust-sweep vector" it
+    // guarded against is closed at the root, because the refund is sourced from
+    // the caller's tracked budget rather than from `balanceOf`.
     // ----------------------------------------------------------------
 
     /// @dev `batchMint` reverts `BatchMint__DispatcherNotConfigured` when the

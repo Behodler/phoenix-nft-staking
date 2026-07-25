@@ -23,7 +23,7 @@ import {MockReentrantERC20} from "./mocks/MockReentrantERC20.sol";
 /// per-token `minRewards` floors, ordered to match `getNudgeTokens()`.
 ///
 /// The suite is organised by the invariant each group pins:
-///   §4.1  payment-token exclusion (admin-time revert + runtime skip)
+///   §4.1  payment token AS a nudge token: permitted and safe (story-029)
 ///   §4.2  snapshot BEFORE the mint loop ("donate forward")
 ///   §4.3  reentrancy guard
 ///   §4.4  fee-on-transfer is documented, not defended
@@ -156,12 +156,34 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     }
 
     // ================================================================ //
-    // §4.1 — payment-token exclusion (admin-time revert + runtime skip)
+    // §4.1 — payment token AS a nudge token: permitted and SAFE (story-029)
+    //
+    // This group used to pin a two-part "payment-token exclusion": an
+    // admin-time revert plus a runtime SKIP in the snapshot loop. The runtime
+    // half was falsified by yield-claim-nft submission `ycn19h1` — skipping the
+    // entry kept the payment token out of the PAYOUT but not out of the
+    // step-10 balance sweep, so the whole nudge pot left to any `count = 1`
+    // caller who paid one wei. The skip is gone. The payment token is now
+    // snapshotted, floor-checked and paid out like every other whitelisted
+    // token, and the refund derives from a tracked `budget` instead of a
+    // balance, which is what makes the collision safe rather than merely
+    // forbidden.
+    //
+    // The admin-time revert is RETAINED as defence in depth only (see
+    // `BatchMint__RewardTokenIsPaymentToken`), so the collision is still
+    // reached the way it is reached in production: the owner repoints
+    // `tokenMinter`/`dispatcherIndex` out from under an existing entry.
     // ================================================================ //
 
-    /// @dev 1. The derived payment token can never be WHITELISTED — the
-    ///      collision is rejected at admin time, before it could ever reach
-    ///      a mint. (The full admin-suite lives in
+    /// @dev 1. `setNudgeTokenWhitelist` still refuses the CURRENT derived
+    ///      payment token. This is now DEFENCE IN DEPTH, not a safety
+    ///      requirement: `batchMint` is safe with the payment token on the
+    ///      whitelist (tests 2-4 below prove it), and the owner can put it
+    ///      there anyway by repointing the dispatcher. The check only stops a
+    ///      single whitelist call from creating the collision by accident, so
+    ///      the admin-time surface and the runtime surface move in separate
+    ///      releases. Removing it would not weaken any invariant this suite
+    ///      pins. (The full admin-suite lives in
     ///      `BatchNFTMinterMultiTokenNudgeCore.t.sol`; this is the §4.1
     ///      anchor.)
     function test_RevertWhen_WhitelistingPaymentToken() public {
@@ -176,13 +198,18 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         assertEq(batch.getNudgeTokens().length, 0, "payment token never lands on the whitelist");
     }
 
-    /// @dev 2. Runtime skip: the owner whitelists token A while the payment
+    /// @dev 2. Runtime collision: the owner whitelists token A while the payment
     ///      token is P, then repoints the dispatcher so A BECOMES the derived
-    ///      payment token. batchMint must not brick — it SKIPS the stale
-    ///      whitelist entry (no snapshot, no payout, its minReward ignored)
-    ///      and pays the remaining entries normally. A's balance follows the
-    ///      normal payment-token dust-sweep path instead.
-    function test_RuntimePaymentTokenCollisionIsSkippedNotReverted() public {
+    ///      payment token. `batchMint` must neither brick NOR skip — A is
+    ///      snapshotted before the caller's budget arrives (so the reading is the
+    ///      uncontaminated pot), floor-checked, and PAID OUT to `recipient` like
+    ///      every other whitelisted token. The caller receives only their unspent
+    ///      budget, which here is zero.
+    ///
+    ///      This test previously asserted the opposite on both counts: that the
+    ///      recipient got nothing and that A's pot swept back to `msg.sender`.
+    ///      That was `ycn19h1`, written down as expected behaviour.
+    function test_RuntimePaymentTokenCollisionIsPaidNotSkipped() public {
         _whitelist(address(rewardA));
         _whitelist(address(rewardB));
         _fundPots();
@@ -198,28 +225,92 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         rewardA.approve(address(batch), cost);
         uint256 callerABefore = rewardA.balanceOf(caller);
 
-        // minRewards[0] (rewardA's slot) is an impossible floor — it MUST be
-        // ignored because the entry is skipped. minRewards[1] (rewardB) is
-        // honoured as usual.
         vm.prank(caller);
-        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(type(uint256).max, 0));
+        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(POT_A, POT_B));
 
-        assertEq(rewardA.balanceOf(recipient), 0, "skipped entry pays nothing to the recipient");
+        assertEq(rewardA.balanceOf(recipient), POT_A, "the colliding entry is PAID, not skipped");
         assertEq(rewardB.balanceOf(recipient), POT_B, "non-colliding entry still pays in full");
-        // The pre-existing rewardA pot is now PAYMENT-token balance and takes
-        // the documented donation/dust-sweep path back to msg.sender.
         assertEq(
             rewardA.balanceOf(caller),
-            callerABefore - cost + POT_A,
-            "colliding token's balance follows the payment-token sweep, not the nudge payout"
+            callerABefore - cost,
+            "the pot is NOT the caller's money: they are charged the cumulative price and refunded nothing"
         );
-        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "batch stays live despite the collision");
+        assertEq(rewardA.balanceOf(address(batch)), 0, "pot fully delivered to the recipient");
+        assertEq(totalPaid, cost, "totalPaid is the cumulative charge");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "batch stays live under the collision");
     }
 
-    /// @dev 3. The runtime skip is unconditional on qualification: a
-    ///      sub-threshold batch with a colliding whitelist entry also
-    ///      succeeds (snapshot pinned to 0, floor of 0 passes).
-    function test_RuntimeSkipAlsoAppliesBelowThreshold() public {
+    /// @dev 2b. The colliding entry's `minRewards[i]` floor is LIVE, where the
+    ///      skip used to ignore it entirely. An impossible floor on slot 0 now
+    ///      reverts before anything is pulled — a strict improvement, and the
+    ///      reason `batchMint`'s `minRewards` NatSpec loses its "whose floor is
+    ///      ignored" clause.
+    function test_RuntimePaymentTokenCollisionFloorIsLive() public {
+        _whitelist(address(rewardA));
+        _whitelist(address(rewardB));
+        _fundPots();
+
+        dispatcher.setPrimeToken(address(rewardA));
+        nftMinter.setPrimeToken(DISPATCHER_INDEX, address(rewardA));
+
+        uint256 cost = _costNow(NUDGE_SIZE);
+        rewardA.mint(caller, cost);
+        vm.prank(caller);
+        rewardA.approve(address(batch), cost);
+
+        vm.prank(caller);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector,
+                address(rewardA),
+                type(uint256).max,
+                POT_A
+            )
+        );
+        batch.batchMint(NUDGE_SIZE, recipient, cost, _mins(type(uint256).max, 0));
+
+        assertEq(rewardA.balanceOf(address(batch)), POT_A, "floor breach rolled the whole batch back");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), 0, "nothing minted");
+    }
+
+    /// @dev 3. Below the threshold the colliding entry behaves exactly like
+    ///      every other entry: snapshot pinned to `0`, nothing paid — and,
+    ///      crucially, the pot STAYS. It used to sweep to `msg.sender`, which is
+    ///      the `ycn19h1` extraction in its purest form (a non-qualifying batch
+    ///      taking pot-sized value).
+    function test_RuntimeCollisionBelowThresholdKeepsThePot() public {
+        _whitelist(address(rewardA));
+        _fundPots();
+
+        dispatcher.setPrimeToken(address(rewardA));
+        nftMinter.setPrimeToken(DISPATCHER_INDEX, address(rewardA));
+
+        uint256 below = NUDGE_SIZE - 1;
+        uint256 cost = _costNow(below);
+        uint256 surplus = 5e6;
+        rewardA.mint(caller, cost + surplus);
+        vm.prank(caller);
+        rewardA.approve(address(batch), cost + surplus);
+        uint256 callerABefore = rewardA.balanceOf(caller);
+
+        vm.prank(caller);
+        uint256 totalPaid = batch.batchMint(below, recipient, cost + surplus, _mins(0));
+
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), below, "sub-threshold batch minted under the collision");
+        assertEq(rewardA.balanceOf(recipient), 0, "nothing paid below threshold");
+        assertEq(
+            rewardA.balanceOf(address(batch)),
+            POT_A,
+            "POT INTEGRITY: a non-qualifying batch must leave the pot exactly where it was"
+        );
+        assertEq(rewardA.balanceOf(caller), callerABefore - cost, "caller is refunded their surplus and nothing more");
+        assertEq(totalPaid, cost, "totalPaid is the cumulative charge");
+    }
+
+    /// @dev 3b. Below the threshold the floor is live too: `available` is `0`
+    ///      for every entry, so any non-zero floor reverts rather than being
+    ///      silently ignored for the colliding slot.
+    function test_RuntimeCollisionBelowThresholdFloorIsLive() public {
         _whitelist(address(rewardA));
         _fundPots();
 
@@ -233,16 +324,22 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         rewardA.approve(address(batch), cost);
 
         vm.prank(caller);
-        batch.batchMint(below, recipient, cost, _mins(type(uint256).max));
-
-        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), below, "sub-threshold batch minted despite collision");
-        assertEq(rewardA.balanceOf(recipient), 0, "nothing paid below threshold");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BatchNFTMinterMultiToken.BatchMint__RewardBelowMinimum.selector, address(rewardA), 1, 0
+            )
+        );
+        batch.batchMint(below, recipient, cost, _mins(1));
     }
 
     /// @dev 4. Sub-threshold payment-token dust left by a prior batch is not
-    ///      claimable as "reward" — the payment token cannot be whitelisted —
-    ///      and it continues to be swept by the normal dust mechanism.
-    function test_PaymentTokenDustNotClaimableAsReward() public {
+    ///      claimable by the NEXT caller either. It used to be swept out
+    ///      alongside that caller's own surplus (`surplus + dust`); the refund is
+    ///      now budget-sourced, so the caller gets back exactly their own
+    ///      unspent budget and the dust stays behind as pot. Sub-threshold
+    ///      residue accrues in the protocol's favour, which is what the
+    ///      `DUST_THRESHOLD` floor was for all along.
+    function test_PaymentTokenDustIsNotSweptIntoTheRefund() public {
         _whitelist(address(rewardA));
         _fundPots();
 
@@ -265,8 +362,9 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         batch.setNudgeTokenWhitelist(address(payToken), true);
         assertEq(payToken.balanceOf(address(batch)), dust, "dust survives the attempted whitelist");
 
-        // It is still swept normally by a batch that leaves a supra-threshold
-        // surplus: the sweep pays out `dust + surplus` to msg.sender.
+        // A later batch with a supra-threshold surplus gets back its OWN unspent
+        // budget and nothing else. The prior batch's dust is not part of that
+        // budget, so it is left where it is.
         uint256 surplus = 5 ether;
         uint256 cost2 = _costNow(NUDGE_SIZE);
         _fund(caller2, cost2 + surplus);
@@ -274,11 +372,9 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         vm.prank(caller2);
         uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost2 + surplus, _mins(0));
 
-        assertEq(payToken.balanceOf(address(batch)), 0, "dust swept with the surplus");
-        assertEq(
-            payToken.balanceOf(caller2), caller2Before - cost2 + dust, "caller receives surplus plus the prior dust"
-        );
-        assertEq(totalPaid, (cost2 + surplus) - (surplus + dust), "totalPaid nets out the swept dust");
+        assertEq(payToken.balanceOf(address(batch)), dust, "the prior batch's dust is NOT the next caller's money");
+        assertEq(payToken.balanceOf(caller2), caller2Before - cost2, "caller receives exactly their own unspent budget");
+        assertEq(totalPaid, cost2, "totalPaid is the cumulative charge, not net of someone else's dust");
     }
 
     // ================================================================ //

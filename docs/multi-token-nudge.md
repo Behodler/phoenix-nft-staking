@@ -101,11 +101,12 @@ Removed (vs the story-022 caller-selected shape):
 Retained unchanged:
 - `nudgeSize`, `setNudgeSize`, `NudgeSizeChanged`
 - `tokenMinter`, `dispatcherIndex` and their setters
-- pauser wiring, `rescueERC20`, `DUST_THRESHOLD` refund sweep
+- pauser wiring, `rescueERC20`, `DUST_THRESHOLD` refund threshold
 
 Added:
 ```solidity
-error BatchMint__RewardTokenIsPaymentToken(address token); // admin-time (story 025)
+error BatchMint__RewardTokenIsPaymentToken(address token); // admin-time (story 025; defence in depth only since story 029)
+error BatchMint__PaymentBudgetExhausted(uint256 mintIndex, uint256 price, uint256 remaining); // story 029
 error BatchMint__ArrayLengthMismatch(uint256 tokensLength, uint256 minsLength);
 error BatchMint__RewardBelowMinimum(address token, uint256 minReward, uint256 actualReward);
 // story 025 whitelist admin:
@@ -133,58 +134,158 @@ The ordering below is the correctness backbone. Do not reorder.
 2. Resolve `tokenMinter`, `dispatcherIndex`, `dispatcher`, and derive
    `paymentToken = dispatcher.primeToken()`.
 3. Compute `qualifies = (nudgeSize != 0 && count >= nudgeSize)`.
-4. **Pre-loop snapshot pass** over the whitelist, in storage order:
-   - if the element equals `paymentToken`, `continue` — runtime SKIP, no
-     revert: the entry's snapshot stays 0 and its `minRewards[i]` is ignored
-     (see §4.1 for why this is a skip rather than a revert);
+4. **Pre-loop snapshot pass** over the whitelist, in storage order. **No
+   element is skipped** — including one equal to `paymentToken` (story 029,
+   §4.1):
    - `snapshot[i] = qualifies ? IERC20(token).balanceOf(address(this)) : 0`;
    - revert `BatchMint__RewardBelowMinimum` if `snapshot[i] < minRewards[i]`.
 
    Failing the floor here (before the pull) rather than after the loop is a
    pure gas improvement over the current contract; the atomic-rollback
    guarantee is identical either way.
+
+   **This pass MUST stay before step 5.** Because the caller's budget has not
+   arrived yet, `paymentToken.balanceOf(address(this))` here is the
+   uncontaminated pot, exactly as clean as any other whitelisted token's — and
+   the caller's own money can never be paid back to them as a reward.
 5. `paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount)`.
-6. `forceApprove(minter, type(uint256).max)`.
-7. Mint loop, `count` iterations.
-8. `forceApprove(minter, 0)`.
-9. **Payout pass**: for each `i` with `snapshot[i] != 0`,
-   `safeTransfer(recipient, snapshot[i])` and emit `NudgePaid`.
-10. Dust sweep of residual `paymentToken` back to `msg.sender`, unchanged.
+6 + 7. **Mint loop with a tracked budget.** `budget = paymentAmount`, then for
+   each of `count` iterations: re-read `(, price,,) = configs(dispatcherIndex)`;
+   revert `BatchMint__PaymentBudgetExhausted(i, price, budget)` if
+   `price > budget`; `forceApprove(minter, price)`; `budget -= price`; `mint`.
+   The price is re-read every iteration because the minter charges
+   `config.price` and *then* ramps it, so a pre-mint read is exactly what that
+   mint will charge. Every `forceApprove` is an ABSOLUTE target, never a delta.
+8. `forceApprove(minter, 0)` — absolute and idempotent, so it also zeroes any
+   allowance a non-decrementing token left standing after the final mint.
+9. **Budget refund**: `available = paymentToken.balanceOf(address(this))`;
+   `refund = min(budget, available)`; transfer it to `msg.sender` if it clears
+   `DUST_THRESHOLD`; `totalPaid = paymentAmount - refund`. This is a refund of
+   the caller's UNSPENT BUDGET, **not** a balance sweep. `available` is a
+   fail-safe for fee-on-transfer / rounding shortfall only: it can lower the
+   refund, never raise it, and is never its source.
+10. **Payout pass**: for each `i` with `snapshot[i] != 0`,
+    `safeTransfer(recipient, snapshot[i])` and emit `NudgePaid`.
+
+**Steps 9 and 10 were swapped in story 029** (the refund used to be step 10 and
+the payout step 9). The refund must precede the payout so that a payout can
+never be funded out of a refund that is owed, and vice versa. Two ordering
+constraints now hold `batchMint` up — snapshot-before-pull and
+refund-before-payout — where there used to be one.
 
 ## 4. Invariants and the reasoning behind them
 
-### 4.1 The payment token can never be a reward token — LOAD-BEARING
+### 4.1 The payment token MAY be a reward token — SAFE BY CONSTRUCTION (story 029)
 
-Story 025 splits this invariant into two halves:
+> **Rewritten in story 029.** This section previously asserted a two-part
+> "payment-token exclusion": an admin-time revert plus a runtime SKIP in the
+> snapshot loop, and it listed "two distinct failures the pair prevents". The
+> second of those — *perturbing the snapshot/refund accounting* — was
+> **affirmatively false**, and yield-claim-nft submission `ycn19h1` (CONDITIONAL
+> High) proved it: skipping the entry kept the payment token out of the
+> **payout** but not out of the step-10 **balance sweep**, so the entire nudge
+> pot left to any `count = 1` caller who paid one wei. 190 USDC out of a 200
+> USDC pot, repeatable on every refill. That claim, and the list containing it,
+> are deleted rather than qualified.
 
-**Admin-time revert (the write-time guard).** `setNudgeTokenWhitelist(token,
-true)` derives the payment token exactly as `batchMint` does (same
-minter/dispatcher resolution, same errors when unconfigured) and reverts
-`BatchMint__RewardTokenIsPaymentToken` if `token` equals it. Because reward
-tokens can ONLY enter via this owner-gated function, a caller can no longer
-express a payment-token/nudge-token collision at all — the story-022
-untrusted-input check on attacker-controlled addresses is gone because the
-attacker-controlled addresses are gone.
+**The construct is now permitted and safe, not forbidden.** The mechanism is a
+swap of the refund's *source of truth*, plus a bound on the minter's allowance.
 
-**Runtime skip (the drift guard).** The whitelist-time check can be
-invalidated later: the owner may repoint `tokenMinter`/`dispatcherIndex`,
-changing the derived payment token out from under an existing whitelist
-entry. The snapshot loop therefore SKIPS (`continue`, not revert) any
-whitelist element equal to the current derived payment token: its snapshot
-stays 0, its `minRewards[i]` is ignored, and nothing is paid for that slot.
-Skipping — rather than reverting — keeps `batchMint` live instead of bricking
-it until the owner notices; the payment-token balance still never enters the
-payout and instead follows the normal step-10 dust-sweep path.
+**Why the old design could not be patched by reordering.** `batchMint` already
+snapshotted before it pulled, so the *snapshot* was clean. The defect was the
+refund: derived from `paymentToken.balanceOf(address(this))`, a single number
+that after the mint loop conflates three pools no reordering can separate after
+the fact.
 
-Two distinct failures the pair prevents:
-- claiming the contract's payment-token balance (accumulated sub-threshold dust
-  from prior batches) as "reward";
-- perturbing the snapshot/refund accounting, since step 5's pull and step 10's
-  sweep both operate on `paymentToken`.
+| pool | belongs to | size |
+|---|---|---|
+| `P` — the standing nudge pot | the next qualifying batch | streamer-fed, unbounded |
+| `A − C` — unspent caller budget | `msg.sender` | ≤ `paymentAmount` |
+| `D` — this batch's own donations | the *next* claimant (§4.2) | per-batch |
+
+Handing back `P + (A − C) + D` as "residual" is the whole bug.
+
+**The two changes.**
+
+1. **Budget tracking (step 6+7).** `budget` starts at `paymentAmount` and is
+   decremented by the authoritative price the minter is about to charge. It is
+   the ONLY source of the refund. It never observes the pot and never observes
+   this batch's own donations.
+2. **Absolute per-mint allowance.** The minter is approved for the EXACT price
+   of the single mint it is about to make, re-asserted absolutely every
+   iteration, instead of `type(uint256).max` for the whole loop. An under-funded
+   batch can no longer top itself up out of the contract's balance; it reverts
+   `BatchMint__PaymentBudgetExhausted`.
+
+**Why it holds.** With `P`, `A`, `C`, `D` as above:
+
+| step | payment-token balance |
+|---|---|
+| after flush + snapshot (`P` captured) | `P` |
+| after pull | `P + A` |
+| after loop | `P + A − C + D` |
+| after refund of `A − C` (step 9) | `P + D` |
+| after payout of `P` (step 10, qualifying) | `D` |
+
+- **Solvency** — the refund needs `A − C`; the balance holds
+  `P + A − C + D ≥ A − C`. Always solvent.
+- **Pot integrity** — `refund ≤ budget ≤ A`. The pot can never leave through the
+  refund, for any `count`, any `nudgeSize`, any dispatcher index. `totalPaid`
+  consequently loses its `paymentAmount > remaining ? … : 0` floor guard:
+  `paymentAmount - refund` is unconditionally safe now, and the guard's absence
+  is the visible marker that the property holds. **Do not reinstate it.**
+- **`ycn19h1` is dead** — `count = 1` does not qualify, so the snapshot is `0`
+  and nothing is paid; the refund is `A − C`; the pot is untouched. The one-wei
+  call reverts `BatchMint__PaymentBudgetExhausted(0, price, 1)`.
+- **Donate-forward survives** — `D` arrives after the snapshot and is not part of
+  `budget`, so it stays behind for the next claimant. Unchanged for the payment
+  token and for every other whitelisted token.
+- **No self-funding** — `A` arrives after the snapshot, so it can never be paid
+  back to the caller as a reward.
+
+**Consequences accepted.**
+
+- The **runtime skip is gone.** The payment token is snapshotted, floor-checked
+  and paid out like any other whitelisted token. Its `minRewards[i]` floor is
+  now **live** instead of silently ignored — a strict improvement.
+- The **admin-time revert is retained as defence in depth only.**
+  `setNudgeTokenWhitelist` still refuses the current derived payment token, so
+  the collision cannot be created by a single whitelist call; but it can be
+  reached by repointing `tokenMinter`/`dispatcherIndex`, and `batchMint` is safe
+  when it is. The check may be removed in a later release with no change to any
+  guarantee here.
+- **Gas.** One `configs` staticcall plus one `forceApprove` SSTORE per mint,
+  replacing two SSTOREs per batch. Deliberate: this contract is a convenience
+  wrapper, not a hot path, and the cost buys token-behaviour independence.
+- **Under-quoting front-ends now revert loudly** rather than drawing silently on
+  the contract's balance. This is the intended regression, and the reason
+  `BatchMint__PaymentBudgetExhausted` carries the mint index, the price and the
+  remaining budget.
+- **Same-denomination arbitrage is accepted** (owner decision, 2026-07-25). Once
+  cost and reward share a denomination, `pot > Σ(nudgeSize mint prices)` is
+  arithmetic any bot can do in one `eth_call`. That is intended: the pot is by
+  construction a fraction of the cost of the qualifying mints, so every claim is
+  net-positive for the protocol. Making the comparison legible does not change
+  the economics.
+
+**Sub-threshold dust.** Payment-token residue below `DUST_THRESHOLD`, and any
+third-party donation of payment token, are no longer swept to the next caller.
+They are not that caller's budget, so they stay behind as pot — which is the
+correct owner for them, and which is what the `DUST_THRESHOLD` floor was
+achieving in spirit all along.
 
 ### 4.2 Snapshot BEFORE the mint loop — LOAD-BEARING, DO NOT "SIMPLIFY"
 
-Balances are read in step 4 and paid out in step 9. The gap is the mint loop.
+> **Story 029: the substance of this section is UNCHANGED.** Donate-forward
+> works exactly as it always did, and it now works for the payment token too —
+> `D` arrives after the snapshot, is not part of `budget`, and is therefore
+> neither refunded to the batcher nor paid to `recipient`. The only edits below
+> are step renumbering (the payout is step 10, not step 9) and the note that the
+> property is pinned for the colliding token as well, by
+> `test_OwnDonationsDoNotRefundToBatcher_paymentTokenArm`. Nothing about the
+> mechanism, the ordering constraint or the reasoning changed.
+
+Balances are read in step 4 and paid out in step 10. The gap is the mint loop.
 
 The dispatcher donates reward token into this contract on every mint. Reading
 balances *before* the loop means the batcher is paid only the **prior
@@ -273,7 +374,10 @@ remaining caller-side validation is length equality against the whitelist.
   real mints at the ramping price (the drain vector closed by pinning
   `tokenMinter` stays closed).
 - Whole-batch atomic rollback on a floor breach.
-- `DUST_THRESHOLD` sweep semantics and the `totalPaid` return value.
+- `DUST_THRESHOLD` semantics and the `totalPaid` return value. (Story 029
+  changed the refund's SOURCE from a balance sweep to the caller's tracked
+  budget, and `totalPaid` lost its `>` floor guard as a result — see §4.1 — but
+  the threshold behaviour and the meaning of `totalPaid` are unchanged.)
 - `whenNotPaused` on `batchMint` only; setters and `rescueERC20` stay callable
   while paused.
 
@@ -305,7 +409,12 @@ Mocks needed beyond the existing set: `MockFeeOnTransferERC20`,
 > **Story 025 note:** the plan below is the historical story-022 test plan
 > for the caller-selected model. Story 025 re-targeted the suites to the
 > whitelist API: the payment-token exclusion tests became whitelist-admin
-> reverts plus runtime-skip tests, `test_DuplicateRewardTokenFailsClosed`
+> reverts plus runtime-skip tests (**story 029 in turn replaced the runtime-skip
+> tests with the payment-token-as-nudge-token suite — see §4.1 — and added
+> `test/PoC_PaymentTokenCollision.t.sol`,
+> `test/BatchNFTMinterMultiTokenBudget.t.sol` and
+> `test/BatchNFTMinterMultiTokenBudgetInvariant.t.sol`**),
+> `test_DuplicateRewardTokenFailsClosed`
 > became `test_DuplicateNudgeTokensStructurallyImpossible` (duplicates now
 > revert at admin time), "empty arrays" became "empty whitelist", and a full
 > `setNudgeTokenWhitelist` admin suite (add/remove/swap-and-pop
