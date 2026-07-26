@@ -319,10 +319,14 @@ the caller's money takes the difference from `P`.
   remaining budget.
 - **Same-denomination arbitrage is accepted** (owner decision, 2026-07-25). Once
   cost and reward share a denomination, `pot > Σ(nudgeSize mint prices)` is
-  arithmetic any bot can do in one `eth_call`. That is intended: the pot is by
-  construction a fraction of the cost of the qualifying mints, so every claim is
-  net-positive for the protocol. Making the comparison legible does not change
-  the economics.
+  arithmetic any bot can do in one `eth_call`. That is intended, but **not**
+  because any code bound keeps the pot under the cost — none does (see §1). It
+  is accepted because the pot is funded from externally-derived yield rather
+  than from principal or user deposits, so a pot that outruns the cost is an
+  opportunity cost and deliberate marketing spend, not a value leak; and because
+  `NudgeStreamer` meters release, so the market discovers a clearing price
+  against the pot instead of racing a lump sum. Making the comparison legible
+  does not change the economics.
 
 **Sub-threshold dust.** Payment-token residue below `DUST_THRESHOLD`, and any
 third-party donation of payment token, are no longer swept to the next caller.
