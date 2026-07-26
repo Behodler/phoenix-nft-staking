@@ -101,10 +101,19 @@ import {INudgeStreamer} from "./INudgeStreamer.sol";
 ///      by anyone who qualifies.** Any balance of a whitelisted token can be
 ///      swept in full by the next caller who clears the `nudgeSize` gate. Do
 ///      not use this address as custody. Non-whitelisted tokens are inert and
-///      recoverable only via `rescueERC20`. The "honeypot" framing does not
-///      apply, because the pot is by construction a fraction of the cost of
-///      the `nudgeSize` mints required to qualify — every claim is
-///      net-positive for the protocol. If someone over-funds this contract
+///      recoverable only via `rescueERC20`.
+///
+///      The pot is intended as a subsidy funded by yield derived from
+///      protocol-owned capital, and in normal operation it is a fraction of
+///      the cost of the `nudgeSize` mints required to qualify. **That is
+///      funding policy, not a construction.** `qualifies` compares a count to
+///      `nudgeSize` and nothing else — no expression in this contract relates
+///      the pot to the cost — so a pot larger than one batch's cost is
+///      claimable at a profit. That is accepted: because the pot is
+///      yield-funded rather than drawn from principal or user deposits, an
+///      over-large pot is an opportunity cost and marketing spend, not a
+///      value leak. Do not add a value-aware cap to the payout on the
+///      strength of this paragraph. If someone over-funds this contract
 ///      beyond the mint cost and a bot snipes it, that is still correct
 ///      behaviour; the error was in the sender.
 ///
