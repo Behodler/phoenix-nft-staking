@@ -653,18 +653,42 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
         // starts at no more than `paymentAmount` (step 5 takes the tighter of
         // the credited and the quoted amount) and only ever decreases.
         //
-        // The `available` cap is BELT-AND-BRACES, not a mechanism. Step 5 used
-        // to trust `paymentAmount`, which made this cap the only thing standing
-        // between a fee-on-transfer shortfall and the pot — and it was standing
-        // in the wrong place, because capping at the balance still lets the
-        // refund reach past the caller's credit and into `P`. Now that `budget`
-        // is measured, the cap is non-binding on every path we can construct;
-        // it is retained only so an unforeseen shortfall degrades into a smaller
-        // refund rather than a revert. It can lower the refund, never raise it,
-        // and is never its source.
+        // The `available` cap is BELT-AND-BRACES, not a mechanism, and it is
+        // NARROWER than it looks. Be precise about what it can and cannot do.
         //
-        // Solvency is likewise structural: the refund needs `credited - C` and
-        // the balance holds `P + (credited - C) + D`, which is never smaller.
+        //   - It is NON-BINDING TODAY, on every constructible path. `budget <=
+        //     credited` (the step-5 `min`) and `available >= credited - C >=
+        //     budget`, so `refund == budget` always. It is a dead branch,
+        //     deliberately retained.
+        //   - It is DEFENCE-IN-DEPTH against an erosion mechanism this contract
+        //     does not currently face: something that shrinks our payment-token
+        //     holdings between the step-5 pull and this line — a negative-rebase
+        //     prime token being the obvious candidate. Against that, and only
+        //     that, it degrades the refund instead of reverting.
+        //   - It CANNOT degrade a shortfall in the CALLER'S OWN CREDIT, and an
+        //     earlier version of this comment wrongly claimed it could.
+        //     `available` is an ABSOLUTE balance read: `P + (credited - C) + D`.
+        //     A caller-credit shortfall cannot make it bind until the standing
+        //     pot `P` and this batch's donations `D` have already been consumed
+        //     in full — i.e. in exactly the scenario that claim names, the
+        //     shortfall is absorbed by the pot, not by the refund. A cap that
+        //     behaved as claimed would have to be caller-scoped, and no
+        //     caller-scoped quantity survives past the step-5 block.
+        //
+        // It can lower the refund, never raise it, and is never its source.
+        //
+        // DURABLE RESIDUAL — `budget` is a ONE-SHOT MEASUREMENT, pinned in the
+        // step-5 block and never re-validated. Any erosion of this contract's
+        // payment-token holdings AFTER that point is therefore charged to the
+        // pot, silently: `budget` still reflects the pre-erosion credit, the
+        // refund pays out at that figure, and `P` covers the difference. This
+        // needs no exotic construction — a negative-rebase prime token
+        // suffices. The `available` cap does not close this; it only stops the
+        // resulting overdraw from reverting once `P` and `D` are exhausted.
+        //
+        // Solvency in the ordinary case is structural: the refund needs
+        // `credited - C` and the balance holds `P + (credited - C) + D`, which
+        // is never smaller.
         {
             uint256 available = paymentToken.balanceOf(address(this));
             uint256 refund = budget > available ? available : budget;
