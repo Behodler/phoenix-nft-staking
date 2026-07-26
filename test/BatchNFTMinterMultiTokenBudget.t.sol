@@ -642,6 +642,81 @@ contract BatchNFTMinterMultiTokenBudgetTest is Test {
         assertEq(hooked.balanceOf(recipient), 0, "non-qualifying: no payout");
     }
 
+    /// @dev The SECOND, less obvious obligation of the SAME `min`: it is what
+    ///      keeps `totalPaid = paymentAmount - refund` in step 9 from
+    ///      underflowing.
+    ///
+    ///      That subtraction is BARE. At `d75229d` it read
+    ///      `paymentAmount > remaining ? paymentAmount - remaining : 0`; story
+    ///      029 removed the guard deliberately, and commit `0318089` §3.3 names
+    ///      its ABSENCE as the marker of the fix. The removal is safe SOLELY
+    ///      because `refund <= budget <= paymentAmount`, and the right-hand
+    ///      inequality is established by the step-5 `min` and nowhere else.
+    ///
+    ///      `test_DonationDuringPullCannotInflateBudget` above pins obligation
+    ///      1 (donation routing) but would still pass under a `min` relaxed
+    ///      just far enough to break this one, because it never stages a
+    ///      donation LARGER than the cumulative charge. This test does. With
+    ///      the cap removed, the counterfactual refund is
+    ///      `paymentAmount + donation - cost`, which exceeds `paymentAmount`
+    ///      exactly when `donation > cost`, and step 9 reverts with an
+    ///      arithmetic underflow instead of returning. A future author who
+    ///      relaxes the cap to a floor, or substitutes the measured `credited`
+    ///      on the grounds that measuring is strictly more honest, turns every
+    ///      such batch into an unconditional DoS.
+    function test_MinIsLoadBearing_totalPaidCannotUnderflow() public {
+        MockDonatingOnPullERC20 hooked = new MockDonatingOnPullERC20("Hooked", "HOOK");
+        Stack memory s = _isolatedStack(address(hooked));
+
+        uint256 count = NUDGE_SIZE - 1; // non-qualifying: no payout to confound the arithmetic
+        uint256 cost = _cumulative(START_PRICE, count);
+        uint256 surplus = 500 ether;
+        uint256 paymentAmount = cost + surplus;
+
+        // The donation must EXCEED the cumulative charge — that is precisely
+        // the condition under which an uncapped `credited` drives the refund
+        // past `paymentAmount`.
+        uint256 donation = cost * 3;
+        address benefactor = makeAddr("underflowBenefactor");
+        hooked.mint(benefactor, donation);
+        hooked.setDonation(benefactor, donation);
+
+        // TRIPWIRE: the donation really is larger than the charge, so this
+        // fixture really does stage the underflow and not a milder shape.
+        assertGt(donation, cost, "TRIPWIRE: donation must exceed the cumulative charge to stage the underflow");
+
+        // TRIPWIRE: the counterfactual — `budget` taken as the measured
+        // `credited`, uncapped — really would make step 9 subtract more than
+        // `paymentAmount`. This is the arithmetic the `min` is preventing.
+        uint256 uncappedRefund = (paymentAmount + donation) - cost;
+        assertGt(
+            uncappedRefund, paymentAmount, "TRIPWIRE: without the min, step 9 would subtract more than paymentAmount"
+        );
+
+        hooked.mint(caller, paymentAmount);
+        uint256 callerBefore = hooked.balanceOf(caller);
+
+        vm.startPrank(caller);
+        hooked.approve(address(s.batch), paymentAmount);
+        // Does NOT revert: the `min` clamps `budget` to `paymentAmount`, so the
+        // bare subtraction below stays in range.
+        uint256 totalPaid = s.batch.batchMint(count, recipient, paymentAmount, _mins(0));
+        vm.stopPrank();
+
+        uint256 refundDelivered = hooked.balanceOf(caller) + paymentAmount - callerBefore;
+
+        assertLe(refundDelivered, paymentAmount, "refund <= paymentAmount is what makes the bare subtraction safe");
+        assertEq(refundDelivered, surplus, "the refund is the caller's own unspent budget, not the benefactor's money");
+        assertEq(
+            totalPaid, paymentAmount - refundDelivered, "totalPaid is the bare subtraction, evaluated without underflow"
+        );
+        assertEq(totalPaid, cost, "and it equals the cumulative charge");
+        assertEq(
+            hooked.balanceOf(address(s.batch)), donation, "the over-large donation stays behind as pot, uncredited"
+        );
+        assertEq(hooked.balanceOf(recipient), 0, "non-qualifying: no payout");
+    }
+
     // ================================================================ //
     // Boundaries (plan §8.10 - §8.11)
     // ================================================================ //

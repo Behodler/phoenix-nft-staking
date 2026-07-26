@@ -586,6 +586,27 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
             uint256 heldBeforePull = paymentToken.balanceOf(address(this));
             paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount);
             uint256 credited = paymentToken.balanceOf(address(this)) - heldBeforePull;
+            // The `min` below carries TWO INDEPENDENT OBLIGATIONS. Both must
+            // survive any future edit; satisfying one does not satisfy the other.
+            //
+            //   1. DONATION ROUTING. A transfer landing inside the pull window
+            //      must not be credited to `msg.sender` and refunded to them.
+            //      See the UPPER-side discussion above. Pinned by
+            //      `test_DonationDuringPullCannotInflateBudget`.
+            //
+            //   2. UNDERFLOW SAFETY IN STEP 9. `totalPaid = paymentAmount -
+            //      refund` is BARE — no floor guard. At `d75229d` it read
+            //      `paymentAmount > remaining ? paymentAmount - remaining : 0`;
+            //      story 029 removed that guard deliberately, and commit
+            //      `0318089` §3.3 names its ABSENCE as the marker of the fix.
+            //      The removal is safe SOLELY because `refund <= budget <=
+            //      paymentAmount`, and the right-hand inequality is established
+            //      here and nowhere else. Relax this cap to a floor, or
+            //      substitute the measured `credited` on the reasoning that
+            //      measuring is strictly more honest, and step 9 underflows and
+            //      reverts — an unconditional DoS on every fee-crediting-over
+            //      path. Pinned by
+            //      `test_MinIsLoadBearing_totalPaidCannotUnderflow`.
             budget = credited < paymentAmount ? credited : paymentAmount;
         }
 
