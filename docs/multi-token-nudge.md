@@ -220,7 +220,7 @@ refund-before-payout — where there used to be one.
 
 ## 4. Invariants and the reasoning behind them
 
-### 4.1 The payment token MAY be a reward token — SAFE BY CONSTRUCTION (story 029)
+### 4.1 The payment token MAY be a reward token — refund path safe by construction (story 029)
 
 > **Rewritten in story 029.** This section previously asserted a two-part
 > "payment-token exclusion": an admin-time revert plus a runtime SKIP in the
@@ -233,8 +233,13 @@ refund-before-payout — where there used to be one.
 > USDC pot, repeatable on every refill. That claim, and the list containing it,
 > are deleted rather than qualified.
 
-**The construct is now permitted and safe, not forbidden.** The mechanism is a
-swap of the refund's *source of truth*, plus a bound on the minter's allowance.
+**The construct is now permitted, not forbidden. The refund path is safe by
+construction; the payout path is governed by the funding policy in §1, not by a
+code bound.** The mechanism is a swap of the refund's *source of truth*, plus a
+bound on the minter's allowance. Story 029 established exactly those two
+properties — `refund <= budget <= paymentAmount`, and the minter's allowance
+held at each mint's exact price — and nothing wider. Read "safe by construction"
+in this section as scoped to them.
 
 **Why the old design could not be patched by reordering.** `batchMint` already
 snapshotted before it pulled, so the *snapshot* was clean. The defect was the
