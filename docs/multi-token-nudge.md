@@ -339,6 +339,22 @@ They are not that caller's budget, so they stay behind as pot — which is the
 correct owner for them, and which is what the `DUST_THRESHOLD` floor was
 achieving in spirit all along.
 
+**Sub-threshold dust — disclosure.** Two consequences of that rule are worth
+stating plainly, because neither is visible from the return value. First, a
+sub-threshold refund is dropped **whole**, not trimmed: the `else` arm sets
+`totalPaid = paymentAmount`, so the contract reports the caller spent their
+entire `paymentAmount` when in fact `paymentAmount - cost` stayed behind. An
+integrator reconciling `totalPaid` against an observed balance delta therefore
+gets no signal that a forfeiture happened — the two figures simply disagree, by
+an amount the caller cannot recover. Second, `DUST_THRESHOLD = 1e6` is a raw-wei
+constant, and the NatSpec at the declaration describes it in 18-decimal terms
+("~10^-12 of a unit"). On a **6-decimal** prime token — which `NudgeRatchet`'s
+constructor *requires* — `1e6` is very nearly one whole token, not dust in that
+sense at all. The forfeiture is triaged **won't-fix** (dust shuffling between
+the caller and the next claimant is acceptable, and the residue lands with the
+pot, which is the right owner); this paragraph is the disclosure half only, and
+nothing about the behaviour changes.
+
 ### 4.2 Snapshot BEFORE the mint loop — LOAD-BEARING, DO NOT "SIMPLIFY"
 
 > **Story 029: the substance of this section is UNCHANGED.** Donate-forward
