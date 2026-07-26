@@ -53,11 +53,34 @@ that lands on the contract is now simply `rescueERC20` territory.)
 
 ### Why the "honeypot" framing does not apply
 
-The pot is a *nudge*: by construction it is a fraction of the cost of the
-`nudgeSize` mints required to qualify. A bot that claims it must first pay more
-payment-token into the protocol than it extracts in reward. Every claim is
-net-positive for the protocol; there is no configuration of this mechanism
-under which claiming is profitable-in-isolation.
+The pot is a *nudge*: a subsidy funded by yield derived from protocol-owned
+capital, paid to whoever performs the `nudgeSize` qualifying mints. In normal
+operation it is a fraction of the cost of those mints.
+
+**That relation is an operating policy, not a construction.** Nothing in the
+contract compares the pot to the cost of qualifying — `qualifies`
+(`BatchNFTMinterMultiToken.sol:510`) tests `_nudgeSize != 0 && count >= _nudgeSize`
+and nothing more. It never reads `paymentAmount`, `price`, `budget` or
+`snapshot[i]`; no expression anywhere in the file relates the pot to the cost.
+The pot *can* exceed one batch's cost, and if it does, a claimant profits in
+isolation. Do not read the paragraph above as a bound the code enforces, and do
+not "fix" the code to make it one.
+
+That outcome is accepted and intended. Because the pot is funded from
+externally-derived yield rather than from principal or user deposits, an
+over-large pot is an **opportunity cost** — that yield could have gone directly
+into liquidity growth — not a loss to the protocol. It is treated as a short-run
+cost and as marketing spend: a visible profit opportunity attracts users, and
+the deficit closes as the lowest-bidding marginal user takes the mint.
+`NudgeStreamer` meters release so the market can find a clearing price against
+the pot rather than racing a lump sum. In live operation the pot has not reached
+50% of the qualifying cost before being claimed.
+
+**What the contract does guarantee** (story 029, invariant-proven at 128,000
+calls): the pot cannot leave through the refund path
+(`refund <= budget <= paymentAmount`); a non-qualifying batch takes nothing; and
+the minter's allowance is bounded at each mint's exact per-mint price. Those
+three are constructions. The pot-versus-cost relation is not.
 
 If someone erroneously over-funds the contract beyond the mint cost and a bot
 snipes it, that is still correct behaviour — the error was in the sender, not in
