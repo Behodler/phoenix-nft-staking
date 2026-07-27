@@ -73,8 +73,10 @@ into liquidity growth — not a loss to the protocol. It is treated as a short-r
 cost and as marketing spend: a visible profit opportunity attracts users, and
 the deficit closes as the lowest-bidding marginal user takes the mint.
 `NudgeStreamer` meters release so the market can find a clearing price against
-the pot rather than racing a lump sum. In live operation the pot has not reached
-50% of the qualifying cost before being claimed.
+the pot rather than racing a lump sum. *As of 2026-07, owner-reported (an
+operating observation, not a repo-verified fact and not a bound): in live
+operation the pot has not reached 50% of the qualifying cost before being
+claimed.*
 
 **What the contract does guarantee** (story 029, invariant-proven at 128,000
 calls): the pot cannot leave through the refund path
