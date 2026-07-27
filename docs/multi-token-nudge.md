@@ -469,11 +469,24 @@ first takes the entire balance of every token they list. `minRewards` protects
 the *loser* (they don't pay mint costs for a pot that was sniped) but does
 nothing to help them *win*.
 
-That is acceptable precisely because of §1: winning requires paying more into
-the protocol than the pot is worth. Bot competition here is a subsidy to the
-protocol, not an extraction from it. Per-mint accrual accounting would be the
-fix if fairness among claimants ever became a goal; it is explicitly out of
-scope.
+That is acceptable on the grounds set out in §1 — and note carefully what those
+grounds are **not**. Nothing in the contract requires a winner to pay more into
+the protocol than the pot is worth; `qualifies` tests a count and nothing else,
+so a bot that wins a pot larger than one batch's cost profits in isolation. The
+acceptance does not rest on a code-enforced bound, because there is none.
+
+It rests on the funding source and on release metering. The pot is funded from
+yield derived from protocol-owned capital, so an over-large pot paid out to a
+racing bot is an **opportunity cost** — yield that could have gone to liquidity
+growth — rather than a leak of principal or of user deposits. And `NudgeStreamer`
+meters release so the market discovers a clearing price against a stream instead
+of racing a lump sum, which is what keeps the spend near the intended subsidy
+level in practice. Both are operating policy, not construction: see §1 for what
+the contract *does* guarantee, and do not add a value-aware cap to the payout on
+the strength of this section.
+
+Per-mint accrual accounting would be the fix if fairness among claimants ever
+became a goal; it is explicitly out of scope.
 
 ## 6. Test plan (TDD — red first)
 
