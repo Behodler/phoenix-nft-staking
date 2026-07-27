@@ -653,10 +653,22 @@ contract BatchNFTMinterMultiTokenBudgetTest is Test {
     ///      because `refund <= budget <= paymentAmount`, and the right-hand
     ///      inequality is established by the step-5 `min` and nowhere else.
     ///
-    ///      `test_DonationDuringPullCannotInflateBudget` above pins obligation
-    ///      1 (donation routing) but would still pass under a `min` relaxed
-    ///      just far enough to break this one, because it never stages a
-    ///      donation LARGER than the cumulative charge. This test does. With
+    ///      This test does NOT close a coverage gap, and it must not be
+    ///      described as one. `test_DonationDuringPullCannotInflateBudget`
+    ///      above already stages `donation = 4_321 ether` against a cumulative
+    ///      charge of `4152.515625 ether`, so it too trips obligation 2:
+    ///      substituting `budget = credited` for the step-5 `min` makes BOTH
+    ///      tests panic `0x11`, verified. What that test does not do is SAY so
+    ///      — it is named, documented and asserted entirely in terms of
+    ///      donation routing, and its `donation > cost` relation is incidental
+    ///      to its fixture rather than a stated requirement of it. Someone
+    ///      retuning that fixture could drop below the charge without noticing
+    ///      they had also dropped the underflow coverage.
+    ///
+    ///      This test makes the incidental property explicit, named and
+    ///      greppable, so the obligation survives a future edit to either
+    ///      test. It asserts `donation > cost` as a `TRIPWIRE:` precondition
+    ///      rather than leaving it to arithmetic a reader has to redo. With
     ///      the cap removed, the counterfactual refund is
     ///      `paymentAmount + donation - cost`, which exceeds `paymentAmount`
     ///      exactly when `donation > cost`, and step 9 reverts with an
