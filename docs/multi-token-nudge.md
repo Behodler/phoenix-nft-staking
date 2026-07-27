@@ -59,7 +59,7 @@ operation it is a fraction of the cost of those mints.
 
 **That relation is an operating policy, not a construction.** Nothing in the
 contract compares the pot to the cost of qualifying — `qualifies`
-(`BatchNFTMinterMultiToken.sol:510`) tests `_nudgeSize != 0 && count >= _nudgeSize`
+(`BatchNFTMinterMultiToken.sol:519`) tests `_nudgeSize != 0 && count >= _nudgeSize`
 and nothing more. It never reads `paymentAmount`, `price`, `budget` or
 `snapshot[i]`; no expression anywhere in the file relates the pot to the cost.
 The pot *can* exceed one batch's cost, and if it does, a claimant profits in
