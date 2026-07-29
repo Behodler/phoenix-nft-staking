@@ -27,8 +27,10 @@ interface IMintableERC20 {
 ///
 /// The payment token IS a whitelisted nudge token in this fixture. That
 /// construct used to be forbidden at admin time and silently skipped at
-/// runtime; after story 029 it is **permitted and safe by construction**,
-/// because the refund derives from a locally-tracked `budget` — provably the
+/// runtime; story 029 deleted the runtime skip and made the construct
+/// **safe by construction**, and story 032 deleted the admin-time rejection
+/// that had been left standing as defence in depth. Safety comes from the
+/// refund deriving from a locally-tracked `budget` — provably the
 /// caller's money and nothing else — rather than from
 /// `paymentToken.balanceOf(address(this))`, which conflates three unrelated
 /// pools:
@@ -60,10 +62,21 @@ contract BatchNFTMinterMultiTokenBudgetTest is Test {
     ///      assertion about the colliding entry has a control beside it.
     MockERC20 internal rewardB;
     /// @dev Holds the dispatcher's prime slot only while `payToken` is being
-    ///      whitelisted. `setNudgeTokenWhitelist` still refuses to whitelist the
-    ///      CURRENT payment token (defence in depth, §5.1), so the collision is
-    ///      reached the way it is reached in production: the owner repoints the
-    ///      dispatcher afterwards, out from under an existing entry.
+    ///      whitelisted, so this suite reaches the collision by REPOINTING: the
+    ///      owner moves the dispatcher's prime token afterwards, out from under
+    ///      an existing whitelist entry.
+    ///
+    ///      This decoy originally existed because `setNudgeTokenWhitelist`
+    ///      refused the CURRENT payment token outright. Since story-032 it does
+    ///      not, and whitelisting `payToken` directly would work — so the decoy
+    ///      is now ONE of two ways in, not the only one. It is kept
+    ///      deliberately: repointing remains a genuine production route to the
+    ///      collision (the owner can change the derived payment token under any
+    ///      existing entry at any time), and this suite plus
+    ///      `PoC_PaymentTokenCollision.t.sol` are the only coverage of it. The
+    ///      direct-whitelist route is covered in
+    ///      `BatchNFTMinterMultiTokenNudge.t.sol` and
+    ///      `BatchNFTMinterMultiTokenNudgeCore.t.sol`.
     MockERC20 internal bootToken;
 
     address internal owner = makeAddr("batchOwner");

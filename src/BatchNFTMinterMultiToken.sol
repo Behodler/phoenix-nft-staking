@@ -88,6 +88,18 @@ import {INudgeStreamer} from "./INudgeStreamer.sol";
 /// third party's funds land inside the pull window and be refunded to the
 /// batcher.
 ///
+/// **Story-032: the admin-time rejection is gone too.** Story-029 kept
+/// `setNudgeTokenWhitelist` refusing the current derived payment token, as
+/// defence in depth, so that the admin surface and the runtime surface would
+/// move in separate releases. This is that later release: the rejection has
+/// been deleted, so `paymentToken ∈ nudgeWhitelist` is now creatable in a
+/// SINGLE owner call as well as by repointing `tokenMinter`/`dispatcherIndex`
+/// under an existing entry. Nothing above changes — the budget-sourced refund
+/// is what makes the collision safe, and it was never the admin check. A
+/// side effect worth knowing when deploying: the add branch no longer derives
+/// the payment path, so a token can be whitelisted BEFORE `setTokenMinter` and
+/// `setDispatcherIndex` are configured.
+///
 /// Two properties of the design, both intended:
 ///
 /// - **Permissionless top-up.** Anyone can seed the batch incentive with any
@@ -194,20 +206,6 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     error BatchMint__ZeroCount();
     /// @dev Reverted when `recipient == address(0)`.
     error BatchMint__ZeroRecipient();
-    /// @dev Reverted when `setNudgeTokenWhitelist` tries to whitelist the
-    ///      dispatcher's CURRENT derived payment token.
-    ///
-    ///      **DEFENCE IN DEPTH ONLY — the reason for this guard is gone.**
-    ///      Story-029 made `paymentToken ∈ nudgeWhitelist` safe by construction
-    ///      (see the contract header), and the runtime skip this used to pair
-    ///      with has been removed. The check is retained deliberately, so the
-    ///      admin-time surface and the runtime surface change in separate
-    ///      releases rather than at once: an owner who wants the collision must
-    ///      still arrive at it explicitly, by repointing
-    ///      `tokenMinter`/`dispatcherIndex`, rather than stumbling into it from
-    ///      a single whitelist call. It may be removed outright in a later
-    ///      release with no change to `batchMint`'s guarantees.
-    error BatchMint__RewardTokenIsPaymentToken(address token);
     /// @dev Reverted when `minRewards` does not cover the FULL whitelist
     ///      (`minRewards.length != getNudgeTokens().length`).
     error BatchMint__ArrayLengthMismatch(uint256 tokensLength, uint256 minsLength);
@@ -304,17 +302,23 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     /// @notice Owner-gated add/remove of a nudge-reward token. Stays callable
     ///         while paused (matches the other setters).
     ///
-    /// @dev    Adding (`allowed == true`) derives the payment token EXACTLY
-    ///         as `batchMint` does (via `_resolvePaymentPath`) and rejects
-    ///         the dispatcher's prime token. **This rejection is now defence in
-    ///         depth, not a safety requirement** — see
-    ///         `BatchMint__RewardTokenIsPaymentToken`. `batchMint` is safe with
-    ///         the payment token on the whitelist (story-029), and it can end up
-    ///         there anyway whenever the owner repoints
-    ///         `tokenMinter`/`dispatcherIndex`; this check only stops a single
-    ///         whitelist call from creating the collision by accident.
-    ///         Re-adding an existing entry and removing an absent one both
-    ///         revert loudly rather than silently no-op'ing.
+    /// @dev    Adding (`allowed == true`) rejects only the zero address and a
+    ///         duplicate entry. It performs **no payment-token derivation**:
+    ///         story-032 removed the admin-time rejection of the dispatcher's
+    ///         prime token, which story-029 had already reduced to defence in
+    ///         depth. `batchMint` is safe with the payment token on the
+    ///         whitelist because the refund is bounded by the caller's tracked
+    ///         `budget` (see the contract header), so the collision is now
+    ///         creatable in a single call as well as by repointing
+    ///         `tokenMinter`/`dispatcherIndex`. Whether to build such a
+    ///         whitelist is an operating decision for the owner; the contract
+    ///         no longer expresses an opinion about it.
+    ///
+    ///         Because nothing here reads the payment path, adding works while
+    ///         `tokenMinter`/`dispatcherIndex` are unset — symmetric with
+    ///         removal, and no longer an ordering constraint on deployment
+    ///         scripts. Re-adding an existing entry and removing an absent one
+    ///         both revert loudly rather than silently no-op'ing.
     ///
     ///         Removal is swap-and-pop (O(1)): the LAST token moves into the
     ///         removed slot, so the `getNudgeTokens()` ordering changes.
@@ -324,16 +328,6 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     function setNudgeTokenWhitelist(address token, bool allowed) external onlyOwner {
         if (allowed) {
             if (token == address(0)) revert BatchMint__ZeroNudgeToken();
-            // DEFENCE IN DEPTH, NOT A SAFETY REQUIREMENT. `batchMint` no longer
-            // depends on this being true: the refund is sourced from a tracked
-            // budget, so the pot cannot leave through it even when the payment
-            // token IS a nudge token. Removing this branch is safe; it is kept
-            // for a release or two so the admin-time surface and the runtime
-            // surface move separately.
-            (,, IERC20 paymentToken) = _resolvePaymentPath();
-            if (token == address(paymentToken)) {
-                revert BatchMint__RewardTokenIsPaymentToken(token);
-            }
             if (_nudgeTokenIndex[token] != 0) {
                 revert BatchMint__NudgeTokenAlreadyWhitelisted(token);
             }
@@ -733,14 +727,9 @@ contract BatchNFTMinterMultiToken is Ownable, Pausable, ReentrancyGuard, IPausab
     }
 
     /// @dev Shared resolution of the owner-pinned minter/dispatcher and the
-    ///      DERIVED payment token. Used by both `batchMint` (step 2) and
-    ///      `setNudgeTokenWhitelist`'s add branch, so the latter's
-    ///      defence-in-depth check is evaluated against exactly the token
-    ///      `batchMint` would derive rather than against a second, drifting
-    ///      derivation. That check is no longer load-bearing (see
-    ///      `BatchMint__RewardTokenIsPaymentToken`); sharing the resolution is
-    ///      simply the correct way to keep two readings of the same state in
-    ///      agreement.
+    ///      DERIVED payment token. Used by `batchMint` (step 2) only —
+    ///      story-032 removed the second caller, `setNudgeTokenWhitelist`'s add
+    ///      branch, along with the admin-time check it fed.
     function _resolvePaymentPath()
         private
         view

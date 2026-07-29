@@ -22,8 +22,9 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 /// admin (`setNudgeTokenWhitelist`) access control, events and swap-and-pop
 /// ordering; setter access control + events; threshold semantics (`>=`);
 /// feature-disabled paths (size-zero, empty whitelist, balance-zero); atomic
-/// rollback on inner mint revert; the admin-time `token == paymentToken`
-/// exclusion guard; and the ordering vs. the dust refund sweep.
+/// rollback on inner mint revert; the payment token being whitelistable like
+/// any other token (story-032 removed the admin-time
+/// `token == paymentToken` guard); and the ordering vs. the dust refund sweep.
 contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
     BatchNFTMinterMultiToken internal batch;
     MockITokenMinterV2 internal nftMinter;
@@ -322,33 +323,38 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
     }
 
     // ----------------------------------------------------------------
-    // Up-front token-distinctness guard
+    // Payment token as a nudge token (no admin-time guard since story 032)
     // ----------------------------------------------------------------
 
-    /// @dev Reframed for story-025 (§4.1): the exclusion moved from the
-    ///      per-call snapshot loop to WHITELIST-ADMIN TIME. The derived
-    ///      payment token can never be whitelisted, so a batch can never
-    ///      claim the payment-token balance as "reward" — the collision is
-    ///      rejected before it can ever reach a mint.
-    function test_whitelist_revertsWhenTokenIsPaymentToken() public {
+    /// @dev Story-025 moved a token-distinctness exclusion from the per-call
+    ///      snapshot loop to WHITELIST-ADMIN TIME; story-029 removed the
+    ///      runtime half and demoted the admin half to defence in depth;
+    ///      story-032 removed the admin half too. The derived payment token is
+    ///      now whitelistable like any other ERC20, in one call. What keeps the
+    ///      payment-token pot out of the caller's hands is the budget-sourced
+    ///      refund, not this call refusing to happen (§4.1).
+    function test_whitelist_acceptsPaymentToken() public {
         vm.prank(owner);
         batch.setNudgeSize(NUDGE_SIZE);
 
+        vm.expectEmit(true, true, true, true, address(batch));
+        emit NudgeTokenWhitelistChanged(address(payToken), true);
         vm.prank(owner);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
-            )
-        );
         batch.setNudgeTokenWhitelist(address(payToken), true);
 
-        assertEq(batch.getNudgeTokens().length, 0, "payment token never lands on the whitelist");
+        address[] memory tokens = batch.getNudgeTokens();
+        assertEq(tokens.length, 1, "payment token lands on the whitelist");
+        assertEq(tokens[0], address(payToken), "and it is the entry that landed");
+        assertTrue(batch.isNudgeToken(address(payToken)), "isNudgeToken agrees");
     }
 
-    /// @dev Reframed for story-025: with an empty whitelist the snapshot
-    ///      loop has zero iterations, so no exclusion logic can fire — the
-    ///      call goes through as a plain mint loop.
-    function test_batchMint_emptyWhitelistNeverTripsPaymentTokenExclusion() public {
+    /// @dev With an empty whitelist the snapshot loop has zero iterations, so
+    ///      there is nothing to snapshot, floor-check or pay — the call goes
+    ///      through as a plain mint loop. (Story-025 framed this as "no
+    ///      exclusion logic can fire"; since story-032 there is no exclusion
+    ///      left to fire in the first place, and the test is simply the
+    ///      zero-length-whitelist path.)
+    function test_batchMint_emptyWhitelistIsAPlainMintLoop() public {
         uint256 N = 2;
         uint256 expected = _expectedTotal(START_PRICE, GROWTH_BPS, N);
         _fundCaller(expected, address(batch));
@@ -587,11 +593,12 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
     //   (a) a DispatcherNotConfigured test (index 0 AND zero-dispatcher), and
     //   (b) a derived-token assertion that the funded prime token is what
     //       moves, proving a wrong/zero payment asset cannot drain the pot.
-    // The nudge-token == prime-token admin check is retained as a deploy-time
-    // check that a single whitelist call cannot create the collision. Since
-    // story-029 that is DEFENCE IN DEPTH only — the old "dust-sweep vector" it
-    // guarded against is closed at the root, because the refund is sourced from
-    // the caller's tracked budget rather than from `balanceOf`.
+    // The nudge-token == prime-token admin check that story-025 added is GONE
+    // (story-032). Story-029 had already reduced it to defence in depth, because
+    // the old "dust-sweep vector" it guarded against is closed at the root: the
+    // refund is sourced from the caller's tracked budget rather than from
+    // `balanceOf`. Note that `batchMint`'s own configuration guards below are
+    // entirely unrelated to it and are untouched.
     // ----------------------------------------------------------------
 
     /// @dev `batchMint` reverts `BatchMint__DispatcherNotConfigured` when the
@@ -676,32 +683,61 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
         assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), N, "recipient minted via pinned dispatcher");
     }
 
-    /// @dev Dust-sweep vector (incident §4), reframed for story-025: the
-    ///      only path by which the derived prime token could become a nudge
-    ///      payout — an owner whitelisting it — reverts
-    ///      `BatchMint__RewardTokenIsPaymentToken` at admin time. Neither a
-    ///      caller nor a misconfiguring owner can turn the payment-token
-    ///      balance into a claimable pot. Pot untouched.
-    function test_whitelist_derivedPrimeTokenCannotBecomeNudgePot() public {
-        // Fund the helper with payToken (the drain target).
+    /// @dev Dust-sweep vector (incident §4), rewritten for story-032.
+    ///
+    ///      Earlier revisions of this test asserted that "the only path by which
+    ///      the derived prime token could become a nudge payout — an owner
+    ///      whitelisting it — reverts at admin time", and concluded that
+    ///      "neither a caller nor a
+    ///      misconfiguring owner can turn the payment-token balance into a
+    ///      claimable pot". **That conclusion was already false when it was
+    ///      written**: the owner could repoint `tokenMinter`/`dispatcherIndex`
+    ///      and reach exactly that state under an existing whitelist entry. It
+    ///      is false twice over now that story-032 has deleted the admin-time
+    ///      revert.
+    ///
+    ///      The genuine invariant — the one that actually closed the incident,
+    ///      in story-029 — is about the refund's SOURCE, not the whitelist's
+    ///      shape: the payment-token pot, whitelisted or not, can never leave
+    ///      through the refund, because the refund is bounded by the caller's
+    ///      locally-tracked `budget`. So with the pot whitelisted, a qualifying
+    ///      batch delivers it to `recipient` as a nudge, and `msg.sender`
+    ///      receives only their own unspent budget. The `61_297674` figure is
+    ///      the real mainnet pot size the incident was reported against and is
+    ///      the point of the test.
+    function test_whitelist_derivedPrimeTokenPotPaysOutAndIsNeverRefunded() public {
         vm.prank(owner);
         batch.setNudgeSize(NUDGE_SIZE);
-        payToken.mint(address(batch), 61_297674); // the real mainnet pot size
 
-        uint256 potBefore = payToken.balanceOf(address(batch));
+        // Fund the helper with payToken — the historical drain target.
+        uint256 pot = 61_297674; // the real mainnet pot size
+        payToken.mint(address(batch), pot);
 
-        // Whitelisting the derived prime token — the only way it could ever
-        // be paid out as a nudge — reverts at admin time.
-        vm.prank(owner);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
-            )
+        // Story-032: one call, no repointing, no decoy entry.
+        _whitelist(address(payToken));
+        assertEq(batch.getNudgeTokens().length, 1, "the derived prime token IS whitelistable");
+
+        uint256 cost = _expectedTotal(START_PRICE, GROWTH_BPS, NUDGE_SIZE);
+        uint256 surplus = 7 ether; // >= DUST_THRESHOLD, so it is refunded
+        _fundCaller(cost + surplus, address(batch));
+        uint256 callerBefore = payToken.balanceOf(caller);
+        uint256 recipientBefore = payToken.balanceOf(recipient);
+
+        vm.expectEmit(true, true, true, true, address(batch));
+        emit NudgePaid(recipient, address(payToken), pot);
+
+        vm.prank(caller);
+        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost + surplus, _mins1(0));
+
+        assertEq(payToken.balanceOf(recipient), recipientBefore + pot, "the pot is PAID to the claimant as a nudge");
+        assertEq(
+            payToken.balanceOf(caller),
+            callerBefore - cost,
+            "REFUND IS BUDGET-BOUNDED: the caller gets back only their own unspent budget, never the pot"
         );
-        batch.setNudgeTokenWhitelist(address(payToken), true);
-
-        assertEq(payToken.balanceOf(address(batch)), potBefore, "pot not swept");
-        assertEq(batch.getNudgeTokens().length, 0, "whitelist stays empty");
+        assertEq(payToken.balanceOf(address(batch)), 0, "pot delivered in full; nothing stranded");
+        assertEq(totalPaid, cost, "totalPaid is the cumulative charge, not net of the pot");
+        assertEq(nft.balanceOf(recipient, DISPATCHER_INDEX), NUDGE_SIZE, "batch stays live under the collision");
     }
 
     // ----------------------------------------------------------------
@@ -1002,27 +1038,42 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
         batch.setNudgeTokenWhitelist(address(nudgeToken), false);
     }
 
-    /// @dev Adding derives the payment token exactly as batchMint does, so
-    ///      an unconfigured minter blocks whitelisting with the same error.
-    function test_whitelist_addRevertsWhenMinterNotConfigured() public {
+    /// @dev The add branch used to derive the payment token exactly as
+    ///      `batchMint` does, purely so it could compare against it, and so an
+    ///      unconfigured minter blocked whitelisting as a side effect of where
+    ///      that check sat. Story-032 removed the derivation with the check, so
+    ///      adding now works while `tokenMinter` is unset. That was never a
+    ///      deliberate invariant — no runbook ordering depends on it — and its
+    ///      removal makes add symmetric with remove (below).
+    ///
+    ///      `batchMint`'s OWN configuration guards are untouched: see
+    ///      `test_batchMint_revertsWhenMinterNotConfigured` and the two
+    ///      `DispatcherNotConfigured` cases.
+    function test_whitelist_addWorksWhenMinterNotConfigured() public {
         vm.prank(owner);
         batch.setTokenMinter(ITokenMinterV2(address(0)));
 
         vm.prank(owner);
-        vm.expectRevert(BatchNFTMinterMultiToken.BatchMint__MinterNotConfigured.selector);
         batch.setNudgeTokenWhitelist(address(nudgeToken), true);
+        assertTrue(batch.isNudgeToken(address(nudgeToken)), "add works with minter unset");
     }
 
-    function test_whitelist_addRevertsWhenDispatcherIndexUnset() public {
+    /// @dev Second unconfigured state: minter present, `dispatcherIndex == 0`.
+    function test_whitelist_addWorksWhenDispatcherIndexUnset() public {
         vm.prank(owner);
         batch.setDispatcherIndex(0);
 
         vm.prank(owner);
-        vm.expectRevert(BatchNFTMinterMultiToken.BatchMint__DispatcherNotConfigured.selector);
         batch.setNudgeTokenWhitelist(address(nudgeToken), true);
+        assertTrue(batch.isNudgeToken(address(nudgeToken)), "add works with dispatcherIndex unset");
     }
 
-    function test_whitelist_addRevertsWhenResolvedDispatcherIsZero() public {
+    /// @dev Third unconfigured state: a non-zero index that RESOLVES to a zero
+    ///      dispatcher. Kept distinct from the two above because it is a
+    ///      different failure of `_resolvePaymentPath` — it is reached through
+    ///      `configs()` rather than a local zero check — and `batchMint` still
+    ///      reverts on it.
+    function test_whitelist_addWorksWhenResolvedDispatcherIsZero() public {
         // Pin an index with price config but no dispatcher wired.
         uint256 zeroDispatcherIndex = 9;
         nftMinter.setConfig(zeroDispatcherIndex, START_PRICE, GROWTH_BPS);
@@ -1030,13 +1081,16 @@ contract BatchNFTMinterMultiTokenNudgeCoreTest is Test {
         batch.setDispatcherIndex(zeroDispatcherIndex);
 
         vm.prank(owner);
-        vm.expectRevert(BatchNFTMinterMultiToken.BatchMint__DispatcherNotConfigured.selector);
         batch.setNudgeTokenWhitelist(address(nudgeToken), true);
+        assertTrue(batch.isNudgeToken(address(nudgeToken)), "add works with a zero-resolving dispatcher");
     }
 
     /// @dev Removal performs NO payment-token derivation, so it stays
     ///      possible even after the minter is unconfigured — the owner can
-    ///      always shrink the whitelist.
+    ///      always shrink the whitelist. Unmodified since story-025; as of
+    ///      story-032 the ADD branch is symmetric with it (the three
+    ///      `addWorksWhen…` tests above), so neither direction of this setter
+    ///      reads the payment path any more.
     function test_whitelist_removeWorksWhenMinterNotConfigured() public {
         _whitelist(address(nudgeToken));
         vm.prank(owner);

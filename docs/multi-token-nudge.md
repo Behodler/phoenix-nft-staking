@@ -39,7 +39,9 @@ decimals are a UI concern, never a contract concern.
 reward-token addresses per call. That opened a weird-token attack surface on
 attacker-chosen addresses and made the payment-token exclusion an
 untrusted-input check; the owner-vetted whitelist removes both. Anything odd
-that lands on the contract is now simply `rescueERC20` territory.)
+that lands on the contract is now simply `rescueERC20` territory. The exclusion
+itself no longer exists at all — story 029 removed its runtime half and story
+032 its admin-time half; see §4.1.)
 
 ### Intended side effects (features, not accidents)
 
@@ -130,7 +132,6 @@ Retained unchanged:
 
 Added:
 ```solidity
-error BatchMint__RewardTokenIsPaymentToken(address token); // admin-time (story 025; defence in depth only since story 029)
 error BatchMint__PaymentBudgetExhausted(uint256 mintIndex, uint256 price, uint256 remaining); // story 029
 error BatchMint__ArrayLengthMismatch(uint256 tokensLength, uint256 minsLength);
 error BatchMint__RewardBelowMinimum(address token, uint256 minReward, uint256 actualReward);
@@ -146,7 +147,11 @@ transferred** (its signature is already per-token, so no ABI change).
 
 `minRewards.length` must equal the FULL whitelist length. **Every entry's
 floor is live, including one currently equal to the derived payment token**
-(story 029 removed the runtime skip that used to ignore it — see §4.1). An empty whitelist therefore demands an empty `minRewards` and the
+(story 029 removed the runtime skip that used to ignore it — see §4.1). Since
+story 032 such an entry can be created directly, by whitelisting the derived
+payment token in one owner call, as well as by repointing
+`tokenMinter`/`dispatcherIndex` under an existing entry; the floor behaves
+identically either way. An empty whitelist therefore demands an empty `minRewards` and the
 batch is a plain mint loop. `getNudgeTokens()` must be re-fetched immediately
 before every call: unwhitelisting uses swap-and-pop, which REORDERS the list.
 
@@ -311,12 +316,16 @@ the caller's money takes the difference from `P`.
 - The **runtime skip is gone.** The payment token is snapshotted, floor-checked
   and paid out like any other whitelisted token. Its `minRewards[i]` floor is
   now **live** instead of silently ignored — a strict improvement.
-- The **admin-time revert is retained as defence in depth only.**
-  `setNudgeTokenWhitelist` still refuses the current derived payment token, so
-  the collision cannot be created by a single whitelist call; but it can be
-  reached by repointing `tokenMinter`/`dispatcherIndex`, and `batchMint` is safe
-  when it is. The check may be removed in a later release with no change to any
-  guarantee here.
+- The **admin-time revert has been removed** (story 032), per the plan story 029
+  recorded for it. Story 029 kept `setNudgeTokenWhitelist` refusing the current
+  derived payment token as defence in depth, so the admin surface and the
+  runtime surface would change in separate releases; story 032 is that later
+  release. `BatchMint__RewardTokenIsPaymentToken` no longer exists. The
+  collision is now creatable by a single whitelist call as well as by repointing
+  `tokenMinter`/`dispatcherIndex` under an existing entry, and `batchMint` is
+  safe under both — nothing in the reasoning above depended on the admin check.
+  Whether to build such a whitelist is an operating decision for the owner; it
+  is not something the contract expresses an opinion about either way.
 - **Gas.** One `configs` staticcall plus one `forceApprove` SSTORE per mint,
   replacing two SSTOREs per batch. Deliberate: this contract is a convenience
   wrapper, not a hot path, and the cost buys token-behaviour independence.
@@ -356,6 +365,30 @@ sense at all. The forfeiture is triaged **won't-fix** (dust shuffling between
 the caller and the next claimant is acceptable, and the residue lands with the
 pot, which is the right owner); this paragraph is the disclosure half only, and
 nothing about the behaviour changes.
+
+**Story 032 — the whitelist add branch no longer derives the payment token.**
+Removing the admin-time rejection also removed the `_resolvePaymentPath()` call
+that fed it, which had two effects worth stating separately from the safety
+argument above.
+
+1. `setNudgeTokenWhitelist(token, true)` accepts the dispatcher's current prime
+   token. `BatchMint__RewardTokenIsPaymentToken` is deleted; no other error or
+   signature changes.
+2. **Deployment ordering changed.** Because the add branch previously derived
+   the payment path, it inherited `_resolvePaymentPath`'s reverts, so a token
+   could not be whitelisted before **both** `setTokenMinter` and
+   `setDispatcherIndex` had been set. That was an accident of where the check
+   sat, not a designed invariant. It is gone: whitelist entries may now be added
+   in any order relative to the minter/dispatcher configuration, which makes the
+   add branch symmetric with the remove branch (which never derived anything, so
+   that the owner could always shrink the whitelist while unconfigured).
+   **Runbooks that encoded the old ordering as a requirement, or that asserted
+   the payment-token rejection as a live tripwire, need revising.**
+
+`batchMint` is byte-for-byte unchanged by story 032 — no change to the snapshot
+loop, the budget tracking, the step 9/10 ordering, or `DUST_THRESHOLD`.
+`registerStream`'s `isNudgeToken(token)` precondition is also unaffected, so the
+**whitelist → registerStream → setNudgeStreamer** ordering remains mandatory.
 
 ### 4.2 Snapshot BEFORE the mint loop — LOAD-BEARING, DO NOT "SIMPLIFY"
 
@@ -581,6 +614,23 @@ Payment-token exclusion
    `count < nudgeSize`; must still revert.
 4. `test_PaymentTokenDustNotClaimableAsReward` — leave sub-threshold dust, prove
    it survives a batch and is swept normally.
+
+> **Story 032 note (2026-07-30), on items 1-3 above.** The exclusion those three
+> items were planned against no longer exists, so no test in the repo carries
+> those names. Story 029 deleted the runtime half; story 032 deleted the
+> admin-time half and the `BatchMint__RewardTokenIsPaymentToken` error with it.
+> The live coverage of the payment-token-as-nudge-token construct is now:
+> `test_WhitelistingPaymentTokenSucceeds`,
+> `test_PaymentTokenDustIsNotSweptIntoTheRefund` and
+> `test_PaymentTokenDustBecomesNudgePotWhenWhitelisted` (§4.1 anchors, in
+> `BatchNFTMinterMultiTokenNudge.t.sol`); `test_whitelist_acceptsPaymentToken`,
+> `test_whitelist_derivedPrimeTokenPotPaysOutAndIsNeverRefunded` and the three
+> `test_whitelist_addWorksWhen…` unconfigured-path tests (in
+> `BatchNFTMinterMultiTokenNudgeCore.t.sol`); plus the whole of
+> `BatchNFTMinterMultiTokenBudget.t.sol`,
+> `BatchNFTMinterMultiTokenBudgetInvariant.t.sol` and
+> `PoC_PaymentTokenCollision.t.sol`. Item 4 survives in substance as the two
+> dust tests. The list above is left in place as the story-022/025 record.
 
 Snapshot-before-loop (§4.2)
 5. `test_OwnDonationsDoNotRefundToBatcher` — dispatcher donates during the loop;

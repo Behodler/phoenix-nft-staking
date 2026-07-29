@@ -111,7 +111,11 @@ contract BudgetInvariantHandler is Test {
         batch.setNudgeTokenWhitelist(address(payToken), true);
 
         // Repoint: `payToken` is now BOTH the derived payment token and the sole
-        // whitelisted nudge token.
+        // whitelisted nudge token. Since story-032 the `bootToken` decoy above is
+        // no longer REQUIRED to get here — the whitelist call would accept
+        // `payToken` directly — but the repoint route is retained deliberately,
+        // because it is the production route the owner can take under an
+        // existing entry, and these invariants are its only fuzzed coverage.
         disp.setPrimeToken(address(payToken));
     }
 

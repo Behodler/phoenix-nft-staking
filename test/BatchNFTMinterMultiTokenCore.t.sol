@@ -436,6 +436,22 @@ contract BatchNFTMinterMultiTokenCoreTest is Test {
     ///         per-additional-token cost and requires them to be LINEAR —
     ///         a superlinear trend means a dedupe or nested loop crept in
     ///         (a bug against §4.5).
+    ///
+    /// @dev    **Story-032 recorded a +17,000 absolute shift in all three
+    ///         labels, and in `batchMintNudge_unhappyPath`. `batchMint` did not
+    ///         change — do not read it as a regression.** It is a warm/cold
+    ///         artifact of the HARNESS. Foundry runs a test body as one
+    ///         transaction, so the `setNudgeTokenWhitelist` calls above used to
+    ///         pre-warm `tokenMinter`, `dispatcherIndex`, the minter and
+    ///         dispatcher accounts and `primeToken` on `batchMint`'s behalf, via
+    ///         the `_resolvePaymentPath()` call in the add branch. Story-032
+    ///         removed that derivation, so `batchMint` now pays the cold-access
+    ///         cost itself — exactly as it always did in production, where no
+    ///         whitelist call precedes it in the same transaction. Warming those
+    ///         four reads back up before the call reproduces the old figures to
+    ///         the wei. The DELTAS between the three labels — the linearity this
+    ///         benchmark actually pins — are unchanged, and the cold-path
+    ///         `batchMintCount1` / `batchMintN_*` figures did not move at all.
     function _gasMultiToken(uint256 tokenCount, string memory label) internal {
         vm.prank(owner);
         batch.setNudgeSize(2);

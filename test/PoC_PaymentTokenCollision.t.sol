@@ -187,6 +187,13 @@ contract PoC_PaymentTokenCollisionTest is Test {
 
     /// @dev The single owner transaction that creates the collision, plus the
     ///      precondition proof that it really did.
+    ///
+    ///      Since story-032 this repoint is no longer the ONLY way to reach the
+    ///      collision — `setNudgeTokenWhitelist(usdc, true)` would now do it in
+    ///      one call while USDC is already the prime token. The PoC keeps the
+    ///      repoint on purpose: it is the shape `ycn19h1` was reported in, and
+    ///      it stays a live production route (the owner can change the derived
+    ///      payment token under an existing whitelist entry at any time).
     function _repointAtUsdcPrimeDispatcher() internal {
         vm.prank(owner);
         batch.setDispatcherIndex(RATCHET_INDEX);

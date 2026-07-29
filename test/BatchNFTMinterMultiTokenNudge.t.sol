@@ -57,6 +57,7 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     uint256 internal constant DUST_THRESHOLD = 1e6;
 
     event NudgePaid(address indexed recipient, address indexed token, uint256 amount);
+    event NudgeTokenWhitelistChanged(address indexed token, bool allowed);
 
     function setUp() public {
         batch = new BatchNFTMinterMultiToken(owner);
@@ -169,33 +170,37 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
     // balance, which is what makes the collision safe rather than merely
     // forbidden.
     //
-    // The admin-time revert is RETAINED as defence in depth only (see
-    // `BatchMint__RewardTokenIsPaymentToken`), so the collision is still
-    // reached the way it is reached in production: the owner repoints
-    // `tokenMinter`/`dispatcherIndex` out from under an existing entry.
+    // The admin-time revert has now gone as well (story-032), so the two-part
+    // exclusion is FULLY gone: no runtime skip (029) and no admin-time revert
+    // (032). The collision is reachable BOTH ways — a direct
+    // `setNudgeTokenWhitelist(paymentToken, true)` call, and the production
+    // route of repointing `tokenMinter`/`dispatcherIndex` out from under an
+    // existing entry. Neither needs defending, because what keeps the pot safe
+    // is the SOURCE of the refund: it is bounded by the caller's tracked
+    // `budget`, so no amount of whitelist shape lets the pot leave that way.
     // ================================================================ //
 
-    /// @dev 1. `setNudgeTokenWhitelist` still refuses the CURRENT derived
-    ///      payment token. This is now DEFENCE IN DEPTH, not a safety
-    ///      requirement: `batchMint` is safe with the payment token on the
-    ///      whitelist (tests 2-4 below prove it), and the owner can put it
-    ///      there anyway by repointing the dispatcher. The check only stops a
-    ///      single whitelist call from creating the collision by accident, so
-    ///      the admin-time surface and the runtime surface move in separate
-    ///      releases. Removing it would not weaken any invariant this suite
-    ///      pins. (The full admin-suite lives in
+    /// @dev 1. `setNudgeTokenWhitelist` accepts the CURRENT derived payment
+    ///      token. The admin-time rejection story-025 introduced and story-029
+    ///      demoted to defence in depth is deleted in story-032; the add branch
+    ///      no longer derives the payment path at all. `batchMint` is safe with
+    ///      the payment token on the whitelist (tests 2-4 below prove it), and
+    ///      the owner could always reach the same state by repointing the
+    ///      dispatcher. (The full admin-suite lives in
     ///      `BatchNFTMinterMultiTokenNudgeCore.t.sol`; this is the §4.1
     ///      anchor.)
-    function test_RevertWhen_WhitelistingPaymentToken() public {
+    function test_WhitelistingPaymentTokenSucceeds() public {
+        _whitelist(address(rewardA));
+
+        vm.expectEmit(true, true, true, true, address(batch));
+        emit NudgeTokenWhitelistChanged(address(payToken), true);
         vm.prank(owner);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
-            )
-        );
         batch.setNudgeTokenWhitelist(address(payToken), true);
 
-        assertEq(batch.getNudgeTokens().length, 0, "payment token never lands on the whitelist");
+        address[] memory tokens = batch.getNudgeTokens();
+        assertEq(tokens.length, 2, "payment token lands on the whitelist");
+        assertEq(tokens[1], address(payToken), "appended at the end, in storage order");
+        assertTrue(batch.isNudgeToken(address(payToken)), "membership view agrees");
     }
 
     /// @dev 2. Runtime collision: the owner whitelists token A while the payment
@@ -351,17 +356,12 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         batch.batchMint(1, recipient, cost1 + dust, _mins(0));
         assertEq(payToken.balanceOf(address(batch)), dust, "sub-threshold dust retained");
 
-        // The dust cannot be turned into a nudge pot: whitelisting the
-        // payment token reverts at admin time.
-        vm.prank(owner);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BatchNFTMinterMultiToken.BatchMint__RewardTokenIsPaymentToken.selector, address(payToken)
-            )
-        );
-        batch.setNudgeTokenWhitelist(address(payToken), true);
-        assertEq(payToken.balanceOf(address(batch)), dust, "dust survives the attempted whitelist");
-
+        // `payToken` is deliberately NOT whitelisted here, so the dust is not a
+        // nudge pot and cannot be paid out as a reward either. The only exit it
+        // could plausibly take is the refund, and that is exactly what this test
+        // denies. The whitelisted arm is
+        // `test_PaymentTokenDustBecomesNudgePotWhenWhitelisted` below.
+        //
         // A later batch with a supra-threshold surplus gets back its OWN unspent
         // budget and nothing else. The prior batch's dust is not part of that
         // budget, so it is left where it is.
@@ -375,6 +375,51 @@ contract BatchNFTMinterMultiTokenNudgeTest is Test {
         assertEq(payToken.balanceOf(address(batch)), dust, "the prior batch's dust is NOT the next caller's money");
         assertEq(payToken.balanceOf(caller2), caller2Before - cost2, "caller receives exactly their own unspent budget");
         assertEq(totalPaid, cost2, "totalPaid is the cumulative charge, not net of someone else's dust");
+    }
+
+    /// @dev 4b. The story-032 arm of the same scenario. Once the owner
+    ///      whitelists the payment token — which they may now do in a single
+    ///      call — the retained dust stops being inert and becomes a live nudge
+    ///      pot like any other whitelisted balance. It is paid to `recipient`,
+    ///      NOT refunded to the caller: the two exits are separately sourced,
+    ///      the payout from the pre-loop snapshot and the refund from the
+    ///      caller's tracked `budget`. So the change of whitelist shape moves
+    ///      the dust to the claimant, and never to the batcher.
+    function test_PaymentTokenDustBecomesNudgePotWhenWhitelisted() public {
+        _whitelist(address(rewardA));
+        _fundPots();
+
+        // Batch 1 leaves sub-threshold dust behind, exactly as above.
+        uint256 dust = DUST_THRESHOLD - 1;
+        uint256 cost1 = _costNow(1);
+        _fund(caller, cost1 + dust);
+        vm.prank(caller);
+        batch.batchMint(1, recipient, cost1 + dust, _mins(0));
+        assertEq(payToken.balanceOf(address(batch)), dust, "sub-threshold dust retained");
+
+        // Story-032: the owner turns the dust into a nudge pot in ONE call.
+        _whitelist(address(payToken));
+        address[] memory tokens = batch.getNudgeTokens();
+        assertEq(tokens[1], address(payToken), "payToken is whitelist slot 1");
+
+        uint256 surplus = 5 ether;
+        uint256 cost2 = _costNow(NUDGE_SIZE);
+        _fund(caller2, cost2 + surplus);
+        uint256 caller2Before = payToken.balanceOf(caller2);
+        uint256 recipientBefore = payToken.balanceOf(recipient);
+
+        vm.prank(caller2);
+        uint256 totalPaid = batch.batchMint(NUDGE_SIZE, recipient, cost2 + surplus, _mins(0, 0));
+
+        assertEq(payToken.balanceOf(recipient), recipientBefore + dust, "the dust is PAID to the recipient as a nudge");
+        assertEq(
+            payToken.balanceOf(caller2),
+            caller2Before - cost2,
+            "caller still receives exactly their own unspent budget and nothing more"
+        );
+        assertEq(payToken.balanceOf(address(batch)), 0, "pot fully delivered; no payment-token residue");
+        assertEq(rewardA.balanceOf(recipient), POT_A, "the non-colliding entry still pays in full");
+        assertEq(totalPaid, cost2, "totalPaid is the cumulative charge");
     }
 
     // ================================================================ //
