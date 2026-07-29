@@ -12,6 +12,7 @@ import {MockTokenDispatcherV2} from "./mocks/MockTokenDispatcherV2.sol";
 import {MockERC1155} from "./mocks/MockERC1155.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockNudgeDonor} from "./mocks/MockNudgeDonor.sol";
+import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 
 /// @title BatchNFTMinterMultiToken — NudgeStreamer integration
 ///
@@ -199,5 +200,122 @@ contract BatchNFTMinterMultiTokenNudgeStreamTest is Test {
         vm.prank(owner);
         batch.setNudgeStreamer(address(0));
         assertEq(batch.nudgeStreamer(), address(0), "streamer cleared");
+    }
+
+    // =====================================================================
+    // M-01 — pooled custody vs per-stream buffers
+    //
+    // `NudgeStreamer` holds ONE balance per token across every
+    // `(batchMinter, token)` pair, while `_accrued`'s cap is per stream. If
+    // `collectNudge` credits the amount SENT rather than the amount RECEIVED,
+    // `Σ buffer_i` exceeds `balanceOf(streamer)` for a taxed token: whichever
+    // pair settles first is paid its full over-stated buffer out of the shared
+    // balance and the later pair's `pullPendingStream` reverts. Because
+    // `batchMint` loops `pullPendingStream` over the WHOLE `getNudgeTokens()`
+    // whitelist inside one transaction with no try/catch, that revert bricks
+    // minting for every reward token, not just the tainted one.
+    //
+    // This is the CUSTODY axis, distinct from the reward-DELIVERY axis that
+    // `docs/multi-token-nudge.md` §4.4 leaves documented-not-defended.
+    // =====================================================================
+
+    uint256 internal constant TAX_BPS = 500; // 5%
+    uint256 internal constant PAIR_DONATION = 100_000 ether;
+
+    function _mins2(uint256 a, uint256 b) internal pure returns (uint256[] memory arr) {
+        arr = new uint256[](2);
+        arr[0] = a;
+        arr[1] = b;
+    }
+
+    /// @dev Two `(batchMinter, token)` pairs sharing ONE taxed token, each
+    ///      donated `PAIR_DONATION`. Post-tax pooled custody is
+    ///      `2 * 95_000e18`; pre-fix the credited buffers total `2 * 100_000e18`.
+    function _wireTaxedCrossPair() internal returns (MockFeeOnTransferERC20 taxed, BatchNFTMinterMultiToken batchB) {
+        taxed = new MockFeeOnTransferERC20("TaxedNudge", "TXN", TAX_BPS);
+        batchB = new BatchNFTMinterMultiToken(owner);
+
+        vm.startPrank(owner);
+        batch.setNudgeStreamer(address(streamer));
+        batch.setNudgeTokenWhitelist(address(taxed), true);
+        // `batchB` only ever has to be a valid `registerStream` target and a
+        // `pullPendingStream` caller, but the whitelist setter resolves the
+        // payment path, so it needs a configured minter/dispatcher too.
+        batchB.setTokenMinter(ITokenMinterV2(address(nftMinter)));
+        batchB.setDispatcherIndex(DISPATCHER_INDEX);
+        batchB.setNudgeTokenWhitelist(address(taxed), true);
+        streamer.registerStream(address(batch), address(nudgeToken), STREAM_DURATION);
+        streamer.registerStream(address(batch), address(taxed), STREAM_DURATION);
+        streamer.registerStream(address(batchB), address(taxed), STREAM_DURATION);
+        vm.stopPrank();
+
+        nudgeToken.mint(address(donor), DONATION);
+        donor.donate(address(streamer), address(batch), address(nudgeToken), DONATION);
+
+        taxed.mint(address(donor), PAIR_DONATION * 2);
+        donor.donate(address(streamer), address(batch), address(taxed), PAIR_DONATION);
+        donor.donate(address(streamer), address(batchB), address(taxed), PAIR_DONATION);
+    }
+
+    /// @notice M-01, case B. Two pairs share one taxed token. Against the
+    ///         pre-fix code the credited buffers totalled 200_000e18 versus
+    ///         190_000e18 of pooled custody, pair A settled for its full
+    ///         100_000e18 and pair B's flush reverted. With the credit measured,
+    ///         the buffers sum to exactly the pooled balance and BOTH pairs
+    ///         settle in full.
+    function test_pullPendingStream_taxedTokenDoesNotDrainSiblingPair() public {
+        (MockFeeOnTransferERC20 taxed, BatchNFTMinterMultiToken batchB) = _wireTaxedCrossPair();
+
+        uint256 receipt = PAIR_DONATION - (PAIR_DONATION * TAX_BPS) / 10_000; // 95_000e18
+        uint256 pooled = 2 * receipt; // 190_000e18
+        assertEq(taxed.balanceOf(address(streamer)), pooled, "pooled custody is post-tax");
+
+        (, uint256 bufA,,) = streamer.streams(address(batchB), address(taxed));
+        (, uint256 bufB,,) = streamer.streams(address(batch), address(taxed));
+        assertEq(bufA + bufB, pooled, "Sigma buffer_i is exactly backed by pooled custody");
+
+        vm.warp(block.timestamp + STREAM_DURATION); // both streams fully accrued
+
+        // Pair A settles for its own buffer and nothing more.
+        vm.prank(address(batchB));
+        streamer.pullPendingStream(address(taxed));
+        assertEq(taxed.balanceOf(address(streamer)), receipt, "A took only its own backing");
+
+        // Pair B is still solvent and settles in full.
+        vm.prank(address(batch));
+        streamer.pullPendingStream(address(taxed));
+        assertEq(taxed.balanceOf(address(streamer)), 0, "B settled too; no sibling was starved");
+    }
+
+    /// @notice M-01, case C. `batchMint` loops `pullPendingStream` over the
+    ///         whole whitelist in one transaction with no try/catch, so against
+    ///         the pre-fix code a tainted token's revert took down minting for
+    ///         the clean reward token too. With the credit measured no pair is
+    ///         under-backed, so the whole mint path stays up and every reward
+    ///         token is delivered.
+    function test_batchMint_taintedNudgeTokenDoesNotBrickEveryRewardToken() public {
+        (MockFeeOnTransferERC20 taxed, BatchNFTMinterMultiToken batchB) = _wireTaxedCrossPair();
+        assertTrue(batch.isNudgeToken(address(taxed)), "tainted token is on the mint path's whitelist");
+
+        vm.warp(block.timestamp + STREAM_DURATION);
+
+        // The sibling pair drains the pooled balance first.
+        vm.prank(address(batchB));
+        streamer.pullPendingStream(address(taxed));
+
+        // The clean token's own stream is perfectly solvent.
+        assertEq(streamer.pendingStream(address(batch), address(nudgeToken)), DONATION, "clean stream fully accrued");
+        assertGe(nudgeToken.balanceOf(address(streamer)), DONATION, "clean token fully backed");
+
+        uint256 N = NUDGE_SIZE;
+        uint256 payment = _expectedTotal(N);
+        _fundCaller(payment);
+
+        vm.prank(caller);
+        batch.batchMint(N, recipient, payment, _mins2(0, 0));
+
+        assertEq(nudgeToken.balanceOf(recipient), DONATION, "clean reward delivered in full");
+        assertGt(taxed.balanceOf(recipient), 0, "tainted reward still pays out what it can");
+        assertEq(taxed.balanceOf(address(streamer)), 0, "tainted stream drained without starving anyone");
     }
 }

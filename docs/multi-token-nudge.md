@@ -408,7 +408,39 @@ and would cost ~200 gas instead of ~2-3k, but it requires solc >= 0.8.24 with
 `evm_version = cancun` and this module is pinned to `0.8.20` in `foundry.toml`.
 Not worth bumping the pragma for 2k gas (see §8).
 
-### 4.4 Fee-on-transfer / rebasing tokens — documented, not defended
+### 4.4 Fee-on-transfer / rebasing tokens — undefended at *delivery*, defended at *custody credit*
+
+There are **two different sites** where a fee-on-transfer token can bite, and the
+project answers them differently. Read the line below before citing this section
+in either direction; a reader who takes "documented, not defended" as a blanket
+policy will mis-read the `collectNudge` measurement as a regression against a
+recorded decision, and a reader who takes the credit-site measurement as policy
+will "fix" the delivery site that story 022 deliberately left alone.
+
+| Site | What is at stake | Answer |
+|---|---|---|
+| **Reward delivery** — `BatchNFTMinter*._payRewards`, the `minRewards[i]` floor | The *recipient* receives less than the floor they declared | **Documented, not defended** (below) |
+| **Custody credit** — `NudgeStreamer.collectNudge`, and the payment-token pull at `BatchNFTMinterMultiToken.sol:584` | The *contract's own accounting* claims more than it holds | **Defended** — balance-delta, capped at the quoted amount |
+
+The distinction is not squeamishness about cost, it is who bears the error. At
+the delivery site the loser is the caller who chose the token, the fee goes to
+the token's own sink, and nobody else is affected — so the honest answer is to
+say so in NatSpec and let sophisticated callers decide. At the credit site the
+loser is a **third party**. `NudgeStreamer` holds one pooled balance per token
+across every `(batchMinter, token)` pair while `_accrued`'s cap is per stream,
+so an over-credit on one pair lets it consume a sibling pair's backing; the
+sibling's `pullPendingStream` then reverts, and because `batchMint` loops
+`pullPendingStream` over the entire whitelist in one transaction with no
+try/catch, that revert bricks minting for **every** reward token. That is audit
+run-21 finding M-01, and it is exactly the "A's token choice costs an unrelated
+B" path whose *absence* the earlier `_payRewards` triage rested on. Same token
+class, different blast radius, different answer.
+
+The two `balanceOf` calls the delivery-site decision declines to pay are paid
+once per *donation* at the credit site, not once per token per *batch*, so the
+cost argument below does not transfer either.
+
+#### Reward delivery: documented, not defended
 
 `minRewards[i]` is checked against the **pre-transfer snapshot**, not against
 what `recipient` actually receives. For a fee-on-transfer or negatively-rebasing
@@ -427,6 +459,29 @@ every batch to serve an asset class the protocol does not use. Instead:
   should not whitelist them.
 
 Sophisticated callers read the source and decide whether the tax is worth it.
+
+`test/mocks/MockFeeOnTransferERC20.sol` is this decision's witness — it exists so
+that a future change which "fixes" the delivery site fails loudly. It is also
+reused, deliberately, by the `NudgeStreamer` credit-site tests. That is not a
+contradiction: it is the same adversary aimed at the other site, where the answer
+is the opposite one. The test docstrings say so at both ends.
+
+#### Custody credit: defended
+
+`collectNudge` credits `min(balanceAfter - balanceBefore, amount)`, with the
+snapshot taken **after** the settle and immediately before the pull so it
+brackets exactly one transfer. The cap is as load-bearing as the measurement: a
+bare delta would let a token that pushes a third party's balance in during the
+pull credit that donation to the stream. Surplus above `amount` therefore stays
+as uncredited idle balance, and a non-zero `amount` that delivers nothing reverts
+with `NudgeStreamer__ZeroReceived()`. The invariant this establishes —
+`Σ buffer_i <= balanceOf(streamer)` over every pair on one token — is what makes
+the per-stream cap in `_accrued` affordable out of the pooled per-token balance.
+
+This does **not** discharge the operational advice above. The owner still should
+not whitelist a taxed nudge token: the streamer is now safe if one is whitelisted,
+but stakers still receive less than the headline donation, and whether any given
+token is taxed remains a pre-whitelist verification, not a contract guarantee.
 
 ### 4.5 Duplicates are structurally impossible; weird tokens are the owner's problem
 

@@ -51,6 +51,15 @@ interface IMultiTokenNudgeWhitelist {
 ///         tokens over long windows. Integer division floors settled amounts;
 ///         leftover dust stays in the buffer and streams out later — dust always
 ///         accrues in the protocol's favour.
+///
+///         That direction holds at the credit site too, and by construction
+///         rather than by convention. `collectNudge` credits the MEASURED
+///         receipt capped at the quoted amount, so a taxed token credits less
+///         than was sent (never more), and a token that pushes extra balance in
+///         during the pull leaves the surplus as uncredited idle balance. The
+///         resulting invariant — `Σ buffer_i <= balanceOf(this)` over every
+///         pair on one token — is what makes the per-stream cap in `_accrued`
+///         affordable out of the pooled per-token balance.
 contract NudgeStreamer is INudgeStreamer, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -76,6 +85,12 @@ contract NudgeStreamer is INudgeStreamer, Ownable, ReentrancyGuard {
     error NudgeStreamer__NotRegistered();
     error NudgeStreamer__ZeroDuration();
     error NudgeStreamer__ZeroAmount();
+    /// @notice A non-zero `amount` delivered nothing into custody (100%-tax or
+    ///         confiscatory token). Deliberately distinct from
+    ///         `NudgeStreamer__ZeroAmount` — that is a caller passing zero,
+    ///         this is a token that ate the whole transfer. Different operator
+    ///         mistakes, different remedies.
+    error NudgeStreamer__ZeroReceived();
     error NudgeStreamer__NotWhitelisted(address batchMinter, address token);
 
     /// @notice Emitted when a stream is (re-)registered for a `(batchMinter, token)`.
@@ -146,13 +161,54 @@ contract NudgeStreamer is INudgeStreamer, Ownable, ReentrancyGuard {
         _settle(s, recipientBatchMinter, token);
 
         if (amount == 0) revert NudgeStreamer__ZeroAmount();
+
+        // --- Credit what ARRIVED, not what was quoted. ---
+        //
+        // The streamer holds ONE pooled balance per token across every
+        // `(batchMinter, token)` pair, while `_accrued`'s cap is per stream.
+        // Crediting the quoted `amount` for a fee-on-transfer / taxed /
+        // reflection token therefore pushes `Σ buffer_i` above
+        // `balanceOf(this)`: whichever pair settles first is paid its full
+        // over-stated buffer out of the shared balance and a sibling pair's
+        // `pullPendingStream` reverts — which bricks `batchMint`, since it
+        // loops `pullPendingStream` over the whole whitelist in one tx.
+        //
+        // SNAPSHOT PLACEMENT IS LOAD-BEARING. `heldBefore` is read HERE, after
+        // `_settle` and immediately before the pull. `_settle` performs an
+        // OUTBOUND `safeTransfer` when anything has accrued, so a snapshot
+        // taken at function entry would span two transfers in opposite
+        // directions and net them against each other. Bracketing exactly one
+        // transfer is what makes the difference a measurement of that transfer
+        // and nothing else. Pinned by
+        // `test_collectNudge_snapshotIsTakenAfterSettleNotAtEntry`.
+        //
+        // The cap is the other half. A bare delta defends only the fee
+        // direction; a token that pushes a third party's balance INTO the
+        // streamer during the pull (see `test/mocks/MockDonatingOnPullERC20.sol`)
+        // would otherwise have that donation credited to this stream.
+        // `min(received, amount)` keeps any surplus as uncredited idle balance,
+        // which accrues in the protocol's favour. This is the same measurement,
+        // for the same two reasons, as the payment-token pull at
+        // `BatchNFTMinterMultiToken.sol:584-611`.
+        uint256 heldBefore = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        s.buffer += amount;
+        uint256 received = IERC20(token).balanceOf(address(this)) - heldBefore;
+        if (received > amount) received = amount;
+        // Distinct from the `amount == 0` check above: that is a caller passing
+        // zero, this is a token that delivered nothing from a non-zero request.
+        if (received == 0) revert NudgeStreamer__ZeroReceived();
+
+        s.buffer += received;
 
         // Canonical recompute site #1: reset the window over the full duration.
+        // Reads `s.buffer` — do NOT add a parallel derivation from `received`;
+        // correcting the credit is what corrects the rate.
         s.rewardPerSecond = (s.buffer * PRECISION) / s.duration;
 
-        emit NudgeCollected(recipientBatchMinter, token, msg.sender, amount, s.rewardPerSecond);
+        // `amount` carries the CREDITED receipt, which is the value
+        // `rewardPerSecond` is derived from. No fifth field: adding one is an
+        // event-ABI change that would force downstream indexer regeneration.
+        emit NudgeCollected(recipientBatchMinter, token, msg.sender, received, s.rewardPerSecond);
     }
 
     /// @notice BatchMinter-facing flush (`msg.sender` = batchMinter = recipient).
@@ -189,9 +245,24 @@ contract NudgeStreamer is INudgeStreamer, Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev `min(rewardPerSecond * elapsed / PRECISION, buffer)`. The buffer cap
-    ///      guarantees the streamer can never transfer more than it holds, even
-    ///      if `elapsed` is large.
+    /// @dev `min(rewardPerSecond * elapsed / PRECISION, buffer)`.
+    ///
+    ///      READ THE SCOPE OF THIS CAP CAREFULLY. It is a PER-STREAM cap: it
+    ///      bounds a single `(batchMinter, token)` pair's payout by that pair's
+    ///      own buffer, and it is what stops a large `elapsed` over-accruing.
+    ///      It says NOTHING on its own about pooled custody, because the
+    ///      streamer holds one balance per token shared across every pair on
+    ///      that token. What makes the payout actually affordable is the
+    ///      separate invariant
+    ///
+    ///          Σ buffer_i  <=  IERC20(token).balanceOf(address(this))
+    ///
+    ///      summed over every `(batchMinter, token)` pair on one token. That
+    ///      invariant is established at ONE site — the balance-delta credit in
+    ///      `collectNudge`, which credits `min(received, amount)` measured
+    ///      across the pull. Credit a quoted amount there instead and the sum
+    ///      exceeds custody for any fee-on-transfer token, a first-settling
+    ///      pair consumes a sibling's backing, and this cap does not catch it.
     function _accrued(Stream storage s) private view returns (uint256) {
         uint256 elapsed = block.timestamp - s.lastUpdate;
         uint256 accrued = (s.rewardPerSecond * elapsed) / PRECISION;

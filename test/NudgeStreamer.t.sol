@@ -11,6 +11,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {NudgeStreamer, IMultiTokenNudgeWhitelist} from "../src/NudgeStreamer.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockNudgeDonor} from "./mocks/MockNudgeDonor.sol";
+import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
+import {MockDonatingOnPullERC20} from "./mocks/MockDonatingOnPullERC20.sol";
 
 /// @notice Minimal ERC20 with a configurable `decimals()`, used for the
 ///         USDC-like (6-dp) accrual test.
@@ -468,5 +470,167 @@ contract NudgeStreamerTest is Test {
         vm.prank(address(bm));
         streamer.pullPendingStream(address(usdc));
         assertEq(usdc.balanceOf(address(bm)) - bmBefore, amount, "streamed native units, no normalization");
+    }
+
+    // =====================================================================
+    // M-01 — the buffer is credited with what was RECEIVED, not what was sent
+    //
+    // NOTE ON `MockFeeOnTransferERC20` REUSE. That mock was introduced as the
+    // `docs/multi-token-nudge.md` §4.4 witness for a DIFFERENT contract and a
+    // DIFFERENT property: reward DELIVERY out of `BatchNFTMinter*`, where
+    // `minRewards[i]` is a floor on the pre-transfer balance and under-delivery
+    // to `recipient` is documented-not-defended. The tests below are about
+    // custody CREDIT into `NudgeStreamer`, which IS defended. The streamer
+    // holds a single pooled balance per token across every
+    // `(batchMinter, token)` pair while `_accrued`'s cap is per stream, so an
+    // over-credit on one pair silently consumes a sibling pair's backing. The
+    // measurement mirrors the house pattern at
+    // `BatchNFTMinterMultiToken.sol:584-611`. Reusing the same adversary at a
+    // second site is not a contradiction of §4.4.
+    // =====================================================================
+
+    uint256 internal constant TAXED_BPS = 500; // 5%
+    uint256 internal constant BIG_DONATION = 100_000e18;
+
+    /// @dev Deploy a taxed token, whitelist it on a fresh batchMinter, and
+    ///      register a `DURATION` stream for the pair.
+    function _registerTaxed(uint256 feeBps)
+        internal
+        returns (MockFeeOnTransferERC20 taxed, MockWhitelistBatchMinter bm)
+    {
+        taxed = new MockFeeOnTransferERC20("Taxed", "TAX", feeBps);
+        bm = new MockWhitelistBatchMinter();
+        bm.setNudge(address(taxed), true);
+        vm.prank(owner);
+        streamer.registerStream(address(bm), address(taxed), DURATION);
+    }
+
+    /// @dev Fund the donor (mint is untaxed) and donate through `collectNudge`.
+    function _donateTaxed(MockFeeOnTransferERC20 taxed, MockWhitelistBatchMinter bm, uint256 amount) internal {
+        taxed.mint(address(donor), amount);
+        donor.donate(address(streamer), address(bm), address(taxed), amount);
+    }
+
+    /// @notice M-01, case A. A 5%-taxed donation of 100_000e18 delivers only
+    ///         95_000e18 into custody. The buffer must credit the receipt, not
+    ///         the request: against the pre-fix code this asserted
+    ///         `buffer == 100_000e18` while custody was 95_000e18, which is the
+    ///         over-credit the finding names.
+    function test_collectNudge_taxedTokenCreditsMeasuredReceipt() public {
+        (MockFeeOnTransferERC20 taxed, MockWhitelistBatchMinter bm) = _registerTaxed(TAXED_BPS);
+        _donateTaxed(taxed, bm, BIG_DONATION);
+
+        uint256 expectedCustody = BIG_DONATION - (BIG_DONATION * TAXED_BPS) / 10_000;
+
+        (, uint256 buffer, uint256 rate,) = _streamState(address(bm), address(taxed));
+        assertEq(taxed.balanceOf(address(streamer)), expectedCustody, "custody is the post-tax receipt");
+        assertEq(buffer, expectedCustody, "buffer credits the amount RECEIVED, not the amount sent");
+        assertEq(rate, (expectedCustody * PRECISION) / DURATION, "rate follows the corrected credit");
+    }
+
+    /// @notice The snapshot must be taken AFTER `_settle`, not at function
+    ///         entry. `_settle`'s outbound transfer moves the streamer's
+    ///         balance mid-call, so an entry snapshot measures the settle and
+    ///         the pull together and mis-credits the buffer.
+    function test_collectNudge_snapshotIsTakenAfterSettleNotAtEntry() public {
+        (MockFeeOnTransferERC20 taxed, MockWhitelistBatchMinter bm) = _registerTaxed(TAXED_BPS);
+        _donateTaxed(taxed, bm, BIG_DONATION);
+
+        uint256 firstReceipt = BIG_DONATION - (BIG_DONATION * TAXED_BPS) / 10_000; // 95_000e18
+
+        // Half the window elapses, so the second donation settles half the
+        // first receipt outbound before it pulls anything in.
+        vm.warp(block.timestamp + DURATION / 2);
+        uint256 settled = firstReceipt / 2;
+        assertEq(streamer.pendingStream(address(bm), address(taxed)), settled, "half the first receipt accrued");
+
+        _donateTaxed(taxed, bm, BIG_DONATION);
+
+        // Correct: remainder + the second receipt, measured across the pull only.
+        // A function-entry snapshot would instead net the outbound settle
+        // against the inbound pull and credit `firstReceipt - settled` here.
+        (, uint256 buffer,,) = _streamState(address(bm), address(taxed));
+        assertEq(buffer, (firstReceipt - settled) + firstReceipt, "credit measures the pull, not the settle");
+        assertEq(taxed.balanceOf(address(streamer)), buffer, "buffer still exactly backed by custody");
+    }
+
+    /// @notice A fee-free token is credited byte-identically to the pre-fix
+    ///         behaviour: measuring must not regress honest tokens.
+    function test_collectNudge_feeFreeTokenCreditUnchanged() public {
+        (MockFeeOnTransferERC20 clean, MockWhitelistBatchMinter bm) = _registerTaxed(0);
+        _donateTaxed(clean, bm, BIG_DONATION);
+
+        (, uint256 buffer, uint256 rate,) = _streamState(address(bm), address(clean));
+        assertEq(buffer, BIG_DONATION, "no fee -> credit is the full amount");
+        assertEq(rate, (BIG_DONATION * PRECISION) / DURATION, "rate identical to the pre-fix derivation");
+        assertEq(clean.balanceOf(address(streamer)), BIG_DONATION, "custody matches the buffer exactly");
+    }
+
+    /// @notice A token that pushes a third party's balance INTO the streamer
+    ///         during the pull must not inflate the credit. The credit is
+    ///         `min(received, amount)`; the surplus stays uncredited idle
+    ///         balance, which is protocol-favourable.
+    function test_collectNudge_donationDuringPullCannotInflateCredit() public {
+        MockDonatingOnPullERC20 pushy = new MockDonatingOnPullERC20("Pushy", "PSH");
+        MockWhitelistBatchMinter bm = new MockWhitelistBatchMinter();
+        bm.setNudge(address(pushy), true);
+        vm.prank(owner);
+        streamer.registerStream(address(bm), address(pushy), DURATION);
+
+        address thirdParty = makeAddr("thirdParty");
+        uint256 surplus = 7_000e18;
+        pushy.mint(thirdParty, surplus);
+        pushy.setDonation(thirdParty, surplus);
+
+        pushy.mint(address(donor), BIG_DONATION);
+        donor.donate(address(streamer), address(bm), address(pushy), BIG_DONATION);
+
+        (, uint256 buffer, uint256 rate,) = _streamState(address(bm), address(pushy));
+        assertEq(buffer, BIG_DONATION, "credit capped at the amount sent");
+        assertEq(rate, (BIG_DONATION * PRECISION) / DURATION, "rate derived from the capped credit");
+        assertEq(
+            pushy.balanceOf(address(streamer)), BIG_DONATION + surplus, "surplus is held but deliberately uncredited"
+        );
+    }
+
+    /// @notice A 100%-fee token delivers nothing from a non-zero `amount`.
+    ///         That is a distinct operator mistake from passing `amount == 0`,
+    ///         so it gets its own error.
+    function test_collectNudge_revertsWhenNothingIsReceived() public {
+        (MockFeeOnTransferERC20 confiscatory, MockWhitelistBatchMinter bm) = _registerTaxed(10_000);
+        confiscatory.mint(address(donor), BIG_DONATION);
+
+        vm.expectRevert(NudgeStreamer.NudgeStreamer__ZeroReceived.selector);
+        donor.donate(address(streamer), address(bm), address(confiscatory), BIG_DONATION);
+    }
+
+    /// @notice `NudgeCollected.amount` carries the CREDITED receipt, which is
+    ///         the value `rewardPerSecond` is derived from. No fifth field is
+    ///         added — that would be an event-ABI break for downstream indexers.
+    function test_collectNudge_emitsReceivedAmountAndConsistentRate() public {
+        (MockFeeOnTransferERC20 taxed, MockWhitelistBatchMinter bm) = _registerTaxed(TAXED_BPS);
+        taxed.mint(address(donor), BIG_DONATION);
+
+        uint256 received = BIG_DONATION - (BIG_DONATION * TAXED_BPS) / 10_000;
+
+        vm.expectEmit(true, true, true, true, address(streamer));
+        emit NudgeCollected(address(bm), address(taxed), address(donor), received, (received * PRECISION) / DURATION);
+
+        donor.donate(address(streamer), address(bm), address(taxed), BIG_DONATION);
+
+        (,, uint256 rate,) = _streamState(address(bm), address(taxed));
+        assertEq(rate, (received * PRECISION) / DURATION, "emitted rate matches stored rate");
+    }
+
+    /// @notice Across N donations of a taxed token the buffer tracks pooled
+    ///         custody rather than drifting further above it with each top-up.
+    function test_collectNudge_taxedMultiDonationBufferTracksCustody() public {
+        (MockFeeOnTransferERC20 taxed, MockWhitelistBatchMinter bm) = _registerTaxed(TAXED_BPS);
+
+        for (uint256 i = 0; i < 4; i++) {
+            _donateTaxed(taxed, bm, BIG_DONATION);
+            (, uint256 buffer,,) = _streamState(address(bm), address(taxed));
+            assertEq(buffer, taxed.balanceOf(address(streamer)), "buffer never exceeds pooled custody");
+        }
     }
 }
