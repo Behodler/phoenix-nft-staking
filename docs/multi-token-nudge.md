@@ -4,6 +4,7 @@ Status: **implemented** — landed as the sibling contract `src/BatchNFTMinterMu
 (story 022, stages 0-7; reward-token selection moved from a caller-supplied
 array to an owner-managed whitelist in story 025). The deployed
 `src/BatchNFTMinter.sol` is frozen and unchanged.
+Successor: `src/BatchNFTMinterNudgeDiscount.sol` (story 033) — see §9.
 Supersedes: the owner-set single `nudgePaymentToken` model in
 `src/BatchNFTMinter.sol` (which remains deployed and frozen; the new model
 lives in `src/BatchNFTMinterMultiToken.sol`), and the story-022
@@ -734,3 +735,176 @@ Take a `forge snapshot` before the change and diff after. Expected shape:
 
 A superlinear trend across increasing array lengths means a dedupe or nested
 loop crept in — treat that as a bug against §4.5, not as a tuning problem.
+
+## 9. Successor: BatchNFTMinterNudgeDiscount (story 033)
+
+`src/BatchNFTMinterNudgeDiscount.sol` replaces `BatchNFTMinterMultiToken` for new
+deployments. It implements **design revision 2**, agreed with the owner on 2026-10-27. Both
+`BatchNFTMinterMultiToken` and `BatchNFTMinter` are deployed and frozen and are not modified.
+Deployment and cutover belong to phStaging2 (stories 118/119), not to this repo.
+
+### 9.1 The loophole
+
+Under the multi-token minter, a whale whose earlier mints earned large NFTStaker phUSD
+rewards could sell that phUSD to fund a qualifying `nudgeSize` batch (40 NFTs) and take the
+winner-take-all USDC pot. That extracted the pot without bringing in new liquidity. The
+"pot is yield-funded, so over-funding is only an opportunity cost" argument in §1 and §5
+assumed the pot was a marketing subsidy. A self-funding loop that drains it repeatedly
+breaks that assumption.
+
+### 9.2 The rev 2 model
+
+The USDC pot no longer pays cash to anyone. It **sets a discrete discount batch**, and the
+pot itself is **reserved** to buy phUSD later.
+
+- `P0` is the next-NFT price at batch start: `configs(dispatcherIndex).price`, in 18dp USDS.
+- `potUSDC = discountToken.balanceOf(this) - pendingBuyUSDC`. The reserve is not pot.
+- `potUSD` is converted with the PSM's own sell maths:
+  `gross = potUSDC * to18ConversionFactor`, then `potUSD = gross - gross * tin / 1e18`.
+- `free = potUSD / P0` (floor). It is 0 when `discountPercent == 0`.
+- `total = ceilDiv(free * 100, discountPercent)`. This rounds **up**, so the effective
+  discount never exceeds `discountPercent`. The spec's literal floor gives the same result
+  for every worked example below.
+- `paid = total - free`.
+- `paidCost` is the sum of the `paid` rising prices from `P0`, term for term with
+  NFTMinterV2's ramp (`price + price * growthBasisPoints / 10000`).
+- `owed = free * P0 * mintDebtHook.ratio() / 100`, with the ratio read live.
+
+The caller cannot choose the count. They pass the previewed `expectedTotal`, and a mismatch
+reverts `TotalMismatch`. `maxPayment` caps their spend. Batch minting is disabled when
+`free == 0` or `discountPercent == 0` (`NoDiscountAvailable`).
+
+Worked examples (d = `discountPercent`, P0 = 10e18, tin = 0, conversion factor 1e12):
+
+| d | Pot (USDC 6dp) | free | paid | total | Reserved | Owed (ratio 50) |
+|---|---|---|---|---|---|---|
+| 50 | 10e6 | 1 | 1 | 2 | 10e6 | 5e18 |
+| 50 | 15e6 | 1 | 1 | 2 | **15e6** (the whole pot) | 5e18 |
+| 50 | 20e6 | 2 | 2 | 4 | 20e6 | 10e18 |
+| 50 | 100e6 | 10 | 10 | 20 | 100e6 | 50e18 |
+| 25 | 10e6 | 1 | 3 | 4 | 10e6 | 5e18 |
+| 100 | 20e6 | 2 | 0 | 2 | 20e6 | 10e18 |
+
+With pot 100 the batch **must** be 20 NFTs, so nobody can mint one NFT and drain a large pot.
+At d = 100 no payment is pulled at all.
+
+`previewBatch()` runs the same maths through the same internal helper. Its pot also counts
+`NudgeStreamer.pendingStream(this, discountToken)`. It returns `nextStepUSDC`: the
+additional USDC, rounded up and with `tin` inverted, that lifts `free` by exactly one. It is
+an **estimate**, because stream accrual and front-runs can change the pot between preview and
+mint. That is why `expectedTotal` and `maxPayment` exist. When the contract is misconfigured
+or `free == 0`, the preview returns zeros for the batch fields instead of reverting.
+
+### 9.3 Free NFTs come from `mintFor`
+
+Paid NFTs go through `ITokenMinterV2.mint` exactly as before: full price to the dispatcher,
+price growth, and mint-debt accrual on the gross price. Free NFTs come from
+`INFTMinterV2.mintFor(dispatcherIndex, recipient)`, so this contract must be an authorised
+minter on NFTMinterV2. `mintFor` takes no payment, does not dispatch, and **does not raise
+the price**, which the owner explicitly wants.
+
+### 9.4 The reserve and the deferred `buyAndBurn`
+
+`batchMint` moves no USDC. It reserves the whole pot, partial-step remainder included:
+`pendingBuyUSDC += potUSDC` and `pendingStakerPhUSD += owed`. The owed portion balances the
+books for the mint-debt hook that the free NFTs skipped. It is phUSD **bought** on the open
+market, not minted, so it adds no new supply.
+
+A swap inside the user's own transaction could be sandwiched. The buy is therefore a
+separate step, called only by an authorised buyer with an off-chain floor (the MEV rule in
+phase-2-staging `docs/NFT/UniV2PriceTilting.md`, mirroring `UniPoolerV2.pool`):
+
+```
+buyAndBurn(usdcIn, minPhusdOut, deadline)   // usdcIn <= pendingBuyUSDC; partial buys allowed
+  USDC --PSM.sellGem--> USDS --sUSDS.deposit--> sUSDS --UniV2 [sUSDS, phUSD]--> phUSD
+```
+
+Every allowance is exact and is reset to 0 afterwards. `phusdOut` is a balance delta taken
+around the swap alone, because phUSD is also a bonus token held on this contract. The split:
+
+- `toStakerOwed = min(phusdOut, pendingStakerPhUSD)`, paid to NFTStaker first.
+- `extra = phusdOut - toStakerOwed`.
+- `burned = extra * burnPercent / 100`. This floors, so burn dust goes to NFTStaker.
+- The rest of `extra` also goes to NFTStaker.
+- `phusdOut == toStaker + burned` exactly. No bought phUSD stays on the contract.
+
+phUSD's burn is allowance-based, so the contract approves **itself** for exactly `burned`
+on each call. If phUSD has rallied and the buy returns less than the owed amount, all of it
+goes to NFTStaker and the shortfall carries forward in `pendingStakerPhUSD`.
+
+Buyer authorisation copies UniPoolerV2. `authVersion` starts at **1**, because the mapping
+default is 0 and a zero `authVersion` would authorise every address. `incrementAuthVersion`
+mass-revokes all buyers. `buyAndBurn` is not pause-gated: pausing stops new reservations
+but still lets the reserve drain.
+
+The reserve and the live pot share one USDC balance. Every pot read subtracts the reserve.
+`rescueERC20` cannot take reserved USDC (`Rescue__ReservedFunds`). `setDiscountToken`
+reverts while a reserve is pending. The active discount token cannot be unwhitelisted.
+Reserved USDC leaves **only** through `buyAndBurn`. If the route ever breaks permanently,
+the owner must repoint it with `setPSM`, `setSUSDS` or `setSwapRoute`. There is deliberately
+no owner escape for the reserve.
+
+### 9.5 Execution order (normative)
+
+`batchMint(expectedTotal, recipient, maxPayment, bonusMinRewards)`:
+
+1. Validate: non-zero recipient, `expectedTotal > 0`, and
+   `bonusMinRewards.length == getBonusTokens().length`.
+2. Resolve the payment path. The payment token is the dispatcher's `primeToken()`.
+3. Flush `pullPendingStream` for **all** whitelisted tokens, the discount token included.
+4. Snapshot every bonus balance and check the floors.
+5. Read the pot and check the config: `discountToken`, `psm` and `mintDebtHook` must be set,
+   and `psm.gem() == discountToken`.
+6. Do the maths. Revert `NoDiscountAvailable`, `TotalMismatch` or `MaxPaymentExceeded` as
+   appropriate.
+7. Reserve: `pendingBuyUSDC += potUSDC` and `pendingStakerPhUSD += owed`.
+8. Pull the caller's payment as a measured delta capped at `maxPayment` (§4.1). This is
+   skipped when `paid == 0`.
+9. Run the paid mint loop. The price is re-read on every iteration, and the approval is the
+   exact price.
+10. Revoke the minter allowance.
+11. Run the free mint loop (`mintFor`).
+12. Refund from `budget` only.
+13. Emit `BatchMinted`.
+14. Pay out the step-4 snapshot.
+
+Load-bearing orderings:
+
+- **(a)** The bonus snapshot comes before the pull (inherited, §4.2).
+- **(b)** The refund comes before the bonus payout (inherited).
+- **(c)** The flush comes before the pot read, so the pot includes the accrued stream.
+- **(d)** The pot read, the maths, and the `expectedTotal` and `maxPayment` checks all come
+  before any value moves, so a front-run caller reverts cleanly.
+- **(e)** The reserve is written before the external mint calls. `nonReentrant` also
+  covers this.
+- **(f)** The paid mints come before the free mints, so `mintFor` cannot affect paid
+  prices. It does not move the price anyway; the order is fixed for auditability.
+
+### 9.6 `nudgeSize` is removed; bonuses are paid on every batch
+
+There is no qualification threshold. The bonus tokens are every whitelisted token except the
+discount token, listed in `getBonusTokens()` order (which swap-and-pop can reorder). Every
+successful batch receives their **entire** pre-pull balance. Every batch contains at least
+one free NFT, so a bonus always accompanies a discounted mint. The discount token stays on
+the whitelist, because `NudgeStreamer.registerStream` requires it, but it is never paid out.
+
+### 9.7 §5's "no value-aware cap" stance
+
+- **Superseded for the discount token.** The USDC pot is never paid out at all. Its only
+  exit is `buyAndBurn`.
+- **Still holds for bonus tokens.** They are paid out in full, with no value-aware cap,
+  for the same reasons as before.
+
+### 9.8 Audit-critical: `mintFor` power
+
+This contract holds unlimited free-mint power over its dispatcher index, bounded only by
+its own logic.
+
+- `NFTMinterV2.mintFor` ignores the NFTMinter pause. **This contract's pause is the only
+  kill switch for free mints.**
+- When this minter is retired, revoke its authorisation with
+  `NFTMinterV2.setAuthorizedMinter(batch, false)`.
+- Staked free NFTs raise NFTStaker's `totalStaked × latestPrice` without raising the price.
+  The owner accepts this.
+- `pendingStakerPhUSD` can carry over while phUSD trades above roughly `$1 / (ratio/100)`.
+  The owner monitors it through the public getter.
