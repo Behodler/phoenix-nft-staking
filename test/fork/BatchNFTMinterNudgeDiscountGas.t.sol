@@ -119,8 +119,11 @@ contract BatchNFTMinterNudgeDiscountGasForkTest is Test {
     }
 
     function _calldata(uint256 total, uint8 boost) internal view returns (bytes memory) {
-        uint256[] memory mins = new uint256[](2);
-        return abi.encodeCall(BatchNFTMinterNudgeDiscount.batchMint, (total, boost, batcher, 10_000_000e18, mins));
+        address[] memory bonusTokens = minter.getBonusTokens();
+        uint256[] memory mins = new uint256[](bonusTokens.length);
+        return abi.encodeCall(
+            BatchNFTMinterNudgeDiscount.batchMint, (total, boost, batcher, 10_000_000e18, bonusTokens, mins)
+        );
     }
 
     function _calldataGas(bytes memory data) internal pure returns (uint256 g) {

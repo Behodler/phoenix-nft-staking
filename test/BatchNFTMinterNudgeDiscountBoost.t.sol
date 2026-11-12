@@ -75,7 +75,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
     function _batchQuoted(uint8 quoted) internal returns (uint256 totalPaid, uint256 free, uint256 paid) {
         (uint256 total, uint256 paidCost) = _previewTotal();
         vm.prank(caller);
-        return batch.batchMint(total, quoted, recipient, paidCost, _zeros());
+        return batch.batchMint(total, quoted, recipient, paidCost, _bonusTokens(), _zeros());
     }
 
     // =====================================================================
@@ -360,7 +360,8 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectEmit(address(batch));
         emit TempDiscountApplied(overflowFree, boost, eff);
         vm.prank(caller);
-        (uint256 totalPaid, uint256 f, uint256 p) = batch.batchMint(total, boost, recipient, paidCost, _zeros());
+        (uint256 totalPaid, uint256 f, uint256 p) =
+            batch.batchMint(total, boost, recipient, paidCost, _bonusTokens(), _zeros());
         assertEq(f, free);
         assertEq(p, paid);
         assertEq(f + p, total);
@@ -393,7 +394,8 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectEmit(address(batch));
         emit TempDiscountApplied(overflowNow, boost, 66); // the flushed overflow, the QUOTED terms
         vm.prank(caller);
-        (uint256 totalPaid, uint256 free, uint256 paid) = batch.batchMint(total, boost, recipient, paidCost, _zeros());
+        (uint256 totalPaid, uint256 free, uint256 paid) =
+            batch.batchMint(total, boost, recipient, paidCost, _bonusTokens(), _zeros());
         assertEq(free + paid, total, "exactly the previewed batch");
         assertEq(totalPaid, paidCost);
     }
@@ -405,7 +407,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         usds.mint(frontRunner, paidCost);
         vm.startPrank(frontRunner);
         usds.approve(address(batch), type(uint256).max);
-        batch.batchMint(total, boost, frontRunner, paidCost, _zeros());
+        batch.batchMint(total, boost, frontRunner, paidCost, _bonusTokens(), _zeros());
         vm.stopPrank();
 
         (, uint8 live,,) = _boost();
@@ -415,7 +417,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectRevert(
             abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__BoostNotAvailable.selector, boost, live)
         );
-        batch.batchMint(total, boost, recipient, paidCost, _zeros());
+        batch.batchMint(total, boost, recipient, paidCost, _bonusTokens(), _zeros());
         assertEq(usds.balanceOf(caller), callerBefore, "nothing moved");
     }
 
@@ -427,7 +429,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectRevert(
             abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__BoostNotAvailable.selector, boost, 3)
         );
-        batch.batchMint(total, boost, recipient, paidCost, _zeros());
+        batch.batchMint(total, boost, recipient, paidCost, _bonusTokens(), _zeros());
     }
 
     function test_Quoted_p0Rise_reverts() public {
@@ -438,7 +440,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectRevert(
             abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__BoostNotAvailable.selector, boost, 11)
         );
-        batch.batchMint(total, boost, recipient, paidCost, _zeros());
+        batch.batchMint(total, boost, recipient, paidCost, _bonusTokens(), _zeros());
     }
 
     function test_Quoted_belowLive_succeedsAtQuotedTerms() public {
@@ -449,7 +451,8 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectEmit(address(batch));
         emit TempDiscountApplied(50, quoted, 55);
         vm.prank(caller);
-        (uint256 totalPaid, uint256 free, uint256 paid) = batch.batchMint(total, quoted, recipient, cost, _zeros());
+        (uint256 totalPaid, uint256 free, uint256 paid) =
+            batch.batchMint(total, quoted, recipient, cost, _bonusTokens(), _zeros());
         assertEq(free, 50);
         assertEq(paid, total - 50);
         assertEq(totalPaid, cost);
@@ -461,7 +464,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         uint256 total = 100; // undiscounted-by-boost terms: ceil(5000 / 50)
         vm.recordLogs();
         vm.prank(caller);
-        batch.batchMint(total, 0, recipient, _ramp(P0, 50), _zeros());
+        batch.batchMint(total, 0, recipient, _ramp(P0, 50), _bonusTokens(), _zeros());
         _assertNoTempDiscount();
     }
 
@@ -472,7 +475,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         vm.expectRevert(
             abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__BoostNotAvailable.selector, 17, 16)
         );
-        batch.batchMint(12345, 17, recipient, type(uint256).max, _zeros()); // total is wrong too
+        batch.batchMint(12345, 17, recipient, type(uint256).max, _bonusTokens(), _zeros()); // total is wrong too
     }
 
     // =====================================================================
@@ -585,12 +588,12 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         minter.setPaused(true);
         vm.prank(caller);
         vm.expectRevert(MockITokenMinterV2.MockITokenMinterV2__Paused.selector);
-        batch.batchMint(total, 49, recipient, paidCost, _zeros());
+        batch.batchMint(total, 49, recipient, paidCost, _bonusTokens(), _zeros());
         assertEq(minter.mintForCallCount(), 0, "no free mint against a paused minter");
 
         minter.setPaused(false);
         vm.prank(caller);
-        (,, uint256 paid) = batch.batchMint(total, 49, recipient, paidCost, _zeros());
+        (,, uint256 paid) = batch.batchMint(total, 49, recipient, paidCost, _bonusTokens(), _zeros());
         assertEq(paid, 1);
     }
 
@@ -599,7 +602,7 @@ contract BatchNFTMinterNudgeDiscountBoostTest is NudgeDiscountFixture {
         minter.setDispatcherDisabled(IDX, true);
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(MockITokenMinterV2.MockITokenMinterV2__Disabled.selector, IDX));
-        batch.batchMint(total, 49, recipient, paidCost, _zeros());
+        batch.batchMint(total, 49, recipient, paidCost, _bonusTokens(), _zeros());
         assertEq(minter.mintForCallCount(), 0, "no free mint against a disabled index");
     }
 

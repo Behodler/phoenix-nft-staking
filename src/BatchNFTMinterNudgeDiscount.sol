@@ -81,7 +81,8 @@ import {IMintDebtRatio} from "./interfaces/IMintDebtRatio.sol";
 ///
 /// **Whitelist-selected multi-token nudge (story-025).** The owner controls the set of
 /// reward assets through an owner-managed whitelist (`setNudgeTokenWhitelist`); the caller
-/// supplies only a per-token floor. Vetting the token set at admin time removes the
+/// supplies only a per-token floor, plus the bonus-token order it read (`bonusTokens`), which
+/// is checked against the live order and never selects a token (audit-27 L-01). Vetting the token set at admin time removes the
 /// weird-token attack surface that attacker-chosen addresses opened — anything odd that
 /// lands here is simply left to `rescueERC20`. Here the whitelist also carries the
 /// discount token, because `NudgeStreamer.registerStream` requires it, but the discount
@@ -266,8 +267,17 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     error BatchMint__ZeroCount();
     /// @dev Reverted when `recipient == address(0)`.
     error BatchMint__ZeroRecipient();
-    /// @dev Reverted when `bonusMinRewards.length != getBonusTokens().length`.
+    /// @dev Reverted when either `batchMint` bonus array (`bonusTokens` or `bonusMinRewards`)
+    ///      has a length other than `getBonusTokens().length`. Each array is checked separately
+    ///      (`bonusTokens` first): `tokensLength` is the live bonus-token count and `minsLength`
+    ///      is the length of whichever caller array was wrong.
     error BatchMint__ArrayLengthMismatch(uint256 tokensLength, uint256 minsLength);
+    /// @dev Reverted (audit-27 L-01) when the caller's `bonusTokens[index]` is not the live bonus
+    ///      token at slot `index`, i.e. the whitelist or the discount token changed after the
+    ///      caller read `getBonusTokens()`. `expected` is the caller's `bonusTokens[index]`;
+    ///      `actual` is the live `getBonusTokens()[index]`. Re-read `getBonusTokens()` (and the
+    ///      preview) and resubmit.
+    error BatchMint__BonusTokenMismatch(uint256 index, address expected, address actual);
     /// @dev Reverted when `batchMint` is called while `tokenMinter` is unset.
     error BatchMint__MinterNotConfigured();
     /// @dev Reverted when `dispatcherIndex` is unset (`0`) or resolves to a zero dispatcher.
@@ -397,8 +407,12 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     }
 
     /// @notice The bonus tokens, in `getNudgeTokens()` order with `discountToken` skipped.
-    ///         `bonusMinRewards` in `batchMint` binds to THIS order. Unwhitelisting uses
-    ///         swap-and-pop, which REORDERS the list — fetch immediately before calling.
+    ///         `batchMint` takes this list back as `bonusTokens` (with `bonusMinRewards`
+    ///         parallel to it) and checks it slot by slot against the live order, reverting
+    ///         `BatchMint__BonusTokenMismatch` on any drift. The order can change without the
+    ///         length changing (swap-and-pop removal followed by an add, or a `setDiscountToken`
+    ///         switch), so a stale or pending call fails closed rather than binding a floor to
+    ///         the wrong token. Pass `bonusTokens` and `bonusMinRewards` from the SAME read.
     function getBonusTokens() public view returns (address[] memory bonus) {
         address dt = address(discountToken);
         uint256 n = _nudgeTokens.length;
@@ -425,8 +439,11 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     /// @notice Owner-gated add/remove of a whitelisted token. Stays callable while paused.
     /// @dev    Adding rejects only the zero address and a duplicate. Removal is swap-and-pop
     ///         (reorders) and REVERTS for the active discount token: clear `discountToken`
-    ///         first (which in turn needs an empty reserve). That avoids a silent flip of the
-    ///         bonus ordering and keeps NudgeStreamer's registration precondition true.
+    ///         first (which in turn needs an empty reserve). That keeps the discount token
+    ///         whitelisted (`_bonusCount` relies on it) and NudgeStreamer's registration
+    ///         precondition true. It does NOT keep the bonus order stable: removal and a later
+    ///         add, or a `setDiscountToken` switch, still reorder `getBonusTokens()`. What makes
+    ///         that drift safe is `batchMint`'s `bonusTokens` check, which fails closed.
     function setNudgeTokenWhitelist(address token, bool allowed) external onlyOwner {
         if (allowed) {
             if (token == address(0)) revert BatchMint__ZeroNudgeToken();
@@ -776,7 +793,10 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     /// @param  maxPayment       Payment-token ceiling. Reverts `MaxPaymentExceeded` up front if
     ///                          the batch costs more. Pulled in full (when `paid > 0`); unspent
     ///                          budget >= `DUST_THRESHOLD` is refunded.
-    /// @param  bonusMinRewards  Per-bonus-token floor, parallel to `getBonusTokens()`.
+    /// @param  bonusTokens      The caller's `getBonusTokens()` read. Must match the live
+    ///                          bonus order slot by slot (step 4), else reverts
+    ///                          `BonusTokenMismatch`; a wrong length reverts `ArrayLengthMismatch`.
+    /// @param  bonusMinRewards  Per-bonus-token floor, parallel to `bonusTokens` (same read).
     /// @return totalPaid        The caller's own spend (pulled budget - refund). The pot never
     ///                          contributes.
     /// @return free             NFTs minted for free.
@@ -786,13 +806,18 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         uint8 quotedBoost,
         address recipient,
         uint256 maxPayment,
+        address[] calldata bonusTokens,
         uint256[] calldata bonusMinRewards
     ) external whenNotPaused nonReentrant returns (uint256 totalPaid, uint256 free, uint256 paid) {
         // --- 1. Validate the caller's inputs. ---
         if (expectedTotal == 0) revert BatchMint__ZeroCount();
         if (recipient == address(0)) revert BatchMint__ZeroRecipient();
         {
+            // Each bonus array is checked on its own, so the revert names the wrong length.
             uint256 bonusCount = _bonusCount();
+            if (bonusCount != bonusTokens.length) {
+                revert BatchMint__ArrayLengthMismatch(bonusCount, bonusTokens.length);
+            }
             if (bonusCount != bonusMinRewards.length) {
                 revert BatchMint__ArrayLengthMismatch(bonusCount, bonusMinRewards.length);
             }
@@ -809,13 +834,17 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         // the bonus snapshot, so accrued bonus streams are counted for this batch.
         _flushStreams();
 
-        // --- 4. Bonus snapshot + per-token floors. ---
+        // --- 4. Bonus order check + snapshot + per-token floors. ---
+        //
+        // The caller's `bonusTokens` is checked against the live order slot by slot here, so a
+        // whitelist or discount-token change since the caller's read reverts
+        // `BonusTokenMismatch` before any value moves (audit-27 L-01).
         //
         // ORDER IS LOAD-BEARING (a) — inherited: the snapshot stays BEFORE the pull at step 8,
         // so the caller's own payment is never visible to the payout. It is also taken BEFORE
         // the mint loops, so this batch's own per-mint donations stay behind for the next
         // batch ("donate forward", §4.2). Do not move this read to the payout site.
-        uint256[] memory snapshot = _snapshotBonus(bonusMinRewards);
+        uint256[] memory snapshot = _snapshotBonus(bonusTokens, bonusMinRewards);
 
         // --- 5 + 6. Pot read, config checks, maths, and the caller's guards. ---
         //
@@ -945,14 +974,22 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     }
 
     /// @dev Step 4: the PRE-PULL, PRE-LOOP snapshot of every bonus balance, iterating the
-    ///      whitelist in storage order with the discount token skipped (`bonusMinRewards[j]`
-    ///      binds to `getBonusTokens()[j]`), plus the per-token floor check. There is no
-    ///      `nudgeSize` threshold: every successful batch pays every bonus balance.
+    ///      whitelist in storage order with the discount token skipped, plus the per-token
+    ///      floor check. Before each floor is read, the caller's `bonusTokens[j]` must equal the
+    ///      live token at slot `j`, else `BatchMint__BonusTokenMismatch(j, bonusTokens[j], t)`.
+    ///      That binds `bonusMinRewards[j]` to the token the caller NAMED, not merely to a
+    ///      position, so a reordered list fails closed (audit-27 L-01). Both arrays were
+    ///      length-checked against `_bonusCount()` at step 1. There is no `nudgeSize`
+    ///      threshold: every successful batch pays every bonus balance.
     ///
     ///      **These balances are read BEFORE the mint loops and paid out after them (§4.2).**
     ///      Moving this read next to the transfer looks cleaner and silently hands the batcher
     ///      the donations their own mints just produced.
-    function _snapshotBonus(uint256[] calldata bonusMinRewards) private view returns (uint256[] memory snapshot) {
+    function _snapshotBonus(address[] calldata bonusTokens, uint256[] calldata bonusMinRewards)
+        private
+        view
+        returns (uint256[] memory snapshot)
+    {
         address dt = address(discountToken);
         uint256 n = _nudgeTokens.length;
         snapshot = new uint256[](bonusMinRewards.length);
@@ -960,6 +997,7 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         for (uint256 i; i < n; ++i) {
             address t = _nudgeTokens[i];
             if (t == dt) continue;
+            if (bonusTokens[j] != t) revert BatchMint__BonusTokenMismatch(j, bonusTokens[j], t);
             uint256 available = IERC20(t).balanceOf(address(this));
             uint256 minReward = bonusMinRewards[j];
             if (available < minReward) revert BatchMint__RewardBelowMinimum(t, minReward, available);

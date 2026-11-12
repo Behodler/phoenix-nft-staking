@@ -239,9 +239,11 @@ contract NudgeDiscountHandler is Test {
         uint256 callerUsdsBefore = usds.balanceOf(caller);
         uint256 owedBefore = batch.pendingStakerPhUSD();
 
-        uint256[] memory mins = new uint256[](batch.getBonusTokens().length);
+        // Bonus tokens and floors from the SAME read, before the prank (story 035).
+        address[] memory bonusTokens = batch.getBonusTokens();
+        uint256[] memory mins = new uint256[](bonusTokens.length);
         vm.prank(caller);
-        try batch.batchMint(expectedTotal, quotedBoost, recipient, maxPayment, mins) returns (
+        try batch.batchMint(expectedTotal, quotedBoost, recipient, maxPayment, bonusTokens, mins) returns (
             uint256 totalPaid, uint256 free, uint256 paid
         ) {
             successfulBatches++;
