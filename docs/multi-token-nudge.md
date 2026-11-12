@@ -761,10 +761,13 @@ pot itself is **reserved** to buy phUSD later.
 - `potUSDC = discountToken.balanceOf(this) - pendingBuyUSDC`. The reserve is not pot.
 - `potUSD` is converted with the PSM's own sell maths:
   `gross = potUSDC * to18ConversionFactor`, then `potUSD = gross - gross * tin / 1e18`.
-- `free = potUSD / P0` (floor). It is 0 when `discountPercent == 0`.
-- `total = ceilDiv(free * 100, discountPercent)`. This rounds **up**, so the effective
-  discount never exceeds `discountPercent`. The spec's literal floor gives the same result
-  for every worked example below.
+- `potFree = potUSD / P0` (floor). `free = min(potFree, maxFreePerBatch)` (audit-27 M-01,
+  §9.9). It is 0 when `discountPercent == 0`.
+- `effective = min(discountPercent + boost, 99)`, where `boost` is the overflow boost of
+  §9.9 (0 at or below the cap, and 0 while `maxBoost == 0`).
+- `total = ceilDiv(free * 100, effective)`. This rounds **up**, so the discount never
+  exceeds `effective`. The spec's literal floor gives the same result for every worked
+  example below. Because `effective <= 99`, `total > free`, so **`paid >= 1` always**.
 - `paid = total - free`.
 - `paidCost` is the sum of the `paid` rising prices from `P0`, term for term with
   NFTMinterV2's ramp (`price + price * growthBasisPoints / 10000`).
@@ -772,7 +775,8 @@ pot itself is **reserved** to buy phUSD later.
 
 The caller cannot choose the count. They pass the previewed `expectedTotal`, and a mismatch
 reverts `TotalMismatch`. `maxPayment` caps their spend. Batch minting is disabled when
-`free == 0` or `discountPercent == 0` (`NoDiscountAvailable`).
+`free == 0` or `discountPercent == 0` (`NoDiscountAvailable`). `discountPercent` is either 0
+or in `[MIN_DISCOUNT_PERCENT, 99]` = `[50, 99]` (audit-27 M-01 and L-04).
 
 Worked examples (d = `discountPercent`, P0 = 10e18, tin = 0, conversion factor 1e12):
 
@@ -782,18 +786,29 @@ Worked examples (d = `discountPercent`, P0 = 10e18, tin = 0, conversion factor 1
 | 50 | 15e6 | 1 | 1 | 2 | **15e6** (the whole pot) | 5e18 |
 | 50 | 20e6 | 2 | 2 | 4 | 20e6 | 10e18 |
 | 50 | 100e6 | 10 | 10 | 20 | 100e6 | 50e18 |
-| 25 | 10e6 | 1 | 3 | 4 | 10e6 | 5e18 |
-| 100 | 20e6 | 2 | 0 | 2 | 20e6 | 10e18 |
+| 75 | 30e6 | 3 | 1 | 4 | 30e6 | 15e18 |
+| 99 | 20e6 | 2 | 1 | 3 | 20e6 | 10e18 |
+| 50, cap 5 | 150e6 | 5 | 5 | 10 | **50e6** (the rest stays pot) | 25e18 |
 
 With pot 100 the batch **must** be 20 NFTs, so nobody can mint one NFT and drain a large pot.
-At d = 100 no payment is pulled at all.
+Even at the maximum percent, 99, one NFT is paid for. The last row is capped (§9.9):
+`maxFreePerBatch = 5`, so only `5 * P0` of the pot is reserved and 100e6 stays as live pot,
+with an overflow of 10.
 
-`previewBatch()` runs the same maths through the same internal helper. Its pot also counts
-`NudgeStreamer.pendingStream(this, discountToken)`. It returns `nextStepUSDC`: the
-additional USDC, rounded up and with `tin` inverted, that lifts `free` by exactly one. It is
-an **estimate**, because stream accrual and front-runs can change the pot between preview and
-mint. That is why `expectedTotal` and `maxPayment` exist. When the contract is misconfigured
-or `free == 0`, the preview returns zeros for the batch fields instead of reverting.
+`previewBatch()` runs the same maths through the same internal helper, with the cap and the
+**live** boost. Its pot also counts `NudgeStreamer.pendingStream(this, discountToken)`. It
+returns `nextStepUSDC`: the additional USDC, rounded up and with `tin` inverted, that lifts
+the **uncapped** `potFree` by exactly one. Below the cap that means "USDC until `free + 1`".
+At or above the cap `free` stays at `maxFreePerBatch`, so it means "USDC until
+`overflowFree + 1`"; one boost point takes `overflowNFTsPerBoostPoint` such steps. The
+companion `previewBoost()` returns `(overflowFree, boost, effectivePercent, reservedUSDC)`
+from the same `_preview()` call. A caller passes `previewBatch().total` as `expectedTotal` and
+`previewBoost().boost` as `quotedBoost`.
+
+The preview is an **estimate**, because stream accrual and front-runs can change the pot
+between preview and mint. That is why `expectedTotal`, `quotedBoost` and `maxPayment` exist.
+When the contract is misconfigured or `free == 0`, both previews return zeros for the batch
+fields instead of reverting.
 
 ### 9.3 Free NFTs come from `mintFor`
 
@@ -805,8 +820,12 @@ the price**, which the owner explicitly wants.
 
 ### 9.4 The reserve and the deferred `buyAndBurn`
 
-`batchMint` moves no USDC. It reserves the whole pot, partial-step remainder included:
-`pendingBuyUSDC += potUSDC` and `pendingStakerPhUSD += owed`. The owed portion balances the
+`batchMint` moves no USDC. It reserves the pot the batch consumes: `pendingBuyUSDC +=
+reservedUSDC` and `pendingStakerPhUSD += owed`. At or below the cap `reservedUSDC` is the
+whole pot, partial-step remainder included. Above the cap it is only the USDC backing
+`maxFreePerBatch * P0`, rounded **up** in the protocol's favour
+(`ceil(potUSDC * free * P0 / potUSD)`, never more than `potUSDC`). The rest stays live,
+unreserved pot: it feeds the overflow boost and is rescuable. The owed portion balances the
 books for the mint-debt hook that the free NFTs skipped. It is phUSD **bought** on the open
 market, not minted, so it adds no new supply.
 
@@ -846,7 +865,7 @@ no owner escape for the reserve.
 
 ### 9.5 Execution order (normative)
 
-`batchMint(expectedTotal, recipient, maxPayment, bonusMinRewards)`:
+`batchMint(expectedTotal, quotedBoost, recipient, maxPayment, bonusMinRewards)`:
 
 1. Validate: non-zero recipient, `expectedTotal > 0`, and
    `bonusMinRewards.length == getBonusTokens().length`.
@@ -855,17 +874,21 @@ no owner escape for the reserve.
 4. Snapshot every bonus balance and check the floors.
 5. Read the pot and check the config: `discountToken`, `psm` and `mintDebtHook` must be set,
    and `psm.gem() == discountToken`.
-6. Do the maths. Revert `NoDiscountAvailable`, `TotalMismatch` or `MaxPaymentExceeded` as
-   appropriate.
-7. Reserve: `pendingBuyUSDC += potUSDC` and `pendingStakerPhUSD += owed`.
-8. Pull the caller's payment as a measured delta capped at `maxPayment` (§4.1). This is
-   skipped when `paid == 0`.
+6. Do the maths at `discountPercent + quotedBoost` (clamped to 99). Revert, in this order,
+   `NoDiscountAvailable`, `BoostNotAvailable` (`quotedBoost` above the live boost),
+   `TotalMismatch` or `MaxPaymentExceeded`.
+7. Reserve: `pendingBuyUSDC += reservedUSDC` (capped, §9.4) and
+   `pendingStakerPhUSD += owed`.
+8. Pull the caller's payment as a measured delta capped at `maxPayment` (§4.1). Never
+   skipped: `paid >= 1` always.
 9. Run the paid mint loop. The price is re-read on every iteration, and the approval is the
    exact price.
 10. Revoke the minter allowance.
 11. Run the free mint loop (`mintFor`).
 12. Refund from `budget` only.
-13. Emit `BatchMinted`.
+13. Emit `BatchMinted` (its `potReservedUSDC` is `reservedUSDC`), then
+    `TempDiscountApplied(overflowFree, boost, effectivePercent)` when the applied boost is
+    non-zero.
 14. Pay out the step-4 snapshot.
 
 Load-bearing orderings:
@@ -873,12 +896,14 @@ Load-bearing orderings:
 - **(a)** The bonus snapshot comes before the pull (inherited, §4.2).
 - **(b)** The refund comes before the bonus payout (inherited).
 - **(c)** The flush comes before the pot read, so the pot includes the accrued stream.
-- **(d)** The pot read, the maths, and the `expectedTotal` and `maxPayment` checks all come
-  before any value moves, so a front-run caller reverts cleanly.
+- **(d)** The pot read, the maths, and the `quotedBoost`, `expectedTotal` and `maxPayment`
+  checks all come before any value moves, so a front-run caller reverts cleanly.
 - **(e)** The reserve is written before the external mint calls. `nonReentrant` also
   covers this.
-- **(f)** The paid mints come before the free mints, so `mintFor` cannot affect paid
-  prices. It does not move the price anyway; the order is fixed for auditability.
+- **(f)** The paid mints come before the free mints. `mintFor` does not move the price, but
+  it also checks neither NFTMinterV2's `paused` flag nor the per-index `disabled` flag. The
+  first paid `mint` checks both, so this order is what makes an NFTMinterV2 halt stop every
+  batch before any free mint (§9.8). It is load-bearing, not cosmetic.
 
 ### 9.6 `nudgeSize` is removed; bonuses are paid on every batch
 
@@ -900,11 +925,116 @@ the whitelist, because `NudgeStreamer.registerStream` requires it, but it is nev
 This contract holds unlimited free-mint power over its dispatcher index, bounded only by
 its own logic.
 
-- `NFTMinterV2.mintFor` ignores the NFTMinter pause. **This contract's pause is the only
-  kill switch for free mints.**
+- `NFTMinterV2.mintFor` ignores the NFTMinter pause and the per-index `disabled` flag. Free
+  mints are still halted by either, because every batch has `paid >= 1` and the paid loop
+  runs first (ordering (f)); `NFTMinterV2.mint` reverts on the first paid mint. Before
+  audit-27 L-04, `discountPercent = 100` made `paid == 0` and opened a free-mint path
+  against a halted NFTMinterV2; 100 is now rejected and the effective percent is clamped
+  to 99. The kill switches for free mints are therefore: this contract's own pause, an
+  NFTMinterV2 pause or index disable, and revoking the authorisation below.
 - When this minter is retired, revoke its authorisation with
   `NFTMinterV2.setAuthorizedMinter(batch, false)`.
 - Staked free NFTs raise NFTStaker's `totalStaked × latestPrice` without raising the price.
   The owner accepts this.
 - `pendingStakerPhUSD` can carry over while phUSD trades above roughly `$1 / (ratio/100)`.
   The owner monitors it through the public getter.
+
+### 9.9 Cap and overflow boost (audit-27 M-01)
+
+Without a cap, `free = potUSD / P0` is unbounded and the caller must take exactly the
+pot-sized batch. Once the pot is large enough, the only batch the contract accepts needs more
+than the EIP-7825 per-transaction gas cap (2^24), and batch minting stops for everyone
+(audit-27 M-01, measured on a fork at block 26,389,634: 138 free at d = 50 with the
+UniPoolerV2 donation leg off). The fix has two parts.
+
+**The cap.** `free = min(potFree, maxFreePerBatch)`. A capped batch reserves only the USDC
+backing `maxFreePerBatch * P0` (§9.4); the rest stays pot for the next batch. A boost only
+removes paid mints, so a cap that is gas-safe at `MIN_DISCOUNT_PERCENT` is gas-safe at every
+boosted percent. The owner can lower `discountPercent` to 50 at any time, so the cap must be
+sized at 50 whatever the operating percent is.
+
+**The overflow boost.** A pot that sits past the cap means buyers do not find the discount
+enticing. The boost raises the discount as the overflow grows:
+
+```
+overflowFree = potFree > cap ? potFree - cap : 0
+liveBoost    = min(maxBoost, overflowFree / overflowNFTsPerBoostPoint)
+effective    = min(discountPercent + boost, 99)
+```
+
+It is a pure function of current state: no timestamp, keeper or marking call. Stream inflow is
+the clock, so a languishing pot keeps getting more attractive until somebody claims. A capped
+batch consumes only `cap * P0`, so a large backlog **drains** the boost claim by claim instead
+of resetting it. `batchMint` emits `TempDiscountApplied(overflowFree, boost,
+effectivePercent)` whenever the applied boost is non-zero; those events are the data for
+retuning the parameters.
+
+**The quoted boost.** A boost that rises between preview and inclusion would change `total`
+and revert the user exactly when the pot is most attractive. The caller therefore passes the
+boost they previewed as `quotedBoost`. The batch is computed at `discountPercent +
+quotedBoost`, so stream inflow in flight cannot hurt them. A quote above the live boost
+reverts `BatchMint__BoostNotAvailable(quoted, live)` before `TotalMismatch`; that happens when
+the overflow fell in flight (a front-running claim, an owner `rescueERC20`, a P0 rise from
+direct NFTMinterV2 mints, or a parameter change). A quote below live is honoured at the quoted
+terms.
+
+**Donation constraint (Safeguard 4).** Anyone can transfer USDC to the minter and raise the
+overflow. One boost point must therefore cost more overflow than it saves on the paid half.
+One point at effective percent `e` cuts `total` by about `cap * 100 / e^2` NFTs, so the
+binding case is `e = discountPercent` and the condition is approximately
+`overflowNFTsPerBoostPoint > cap * 100 / discountPercent^2`, scaled up by the paid-price ramp.
+`boostDonationSafe()` evaluates it conservatively in integers at the current parameters:
+`perPoint * d^2 * 10_000 > cap * 100 * rampBps`, with `rampBps` the growth compounded (rounded
+up) over a full batch's paid mints. Because `overflowFree` floors, a tiny donation just below
+a step boundary can still buy a whole point early; that saving would have reached the next
+claimant through natural inflow anyway, so under P-006 it is accepted as opportunity cost.
+
+**Recirculation (audit-27 L-02).** Each paid mint dispatches `P` to UniPoolerV2, which streams
+`batchDonationSize`% (`s`) back into this pot. The loop gain is `k = s (100 - d) / (100 d)`;
+with `d >= 50` it is below 1 for every `s < 100`, so the floor alone keeps the loop
+contracting, and the cap bounds any single batch regardless.
+
+**Parameters.**
+
+| parameter | meaning | bound | default |
+|---|---|---|---|
+| `maxFreePerBatch` | gas-safe cap on free NFTs per batch | non-zero | 50 |
+| `overflowNFTsPerBoostPoint` | overflow free-equivalents per boost point | non-zero; `boostDonationSafe()` | 3 |
+| `maxBoost` | boost ceiling, in points | 0..49 | 0 (boost disabled) |
+| `MIN_DISCOUNT_PERCENT` | lowest non-zero `discountPercent` | constant | 50 |
+
+Parameter table, from the run-27 fork measurements (block 26,389,634, P0 about 18.46 USDS):
+8,734 gas per free mint, 110,529 per paid mint with the donation leg off, 262,254 with it on
+(`batchDonationSize = 10`; the PSM and streamer cost barely depends on the size), and a fixed
+overhead of 263,917. Gas is `263,917 + cap * 8,734 + paid * gPaid`, with
+`paid = ceil(cap * 100 / d) - cap`, against `2^24 - ~24,000` intrinsic. "Gas margin" is the
+headroom left below that; it must stay at or above 10%. "Donation margin" is how far the
+minimum safe `overflowNFTsPerBoostPoint` sits above the Safeguard-4 threshold at growth 1 bp.
+
+| leg | d | `maxFreePerBatch` | paid | gas | gas margin | Safeguard-4 threshold | min `overflowNFTsPerBoostPoint` | donation margin |
+|---|---|---|---|---|---|---|---|---|
+| **on** | 50 | 25 | 25 | 7.04M | 58.0% | 1.005 | 2 | 99% |
+| **on** | 50 | 40 | 40 | 11.10M | 33.7% | 1.613 | 2 | 24% |
+| **on** | 50 | **50** | 50 | 13.81M | **17.5%** | 2.020 | **3** | 49% |
+| **on** | 75 | 25 | 9 | 2.84M | 83.0% | 0.445 | 1 | 125% |
+| **on** | 75 | 40 | 14 | 4.28M | 74.4% | 0.713 | 1 | 40% |
+| **on** | 75 | 50 | 17 | 5.16M | 69.2% | 0.892 | 1 | 12% |
+| off | 50 | 25 | 25 | 3.25M | 80.6% | 1.005 | 2 | 99% |
+| off | 50 | 40 | 40 | 5.03M | 69.9% | 1.613 | 2 | 24% |
+| off | 50 | 50 | 50 | 6.23M | 62.8% | 2.020 | 3 | 49% |
+| off | 75 | 50 | 17 | 2.58M | 84.6% | 0.892 | 1 | 12% |
+
+The largest cap with 10% headroom at d = 50 is 54 free with the donation leg on and 124 with
+it off. The d = 75 rows show the extra margin at that operating percent, but the cap must
+still pass the d = 50 row, because the owner can lower the percent at any time. If the
+donation leg is ever made cheaper (a UniPoolerV2 rewrite), the cap can be raised with
+`setMaxFreePerBatch` alone, with no redeploy.
+
+`maxBoost` is not a gas or donation parameter: both constraints hold at every boost, because
+the 99 clamp and the amortised constraint apply at every reachable percent. Choose it from
+demand, so the boost reaches a meaningful level (around 10–15 points) after a few days of
+inflow past the cap. It ships at 0, so the boost is off until the phStaging2 cutover sets
+modelled values. That cutover must re-measure gas on a fork at the broadcast block and
+`batchDonationSize`, assert `boostDonationSafe()`, and set non-zero parameters in the deploy
+script; that gate lives in phStaging2, not here. `test/fork/BatchNFTMinterNudgeDiscountGas.t.sol`
+re-proves the cap's gas headroom on a fork when `RPC_MAINNET` is set.
