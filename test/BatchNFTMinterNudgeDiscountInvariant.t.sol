@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {INFTMinterV2} from "yield-claim-nft/interfaces/INFTMinterV2.sol";
 
 import {BatchNFTMinterNudgeDiscount} from "../src/BatchNFTMinterNudgeDiscount.sol";
 import {NudgeStreamer} from "../src/NudgeStreamer.sol";
@@ -20,7 +21,8 @@ import {MockUniV2AmmRouter} from "./mocks/MockUniV2Amm.sol";
 ///         `BatchNFTMinterMultiTokenBudgetInvariant.t.sol`.
 ///
 /// @dev    Fuzzes pot top-ups (direct and streamed), `batchMint` at a previewed — or
-///         deliberately stale — `expectedTotal`, under-quoted `maxPayment`, `discountPercent`,
+///         deliberately stale — `expectedTotal` and `quotedBoost`, under-quoted `maxPayment`,
+///         `discountPercent`, the audit-27 cap / boost parameters,
 ///         `burnPercent`, PSM `tin`, AMM repricing, and partial `buyAndBurn`. Violations are
 ///         recorded in sticky booleans so a later good call cannot mask an earlier bad one.
 contract NudgeDiscountHandler is Test {
@@ -47,6 +49,9 @@ contract NudgeDiscountHandler is Test {
     uint256 public successfulBatches;
     uint256 public noDiscountReverts;
     uint256 public totalMismatchReverts;
+    uint256 public boostNotAvailableReverts;
+    uint256 public boostedBatches;
+    uint256 public cappedBatches;
     uint256 public buysWithBurn;
     uint256 public rallyCarryForwards;
     uint256 public buys;
@@ -56,6 +61,9 @@ contract NudgeDiscountHandler is Test {
 
     bool public refundBoundHeld = true;
     bool public buySplitHeld = true;
+    /// @dev audit-27: every successful batch had `1 <= paid`, `free <= cap`, and reserved at
+    ///      most the live pot.
+    bool public capAndPaidHeld = true;
 
     constructor(
         BatchNFTMinterNudgeDiscount batch_,
@@ -109,11 +117,40 @@ contract NudgeDiscountHandler is Test {
 
     function setDiscountPercent(uint256 d) external {
         calls++;
-        // Weight towards realistic discounts; [0, 100] overall, 0 included.
-        d = bound(d, 0, 100);
-        if (d != 0 && d < 10) d += 10;
+        // audit-27: the legal range is {0} ∪ [MIN_DISCOUNT_PERCENT, 99].
+        d = bound(d, 0, 50);
+        if (d != 0) d += 49;
         vm.prank(owner);
         batch.setDiscountPercent(uint8(d));
+    }
+
+    /// @dev audit-27: the owner's remedy for an overflowing pot — rescue some or all of the
+    ///      UNRESERVED pot. Must never touch the reserve (`invariant_ReserveNeverExceedsBalance`).
+    function rescueUnreserved(uint256 frac) external {
+        calls++;
+        uint256 unreserved = batch.availablePotUSDC();
+        if (unreserved == 0) return;
+        uint256 amount = bound(frac, 1, unreserved);
+        vm.prank(owner);
+        batch.rescueERC20(IERC20(address(usdc)), owner, amount);
+    }
+
+    function setMaxFreePerBatch(uint256 cap) external {
+        calls++;
+        vm.prank(owner);
+        batch.setMaxFreePerBatch(bound(cap, 1, 60));
+    }
+
+    function setOverflowNFTsPerBoostPoint(uint256 perPoint) external {
+        calls++;
+        vm.prank(owner);
+        batch.setOverflowNFTsPerBoostPoint(bound(perPoint, 1, 4));
+    }
+
+    function setMaxBoost(uint256 boost) external {
+        calls++;
+        vm.prank(owner);
+        batch.setMaxBoost(uint8(bound(boost, 0, 49)));
     }
 
     function setBurnPercent(uint256 b) external {
@@ -157,10 +194,39 @@ contract NudgeDiscountHandler is Test {
 
     function batchMintFuzzed(uint256 staleSeed, uint256 quoteSeed) external {
         calls++;
+        _doBatch(staleSeed, quoteSeed);
+    }
+
+    /// @dev audit-27 composite: push the pot `1..4` boost points past the cap, batch at the
+    ///      live boost, then the owner rescues the unreserved leftover (the documented remedy).
+    ///      Guarantees capped and boosted batches are reachable in every run without letting the
+    ///      pot grow without bound (which would starve the `NoDiscountAvailable` path).
+    function overflowBatch(uint256 extra, uint256 quoteSeed) external {
+        calls++;
+        (, uint256 p0,,) = INFTMinterV2(address(batch.tokenMinter())).configs(batch.dispatcherIndex());
+        uint256 n = batch.maxFreePerBatch() + batch.overflowNFTsPerBoostPoint() * bound(extra, 1, 4);
+        // +6% covers the fuzzed PSM tin (<= 5%).
+        usdc.mint(address(batch), (n * p0 * 106) / 100 / 1e12 + 1);
+        // staleSeed 2: neither stale nor over-quoted; 1: over-quoted (live + 1).
+        _doBatch(quoteSeed % 3 == 0 ? 1 : 2, quoteSeed);
+        uint256 leftover = batch.availablePotUSDC();
+        if (leftover != 0) {
+            vm.prank(owner);
+            batch.rescueERC20(IERC20(address(usdc)), owner, leftover);
+        }
+    }
+
+    function _doBatch(uint256 staleSeed, uint256 quoteSeed) internal {
         (, uint256 total,, uint256 paidCost,,,) = batch.previewBatch();
+        uint8 liveBoost;
+        (, liveBoost,, _previewReserve) = batch.previewBoost();
+        _potBefore = batch.availablePotUSDC() + streamer.pendingStream(address(batch), address(usdc));
+        _reserveBefore = batch.pendingBuyUSDC();
 
         uint256 expectedTotal = total == 0 ? 1 : total;
         if (staleSeed % 5 == 0) expectedTotal += 1; // deliberately stale
+        uint8 quotedBoost = liveBoost;
+        if (staleSeed % 7 == 1) quotedBoost = liveBoost + 1; // deliberately above live
 
         uint256 maxPayment;
         uint256 mode = quoteSeed % 4;
@@ -173,10 +239,16 @@ contract NudgeDiscountHandler is Test {
         uint256 callerUsdsBefore = usds.balanceOf(caller);
         uint256 owedBefore = batch.pendingStakerPhUSD();
 
-        uint256[] memory mins = new uint256[](batch.getBonusTokens().length);
+        // Bonus tokens and floors from the SAME read, before the prank (story 035).
+        address[] memory bonusTokens = batch.getBonusTokens();
+        uint256[] memory mins = new uint256[](bonusTokens.length);
         vm.prank(caller);
-        try batch.batchMint(expectedTotal, recipient, maxPayment, mins) returns (uint256 totalPaid, uint256, uint256) {
+        try batch.batchMint(expectedTotal, quotedBoost, recipient, maxPayment, bonusTokens, mins) returns (
+            uint256 totalPaid, uint256 free, uint256 paid
+        ) {
             successfulBatches++;
+            if (quotedBoost != 0) boostedBatches++;
+            _checkCap(free, paid);
             owedAdded += batch.pendingStakerPhUSD() - owedBefore;
             uint256 spent = callerUsdsBefore - usds.balanceOf(caller);
             uint256 refund = maxPayment - spent;
@@ -187,6 +259,21 @@ contract NudgeDiscountHandler is Test {
             bytes4 sel = bytes4(err);
             if (sel == BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector) noDiscountReverts++;
             else if (sel == BatchNFTMinterNudgeDiscount.BatchMint__TotalMismatch.selector) totalMismatchReverts++;
+            else if (sel == BatchNFTMinterNudgeDiscount.BatchMint__BoostNotAvailable.selector) boostNotAvailableReverts++;
+        }
+    }
+
+    // Pre-batch snapshots, in storage for the legacy code generator's stack limit.
+    uint256 internal _previewReserve;
+    uint256 internal _potBefore;
+    uint256 internal _reserveBefore;
+
+    function _checkCap(uint256 free, uint256 paid) internal {
+        uint256 reserved = batch.pendingBuyUSDC() - _reserveBefore;
+        uint256 cap = batch.maxFreePerBatch();
+        if (free == cap && reserved < _potBefore) cappedBatches++;
+        if (paid == 0 || free > cap || reserved > _potBefore || reserved != _previewReserve) {
+            capAndPaidHeld = false;
         }
     }
 
@@ -221,7 +308,7 @@ contract NudgeDiscountHandler is Test {
 
 /// @notice Invariant suite over `NudgeDiscountHandler`.
 /// forge-config: default.invariant.runs = 64
-/// forge-config: default.invariant.depth = 500
+/// forge-config: default.invariant.depth = 850
 contract BatchNFTMinterNudgeDiscountInvariantTest is StdInvariant, NudgeDiscountFixture {
     NudgeDiscountHandler internal handler;
     NudgeStreamer internal streamer;
@@ -232,11 +319,14 @@ contract BatchNFTMinterNudgeDiscountInvariantTest is StdInvariant, NudgeDiscount
         vm.startPrank(owner);
         batch.setNudgeStreamer(address(streamer));
         streamer.registerStream(address(batch), address(usdc), 10 days);
+        // audit-27: start every run with a live boost (the handler then re-fuzzes the knobs).
+        batch.setOverflowNFTsPerBoostPoint(1);
+        batch.setMaxBoost(20);
         vm.stopPrank();
 
         handler = new NudgeDiscountHandler(batch, streamer, usdc, usds, phUSD, psm, sUSDS, router, owner, buyer);
 
-        bytes4[] memory selectors = new bytes4[](8);
+        bytes4[] memory selectors = new bytes4[](13);
         selectors[0] = NudgeDiscountHandler.topUpDirect.selector;
         selectors[1] = NudgeDiscountHandler.topUpStreamed.selector;
         selectors[2] = NudgeDiscountHandler.setDiscountPercent.selector;
@@ -245,6 +335,11 @@ contract BatchNFTMinterNudgeDiscountInvariantTest is StdInvariant, NudgeDiscount
         selectors[5] = NudgeDiscountHandler.reprice.selector;
         selectors[6] = NudgeDiscountHandler.batchMintFuzzed.selector;
         selectors[7] = NudgeDiscountHandler.buyPartial.selector;
+        selectors[8] = NudgeDiscountHandler.setMaxFreePerBatch.selector;
+        selectors[9] = NudgeDiscountHandler.setOverflowNFTsPerBoostPoint.selector;
+        selectors[10] = NudgeDiscountHandler.setMaxBoost.selector;
+        selectors[11] = NudgeDiscountHandler.rescueUnreserved.selector;
+        selectors[12] = NudgeDiscountHandler.overflowBatch.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -275,11 +370,19 @@ contract BatchNFTMinterNudgeDiscountInvariantTest is StdInvariant, NudgeDiscount
         assertEq(handler.owedAdded(), handler.owedPaid() + batch.pendingStakerPhUSD(), "owed not conserved");
     }
 
+    /// @dev audit-27: `paid >= 1`, `free <= cap`, reserve <= live pot and == the preview's reserve.
+    function invariant_CapAndPaidFloor() public view {
+        assertTrue(handler.capAndPaidHeld(), "paid == 0, free > cap, or reserve exceeded the pot / preview");
+    }
+
     function afterInvariant() public view {
         assertGt(handler.calls(), 0, "TRIPWIRE: handler never called");
         assertGt(handler.successfulBatches(), 0, "TRIPWIRE: no batch ever succeeded");
         assertGt(handler.noDiscountReverts(), 0, "TRIPWIRE: NoDiscountAvailable never hit");
         assertGt(handler.totalMismatchReverts(), 0, "TRIPWIRE: TotalMismatch never hit");
+        assertGt(handler.boostNotAvailableReverts(), 0, "TRIPWIRE: BoostNotAvailable never hit");
+        assertGt(handler.boostedBatches(), 0, "TRIPWIRE: no boosted batch");
+        assertGt(handler.cappedBatches(), 0, "TRIPWIRE: no capped batch");
         assertGt(handler.buysWithBurn(), 0, "TRIPWIRE: no buy ever burned");
         assertGt(handler.rallyCarryForwards(), 0, "TRIPWIRE: no rally carry-forward");
     }
