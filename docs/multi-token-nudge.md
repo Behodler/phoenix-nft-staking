@@ -859,19 +859,28 @@ but still lets the reserve drain.
 The reserve and the live pot share one USDC balance. Every pot read subtracts the reserve.
 `rescueERC20` cannot take reserved USDC (`Rescue__ReservedFunds`). `setDiscountToken`
 reverts while a reserve is pending. The active discount token cannot be unwhitelisted.
+That guard keeps the discount token on the whitelist; it does **not** keep the bonus order
+stable. A removal followed by an add, or a `setDiscountToken` switch between two whitelisted
+tokens, still reorders `getBonusTokens()` without changing its length. `batchMint`'s
+`bonusTokens` check (§9.5 step 4) is what makes that drift fail closed (audit-27 L-01).
 Reserved USDC leaves **only** through `buyAndBurn`. If the route ever breaks permanently,
 the owner must repoint it with `setPSM`, `setSUSDS` or `setSwapRoute`. There is deliberately
 no owner escape for the reserve.
 
 ### 9.5 Execution order (normative)
 
-`batchMint(expectedTotal, quotedBoost, recipient, maxPayment, bonusMinRewards)`:
+`batchMint(expectedTotal, quotedBoost, recipient, maxPayment, bonusTokens, bonusMinRewards)`:
 
-1. Validate: non-zero recipient, `expectedTotal > 0`, and
-   `bonusMinRewards.length == getBonusTokens().length`.
+1. Validate: non-zero recipient, `expectedTotal > 0`, then
+   `bonusTokens.length == getBonusTokens().length` and
+   `bonusMinRewards.length == getBonusTokens().length`, each checked on its own so
+   `ArrayLengthMismatch(bonusCount, length)` names the array length that was wrong.
 2. Resolve the payment path. The payment token is the dispatcher's `primeToken()`.
 3. Flush `pullPendingStream` for **all** whitelisted tokens, the discount token included.
-4. Snapshot every bonus balance and check the floors.
+4. Walk the bonus tokens in live order. At each slot `j`, revert
+   `BonusTokenMismatch(j, bonusTokens[j], live)` unless `bonusTokens[j]` is the live token,
+   then snapshot its balance and check `bonusMinRewards[j]` against it. Each floor is
+   therefore bound to the token the caller named, not merely to a position (audit-27 L-01).
 5. Read the pot and check the config: `discountToken`, `psm` and `mintDebtHook` must be set,
    and `psm.gem() == discountToken`.
 6. Do the maths at `discountPercent + quotedBoost` (clamped to 99). Revert, in this order,
@@ -908,7 +917,11 @@ Load-bearing orderings:
 ### 9.6 `nudgeSize` is removed; bonuses are paid on every batch
 
 There is no qualification threshold. The bonus tokens are every whitelisted token except the
-discount token, listed in `getBonusTokens()` order (which swap-and-pop can reorder). Every
+discount token, listed in `getBonusTokens()` order. That order is not stable: swap-and-pop
+removal followed by an add, or a `setDiscountToken` switch, reorders it without changing its
+length. Callers pass `bonusTokens` and `bonusMinRewards` from the same `getBonusTokens()`
+read, and a stale or pending call whose order has drifted reverts `BonusTokenMismatch`
+(§9.5 step 4) instead of binding a floor to the wrong token. Every
 successful batch receives their **entire** pre-pull balance. Every batch contains at least
 one free NFT, so a bonus always accompanies a discounted mint. The discount token stays on
 the whitelist, because `NudgeStreamer.registerStream` requires it, but it is never paid out.
