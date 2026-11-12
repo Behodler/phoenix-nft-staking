@@ -37,16 +37,25 @@ import {IMintDebtRatio} from "./interfaces/IMintDebtRatio.sol";
 ///
 /// - **The USDC pot sets the batch.** With `P0` the next-NFT price at batch start and the
 ///   pot converted to USD with the PSM's own sell maths (`tin` included):
-///   `free = potUSD / P0` (floor), `total = ceilDiv(free * 100, discountPercent)`,
-///   `paid = total - free`. The caller cannot choose the count: they confirm the previewed
-///   `expectedTotal`, and a mismatch reverts. Price 10, discount 50: pot 10 → 2 for 1;
-///   pot 15 → still 2 for 1; pot 20 → 4 for 2; pot 100 → the batch MUST be 20.
+///   `free = min(potUSD / P0, maxFreePerBatch)` (floor; capped by audit-27 M-01),
+///   `total = ceilDiv(free * 100, effectivePercent)`, `paid = total - free`, with
+///   `effectivePercent = min(discountPercent + boost, 99)`. The caller cannot choose the
+///   count: they confirm the previewed `expectedTotal` (and `quotedBoost`), and a mismatch
+///   reverts. Price 10, discount 50: pot 10 → 2 for 1; pot 15 → still 2 for 1; pot 20 → 4
+///   for 2; pot 100 → the batch MUST be 20.
+/// - **The cap and the overflow boost (audit-27 M-01).** A batch never has more than
+///   `maxFreePerBatch` free NFTs, so it always fits under the EIP-7825 per-tx gas cap. Pot
+///   past the cap stays unreserved and raises the discount by
+///   `min(maxBoost, overflowFree / overflowNFTsPerBoostPoint)` points, so a languishing pot
+///   gets steadily more attractive. The caller quotes the previewed boost (`quotedBoost`), so
+///   in-flight inflow cannot revert them; a quote above the live boost reverts.
 /// - **Paid NFTs** go through `ITokenMinterV2.mint` exactly as before: full price to the
 ///   dispatcher, price growth, and mint-debt accrual.
 /// - **Free NFTs** come from `INFTMinterV2.mintFor`: no payment, no dispatch, no price
 ///   growth. This contract must be an authorised minter on NFTMinterV2.
 /// - **The pot never reaches the user and is never pooled.** `batchMint` only RESERVES the
-///   whole pot (partial-step remainder included): `pendingBuyUSDC += pot` and
+///   pot it consumes (the whole pot, partial-step remainder included, at or below the cap;
+///   the rounded-up USDC backing `cap * P0` above it): `pendingBuyUSDC += reservedUSDC` and
 ///   `pendingStakerPhUSD += owed`, `owed = free * P0 * ratio / 100`, `ratio` read live from
 ///   the mint-debt hook. `owed` balances the books for the hook the free NFTs skipped; it
 ///   is BOUGHT phUSD, not minted, so there is no new supply.
@@ -61,6 +70,8 @@ import {IMintDebtRatio} from "./interfaces/IMintDebtRatio.sol";
 ///   on EVERY batch. `nudgeSize` is gone; every batch contains at least one free NFT, so a
 ///   bonus always accompanies a discounted mint.
 /// - **No batch without a discount**: `free == 0` or `discountPercent == 0` reverts.
+/// - **No batch without a paid mint** (audit-27 L-04): `discountPercent` is 0 or 50..99 and
+///   the effective percent is clamped to 99, so `paid >= 1` and the paid loop always runs.
 ///
 /// ### Inherited from `BatchNFTMinterMultiToken`
 ///
@@ -96,9 +107,12 @@ import {IMintDebtRatio} from "./interfaces/IMintDebtRatio.sol";
 ///
 /// @dev **AUDIT-CRITICAL — `mintFor` power.** This contract holds unlimited free-mint power
 ///      over its dispatcher index, bounded only by its own logic. `NFTMinterV2.mintFor`
-///      ignores the NFTMinter pause, so THIS contract's pause is the only kill switch for
-///      free mints, and the authorisation must be revoked (`setAuthorizedMinter(this,
-///      false)`) when this minter is retired.
+///      ignores the NFTMinter pause and the per-index `disabled` flag. Free mints are still
+///      halted by either, because every batch has `paid >= 1` and the paid loop (whose first
+///      `mint` checks both) runs BEFORE the free loop (ordering (f), audit-27 L-04). The kill
+///      switches for free mints are this contract's pause, an NFTMinterV2 pause or index
+///      disable, and revoking the authorisation (`setAuthorizedMinter(this, false)`), which
+///      must be done when this minter is retired.
 ///
 ///      **Two balances share one USDC holding.** The reserve (`pendingBuyUSDC`) and the live
 ///      pot are both `discountToken.balanceOf(this)`. Every pot read subtracts the reserve;
@@ -112,6 +126,11 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     constructor(address initialOwner) Ownable(initialOwner) {
         discountPercent = 50;
         burnPercent = 100;
+        // audit-27 M-01: gas-safe default cap (100 NFTs at d=50 with the UniPoolerV2 donation
+        // leg on, ~13.8M gas). The boost ships DISABLED (`maxBoost == 0`); `3` is the smallest
+        // divisor that passes the donation constraint at d=50 / cap 50 (`> 50*100/50^2 = 2`).
+        maxFreePerBatch = 50;
+        overflowNFTsPerBoostPoint = 3;
         // LOAD-BEARING (UniPoolerV2 :231 pattern): the `buyerAuthVersion` mapping defaults to
         // 0, so a zero `authVersion` would authorise EVERY address as a buyer.
         authVersion = 1;
@@ -124,6 +143,17 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
 
     /// @dev WAD scale of the PSM `tin` fee.
     uint256 internal constant WAD = 1e18;
+
+    /// @notice Lowest non-zero `discountPercent` the owner may set (audit-27 M-01). The
+    ///         gas-safe `maxFreePerBatch` is sized at this floor: a lower percent means more
+    ///         paid mints per free mint, and every cap fails as the percent approaches 1.
+    uint8 public constant MIN_DISCOUNT_PERCENT = 50;
+
+    /// @notice Highest `discountPercent`, and the clamp on `discountPercent + boost`
+    ///         (audit-27 L-04). Below 100, `total = ceil(free * 100 / e) > free`, so `paid >= 1`
+    ///         and the paid loop — the only path through which an NFTMinterV2 pause or per-index
+    ///         `disabled` flag halts a batch — always runs first.
+    uint8 public constant MAX_DISCOUNT_PERCENT = 99;
 
     /// @notice Trusted, owner-configured NFT minter every `batchMint` forwards
     ///         to. `address(0)` disables `batchMint`.
@@ -156,7 +186,8 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     /// @notice The pot token (USDC). Must stay whitelisted (NudgeStreamer requires it) and
     ///         is excluded from the bonus. `address(0)` disables batch minting.
     IERC20 public discountToken;
-    /// @notice 0..100; 25 means a 25% discount. Default 50.
+    /// @notice 0 (disabled) or 50..99; 50 means a 50% discount. Default 50. The applied
+    ///         discount is `min(discountPercent + boost, 99)`.
     uint8 public discountPercent;
     /// @notice 0..100 share of the buy's EXTRA phUSD (beyond owed) that is burned. Default 100.
     uint8 public burnPercent;
@@ -174,6 +205,18 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     address public pair;
     /// @notice phUSD.
     address public phUSD;
+
+    /// @notice Gas-safe cap on free NFTs per batch (audit-27 M-01). A batch consumes only
+    ///         `min(potFree, cap) * P0` of the pot; the rest stays UNRESERVED pot for the next
+    ///         batch (and stays rescuable). Never zero. Default 50.
+    uint256 public maxFreePerBatch;
+    /// @notice Overflow free-equivalents (pot past the cap, in `P0` units) per boost point.
+    ///         Bounded BELOW by the donation constraint — see `boostDonationSafe`. Never zero.
+    ///         Default 3. Only matters when `maxBoost > 0`.
+    uint256 public overflowNFTsPerBoostPoint;
+    /// @notice Ceiling on the overflow boost, in discount points. `0` disables the boost.
+    ///         At most `MAX_DISCOUNT_PERCENT - MIN_DISCOUNT_PERCENT` (49). Default 0.
+    uint8 public maxBoost;
 
     /// @notice Reserved USDC awaiting `buyAndBurn` (6dp). NOT pot.
     uint256 public pendingBuyUSDC;
@@ -200,6 +243,23 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         uint256 paid;
         uint256 paidCost;
         uint256 owed;
+        // audit-27 M-01 cap + overflow boost.
+        uint256 overflowFree; //     potFree - cap (0 at or below the cap)
+        uint256 liveBoost; //        min(maxBoost, overflowFree / overflowNFTsPerBoostPoint)
+        uint256 boost; //            applied boost: liveBoost (preview) or quotedBoost (batchMint)
+        uint256 effectivePercent; // min(discountPercent + boost, MAX_DISCOUNT_PERCENT)
+        uint256 reservedUSDC; //     pot USDC this batch reserves (<= potUSDC)
+    }
+
+    /// @dev Owner parameters for the shared maths, passed into the `pure` `_computeBatch` so the
+    ///      view and the transaction cannot drift.
+    struct BatchParams {
+        uint256 percent;
+        uint256 cap;
+        uint256 perPoint;
+        uint256 maxBoost;
+        uint256 quotedBoost;
+        bool useLiveBoost;
     }
 
     /// @dev Reverted when `expectedTotal == 0`.
@@ -226,6 +286,17 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     error BatchMint__PaymentBudgetExhausted(uint256 mintIndex, uint256 price, uint256 remaining);
 
     error BatchMint__PercentTooHigh(uint8 percent);
+    /// @dev `setDiscountPercent` in `1..MIN_DISCOUNT_PERCENT-1`.
+    error BatchMint__PercentTooLow(uint8 percent);
+    /// @dev `setMaxFreePerBatch(0)`.
+    error BatchMint__ZeroCap();
+    /// @dev `setOverflowNFTsPerBoostPoint(0)`.
+    error BatchMint__ZeroBoostDivisor();
+    /// @dev `setMaxBoost` above `MAX_DISCOUNT_PERCENT - MIN_DISCOUNT_PERCENT`.
+    error BatchMint__BoostTooHigh(uint8 boost);
+    /// @dev The caller quoted a boost the live pot no longer supports (a front-running claim, an
+    ///      owner rescue, a P0 rise or a parameter change lowered it).
+    error BatchMint__BoostNotAvailable(uint8 quoted, uint8 live);
     error BatchMint__DiscountTokenNotWhitelisted(address token);
     /// @dev Unwhitelisting the active discount token. Clear `discountToken` first.
     error BatchMint__DiscountTokenIsActive(address token);
@@ -259,6 +330,12 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
 
     event DiscountTokenSet(address indexed token);
     event DiscountPercentSet(uint8 percent);
+    event MaxFreePerBatchSet(uint256 cap);
+    event OverflowNFTsPerBoostPointSet(uint256 overflowNFTsPerBoostPoint);
+    event MaxBoostSet(uint8 maxBoost);
+    /// @notice Emitted by `batchMint` exactly when the applied boost is non-zero. The
+    ///         languishing statistic used to retune `overflowNFTsPerBoostPoint` / `maxBoost`.
+    event TempDiscountApplied(uint256 overflowFree, uint8 boost, uint8 effectivePercent);
     event BurnPercentSet(uint8 percent);
     event NFTStakerSet(address indexed nftStaker);
     event MintDebtHookSet(address indexed hook);
@@ -423,11 +500,42 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         emit DiscountTokenSet(token);
     }
 
-    /// @notice 0..100. `0` disables batch minting (`NoDiscountAvailable`).
+    /// @notice `0` (disables batch minting: `NoDiscountAvailable`) or
+    ///         `MIN_DISCOUNT_PERCENT..MAX_DISCOUNT_PERCENT` (50..99). 100 is not allowed
+    ///         (audit-27 L-04): at 100 `paid == 0`, the paid loop is skipped, and free mints would
+    ///         proceed against a paused or disabled NFTMinterV2.
     function setDiscountPercent(uint8 percent) external onlyOwner {
-        if (percent > 100) revert BatchMint__PercentTooHigh(percent);
+        if (percent > MAX_DISCOUNT_PERCENT) revert BatchMint__PercentTooHigh(percent);
+        if (percent != 0 && percent < MIN_DISCOUNT_PERCENT) revert BatchMint__PercentTooLow(percent);
         discountPercent = percent;
         emit DiscountPercentSet(percent);
+    }
+
+    /// @notice Gas-safe cap on free NFTs per batch. Non-zero. Size it from a fork measurement
+    ///         at `MIN_DISCOUNT_PERCENT` with the broadcast UniPoolerV2 donation configuration
+    ///         (the phStaging2 cutover gate); a boost only removes paid mints, so a cap that is
+    ///         gas-safe at the base percent is gas-safe at every boosted percent.
+    function setMaxFreePerBatch(uint256 cap) external onlyOwner {
+        if (cap == 0) revert BatchMint__ZeroCap();
+        maxFreePerBatch = cap;
+        emit MaxFreePerBatchSet(cap);
+    }
+
+    /// @notice Overflow free-equivalents per boost point. Non-zero. Must keep
+    ///         `boostDonationSafe()` true (checked off-chain by the cutover gate, not here, so the
+    ///         owner can reorder parameter changes freely).
+    function setOverflowNFTsPerBoostPoint(uint256 perPoint) external onlyOwner {
+        if (perPoint == 0) revert BatchMint__ZeroBoostDivisor();
+        overflowNFTsPerBoostPoint = perPoint;
+        emit OverflowNFTsPerBoostPointSet(perPoint);
+    }
+
+    /// @notice Boost ceiling in points, `0..49`. `0` disables the boost. The effective percent
+    ///         is clamped to `MAX_DISCOUNT_PERCENT` regardless.
+    function setMaxBoost(uint8 boost) external onlyOwner {
+        if (boost > MAX_DISCOUNT_PERCENT - MIN_DISCOUNT_PERCENT) revert BatchMint__BoostTooHigh(boost);
+        maxBoost = boost;
+        emit MaxBoostSet(boost);
     }
 
     /// @notice 0..100. `0` = all extra phUSD to NFTStaker; `100` = burn all of it.
@@ -521,9 +629,16 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     /// @return paid         NFTs minted via `mint`.
     /// @return paidCost     The caller's cost (18dp prime token); a sound `maxPayment` floor.
     /// @return owed         phUSD added to `pendingStakerPhUSD`.
-    /// @return potUSD       The pot in USD (18dp), net of the PSM `tin`.
-    /// @return nextStepUSDC Additional USDC (6dp, rounded up) needed for `free` to reach
-    ///                      `free + 1`.
+    /// @return potUSD       The pot in USD (18dp), net of the PSM `tin`. UNCAPPED: the whole
+    ///                      live pot, not just the part this batch would reserve.
+    /// @return nextStepUSDC Additional USDC (6dp, rounded up) needed for the UNCAPPED
+    ///                      `potFree = potUSD / P0` to reach `potFree + 1`. Below the cap that
+    ///                      is "USDC until `free + 1`"; at or above the cap `free` is pinned at
+    ///                      `maxFreePerBatch`, so it means "USDC until `overflowFree + 1`" (one
+    ///                      boost point needs `overflowNFTsPerBoostPoint` such steps).
+    ///
+    ///         The batch is computed with the cap and the LIVE boost, so `total` is the
+    ///         `expectedTotal` to pass together with `quotedBoost = previewBoost().boost`.
     function previewBatch()
         external
         view
@@ -545,15 +660,80 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         }
     }
 
-    /// @dev `previewBatch` body, split out for the legacy code generator's stack limit.
+    /// @notice Companion to `previewBatch`: the cap / overflow-boost terms of the same
+    ///         preview, through the SAME `_preview()` path (nothing is duplicated). Pass
+    ///         `boost` as `batchMint`'s `quotedBoost`. Zero when `previewBatch`'s batch fields
+    ///         are zero (misconfigured, or `free == 0`).
+    /// @return overflowFree     Pot free-equivalents past `maxFreePerBatch`.
+    /// @return boost            Live boost, `min(maxBoost, overflowFree / overflowNFTsPerBoostPoint)`.
+    /// @return effectivePercent `min(discountPercent + boost, MAX_DISCOUNT_PERCENT)`.
+    /// @return reservedUSDC     Pot USDC the batch would reserve (the whole pot at or below the
+    ///                          cap; the rounded-UP USDC backing `cap * P0` above it).
+    function previewBoost()
+        external
+        view
+        returns (uint256 overflowFree, uint8 boost, uint8 effectivePercent, uint256 reservedUSDC)
+    {
+        (BatchCtx memory c,, bool batchable) = _preview();
+        if (batchable && c.free != 0) {
+            overflowFree = c.overflowFree;
+            boost = uint8(c.boost);
+            effectivePercent = uint8(c.effectivePercent);
+            reservedUSDC = c.reservedUSDC;
+        }
+    }
+
+    /// @notice Safeguard 4 (audit-27 M-01, amortised form): `true` iff, at the CURRENT
+    ///         `discountPercent`, `maxFreePerBatch` and `overflowNFTsPerBoostPoint`, one boost
+    ///         point costs a donor more overflow than it saves them on the paid half.
+    /// @dev    One point at effective percent `e` cuts `total` by about `cap * 100 / (e (e+1))`
+    ///         NFTs, so the binding case is `e = discountPercent` and, bounding `e (e+1)` below by
+    ///         `e^2`, the condition is
+    ///
+    ///             overflowNFTsPerBoostPoint * P0 > (cap * 100 / d^2) * P0 * ramp
+    ///
+    ///         where `ramp` (bps, rounded UP each step) bounds the most expensive paid mint of a
+    ///         full batch at `d`: `(1 + growthBps / 10_000) ^ (ceil(cap * 100 / d) - cap)`. `P0`
+    ///         cancels. Integer form: `perPoint * d^2 * 10_000 > cap * 100 * rampBps`. A single
+    ///         floored step can still hand a donor up to one step's saving early (accepted under
+    ///         P-006). Returns `true` when `discountPercent == 0` (no batch, nothing to buy) and
+    ///         `false` when the NFT minter / dispatcher index is unset (the ramp is unknowable).
+    function boostDonationSafe() external view returns (bool) {
+        uint256 d = discountPercent;
+        if (d == 0) return true;
+        ITokenMinterV2 nftMinter = tokenMinter;
+        uint256 idx = dispatcherIndex;
+        if (address(nftMinter) == address(0) || idx == 0) return false;
+        (,, uint256 g,) = INFTMinterV2(address(nftMinter)).configs(idx);
+        uint256 cap = maxFreePerBatch;
+        uint256 paidMax = Math.ceilDiv(cap * 100, d) - cap;
+        uint256 rampBps = 10_000;
+        for (uint256 i; i < paidMax; ++i) {
+            rampBps += Math.ceilDiv(rampBps * g, 10_000);
+        }
+        return overflowNFTsPerBoostPoint * d * d * 10_000 > cap * 100 * rampBps;
+    }
+
+    /// @dev `previewBatch` body, split out for the legacy code generator's stack limit. Uses the
+    ///      LIVE boost.
     function _preview() private view returns (BatchCtx memory c, uint256 nextStepUSDC, bool batchable) {
         uint256 conv;
         uint256 tin;
         uint256 ratio;
         (c, conv, tin, ratio, batchable) = _previewInputs();
         if (conv == 0) return (c, 0, false);
-        _computeBatch(c, conv, tin, discountPercent, ratio);
+        _computeBatch(c, conv, tin, ratio, _params(0, true));
         nextStepUSDC = _nextStepUSDC(c.potUSDC, c.potUSD, c.p0, conv, tin);
+    }
+
+    /// @dev Snapshot the owner parameters for `_computeBatch`.
+    function _params(uint8 quotedBoost, bool useLiveBoost) private view returns (BatchParams memory q) {
+        q.percent = discountPercent;
+        q.cap = maxFreePerBatch;
+        q.perPoint = overflowNFTsPerBoostPoint;
+        q.maxBoost = maxBoost;
+        q.quotedBoost = quotedBoost;
+        q.useLiveBoost = useLiveBoost;
     }
 
     // =====================================================================
@@ -562,7 +742,10 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
 
     /// @notice Mint the pot-sized discounted batch to `recipient`: `free` NFTs via `mintFor`
     ///         and `paid` NFTs via `mint`, paid by `msg.sender` in the dispatcher's prime token.
-    ///         Reserves the whole pot for `buyAndBurn` and pays every bonus balance.
+    ///         `free = min(potUSD / P0, maxFreePerBatch)`; the batch reserves only the pot USDC
+    ///         backing `free * P0` (the whole pot at or below the cap) for `buyAndBurn`, and pays
+    ///         every bonus balance. The discount is `discountPercent` plus the caller's
+    ///         `quotedBoost`, clamped to `MAX_DISCOUNT_PERCENT`, so `paid >= 1` ALWAYS.
     ///
     /// @dev    NORMATIVE EXECUTION ORDER (story 033; mirrored in `docs/multi-token-nudge.md` §9):
     ///          1. Validate inputs.             8. Pull the caller's payment (skip if paid == 0).
@@ -570,8 +753,14 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     ///          3. Flush ALL streams.          10. Revoke the minter allowance.
     ///          4. Bonus snapshot + floors.    11. Free mint loop (`mintFor`).
     ///          5. Read the pot, check config. 12. Refund unspent budget.
-    ///          6. Maths + total/maxPayment.   13. Emit `BatchMinted`.
+    ///          6. Maths + quotedBoost/total/  13. Emit `BatchMinted` (+ `TempDiscountApplied`
+    ///             maxPayment checks.              when the applied boost is non-zero).
     ///          7. Reserve (effects).          14. Bonus payout of the step-4 snapshot.
+    ///
+    ///         Steps 8 – 12 ALWAYS run: the effective percent is at most 99, so `paid >= 1`
+    ///         and there is no all-free branch (audit-27 L-04). The paid loop at step 9 is what
+    ///         makes an NFTMinterV2 pause or per-index `disabled` flag halt the batch, because
+    ///         `mintFor` checks neither.
     ///
     ///         ORDER IS LOAD-BEARING at six points, (a)–(f), each commented inline below.
     ///
@@ -579,6 +768,10 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     ///         function calls; `nonReentrant` removes the need to reason about interleaving.
     ///
     /// @param  expectedTotal    The previewed `total`. A mismatch reverts `TotalMismatch`.
+    /// @param  quotedBoost      The previewed `previewBoost().boost`. The batch is computed at
+    ///                          `discountPercent + quotedBoost` (clamped to 99). Reverts
+    ///                          `BoostNotAvailable` if it exceeds the live boost; a quote BELOW
+    ///                          live is honoured at the quoted (worse) terms.
     /// @param  recipient        ERC1155 and bonus recipient (non-zero).
     /// @param  maxPayment       Payment-token ceiling. Reverts `MaxPaymentExceeded` up front if
     ///                          the batch costs more. Pulled in full (when `paid > 0`); unspent
@@ -588,12 +781,13 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
     ///                          contributes.
     /// @return free             NFTs minted for free.
     /// @return paid             NFTs minted at full price.
-    function batchMint(uint256 expectedTotal, address recipient, uint256 maxPayment, uint256[] calldata bonusMinRewards)
-        external
-        whenNotPaused
-        nonReentrant
-        returns (uint256 totalPaid, uint256 free, uint256 paid)
-    {
+    function batchMint(
+        uint256 expectedTotal,
+        uint8 quotedBoost,
+        address recipient,
+        uint256 maxPayment,
+        uint256[] calldata bonusMinRewards
+    ) external whenNotPaused nonReentrant returns (uint256 totalPaid, uint256 free, uint256 paid) {
         // --- 1. Validate the caller's inputs. ---
         if (expectedTotal == 0) revert BatchMint__ZeroCount();
         if (recipient == address(0)) revert BatchMint__ZeroRecipient();
@@ -625,10 +819,12 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
 
         // --- 5 + 6. Pot read, config checks, maths, and the caller's guards. ---
         //
-        // ORDER IS LOAD-BEARING (d): the pot read, the maths and the `expectedTotal` and
-        // `maxPayment` checks ALL happen before any value moves, so a front-run caller (pot
-        // consumed, or grown past a step) reverts cleanly having paid nothing.
-        _prepareBatch(c);
+        // ORDER IS LOAD-BEARING (d): the pot read, the maths and the `quotedBoost`,
+        // `expectedTotal` and `maxPayment` checks ALL happen before any value moves, so a
+        // front-run caller (pot consumed, or grown past a step, or the overflow boost lowered)
+        // reverts cleanly having paid nothing. `BoostNotAvailable` is checked inside
+        // `_prepareBatch`, i.e. BEFORE `TotalMismatch`, so a lowered boost reports its own cause.
+        _prepareBatch(c, quotedBoost);
         if (c.total != expectedTotal) revert BatchMint__TotalMismatch(c.total, expectedTotal);
         if (c.paidCost > maxPayment) revert BatchMint__MaxPaymentExceeded(c.paidCost, maxPayment);
 
@@ -636,28 +832,30 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         //
         // ORDER IS LOAD-BEARING (e): the reserve is written BEFORE the external mint calls, so
         // a re-entrant or later read sees this pot already consumed. `nonReentrant` also
-        // covers this. The USDC does not move; it is now reserved on this contract.
-        pendingBuyUSDC += c.potUSDC;
+        // covers this. The USDC does not move; it is now reserved on this contract. Only the
+        // CAPPED reserve is taken: past `maxFreePerBatch` the remainder stays unreserved pot.
+        pendingBuyUSDC += c.reservedUSDC;
         pendingStakerPhUSD += c.owed;
 
         // --- 8 – 12. Pull, paid loop, revoke, free loop, refund. ---
-        if (c.paid != 0) {
-            uint256 budget = _pullPayment(c.paymentToken, maxPayment);
-            // ORDER IS LOAD-BEARING (f): the paid mints come BEFORE the free mints, so
-            // `mintFor` cannot affect the paid prices. `mintFor` does not move the price
-            // anyway; the order is fixed for auditability.
-            budget = _paidMintLoop(c, recipient, budget);
-            _freeMintLoop(c, recipient);
-            // ORDER IS LOAD-BEARING (b) — inherited: the refund comes BEFORE the bonus
-            // payout, so neither transfer can be funded out of the other.
-            totalPaid = _refund(c.paymentToken, budget, maxPayment);
-        } else {
-            // `discountPercent == 100`: every NFT is free. Nothing is pulled or refunded.
-            _freeMintLoop(c, recipient);
-        }
+        //
+        // Unconditional: `effectivePercent <= 99` guarantees `paid >= 1` (audit-27 L-04).
+        uint256 budget = _pullPayment(c.paymentToken, maxPayment);
+        // ORDER IS LOAD-BEARING (f): the paid mints come BEFORE the free mints. `mintFor`
+        // does not move the price, but it also checks neither NFTMinterV2's `paused` nor the
+        // per-index `disabled` flag; the first paid `mint` does, so running the paid loop
+        // first is what makes an NFTMinterV2 halt stop every batch before any free mint.
+        budget = _paidMintLoop(c, recipient, budget);
+        _freeMintLoop(c, recipient);
+        // ORDER IS LOAD-BEARING (b) — inherited: the refund comes BEFORE the bonus
+        // payout, so neither transfer can be funded out of the other.
+        totalPaid = _refund(c.paymentToken, budget, maxPayment);
 
         // --- 13. Emit. ---
-        emit BatchMinted(recipient, c.free, c.paid, c.paidCost, c.potUSDC, c.owed);
+        emit BatchMinted(recipient, c.free, c.paid, c.paidCost, c.reservedUSDC, c.owed);
+        if (c.boost != 0) {
+            emit TempDiscountApplied(c.overflowFree, uint8(c.boost), uint8(c.effectivePercent));
+        }
 
         // --- 14. Bonus payout of the step-4 snapshot (NOT re-read). ---
         _payBonus(recipient, snapshot);
@@ -785,8 +983,9 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         }
     }
 
-    /// @dev Steps 5 + 6: config checks, the pot read NET OF THE RESERVE, and the shared maths.
-    function _prepareBatch(BatchCtx memory c) private view {
+    /// @dev Steps 5 + 6: config checks, the pot read NET OF THE RESERVE, the shared maths at the
+    ///      caller's QUOTED boost, and the `BoostNotAvailable` check (before `TotalMismatch`).
+    function _prepareBatch(BatchCtx memory c, uint8 quotedBoost) private view {
         IERC20 dt = discountToken;
         ISkyPSM _psm = psm;
         IMintDebtRatio hook = mintDebtHook;
@@ -799,8 +998,9 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         // The reserved USDC is NOT pot: two balances share one holding.
         c.potUSDC = dt.balanceOf(address(this)) - pendingBuyUSDC;
         (, c.p0, c.growthBps,) = INFTMinterV2(address(c.nftMinter)).configs(c.dispatcherIndex);
-        _computeBatch(c, _psm.to18ConversionFactor(), _psm.tin(), discountPercent, hook.ratio());
+        _computeBatch(c, _psm.to18ConversionFactor(), _psm.tin(), hook.ratio(), _params(quotedBoost, false));
         if (c.free == 0) revert BatchMint__NoDiscountAvailable();
+        if (quotedBoost > c.liveBoost) revert BatchMint__BoostNotAvailable(quotedBoost, uint8(c.liveBoost));
     }
 
     /// @dev Gather `previewBatch`'s inputs WITHOUT reverting on misconfiguration. `conv == 0`
@@ -836,17 +1036,46 @@ contract BatchNFTMinterNudgeDiscount is Ownable, Pausable, ReentrancyGuard, IPau
         if (batchable) ratio = mintDebtHook.ratio();
     }
 
-    /// @dev The shared maths (`batchMint` and `previewBatch`). All rounding favours the protocol:
-    ///      `potUSD` mirrors the PSM's own floor, `free` floors, `total` rounds UP (so the
-    ///      effective discount never exceeds `discountPercent`; the spec's literal floor agrees
-    ///      for every worked example), `owed` floors.
-    function _computeBatch(BatchCtx memory c, uint256 conv, uint256 tin, uint256 percent, uint256 ratio) private pure {
+    /// @dev The shared maths (`batchMint`, `previewBatch`, `previewBoost`). All rounding favours
+    ///      the protocol: `potUSD` mirrors the PSM's own floor, `free` floors, `total` rounds UP
+    ///      (so the effective discount never exceeds `effectivePercent`; the spec's literal floor
+    ///      agrees for every worked example), the capped reserve rounds UP, `owed` floors.
+    ///
+    ///          potFree   = potUSD / P0                              (uncapped)
+    ///          overflow  = potFree > cap ? potFree - cap : 0
+    ///          liveBoost = min(maxBoost, overflow / perPoint)
+    ///          boost     = useLiveBoost ? liveBoost : quotedBoost    (batchMint rejects quoted > live)
+    ///          effective = min(percent + boost, 99)
+    ///          free      = min(potFree, cap)
+    ///          reserved  = potFree > cap ? ceil(potUSDC * free * P0 / potUSD) : potUSDC
+    ///          total     = ceil(free * 100 / effective);  paid = total - free  (>= 1)
+    function _computeBatch(BatchCtx memory c, uint256 conv, uint256 tin, uint256 ratio, BatchParams memory q)
+        private
+        pure
+    {
         c.potUSD = _netUSD(c.potUSDC, conv, tin);
-        if (percent == 0 || c.p0 == 0) return; // free = total = paid = paidCost = owed = 0
+        if (q.percent == 0 || c.p0 == 0) return; // free = total = paid = paidCost = owed = 0
         uint256 free = c.potUSD / c.p0;
         if (free == 0) return;
+        if (free > q.cap) {
+            c.overflowFree = free - q.cap;
+            free = q.cap;
+            // Only the USDC backing `free * P0` is reserved; `free * P0 < potUSD`, so this is
+            // strictly a fraction of `potUSDC` and the ceil cannot exceed it.
+            c.reservedUSDC = Math.mulDiv(c.potUSDC, free * c.p0, c.potUSD, Math.Rounding.Ceil);
+        } else {
+            c.reservedUSDC = c.potUSDC;
+        }
+        uint256 live = q.perPoint == 0 ? 0 : c.overflowFree / q.perPoint;
+        if (live > q.maxBoost) live = q.maxBoost;
+        c.liveBoost = live;
+        uint256 boost = q.useLiveBoost ? live : q.quotedBoost;
+        c.boost = boost;
+        uint256 effective = q.percent + boost;
+        if (effective > MAX_DISCOUNT_PERCENT) effective = MAX_DISCOUNT_PERCENT;
+        c.effectivePercent = effective;
         c.free = free;
-        c.total = Math.ceilDiv(free * 100, percent);
+        c.total = Math.ceilDiv(free * 100, effective);
         c.paid = c.total - free;
         // Sum the `paid` rising prices term-for-term with NFTMinterV2's ramp. Free NFTs never
         // move the price, so the paid/free interleaving does not change the cost.

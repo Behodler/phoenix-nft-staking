@@ -61,9 +61,27 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
 
     error MockITokenMinterV2__ForcedRevert();
 
+    // NFTMinterV2 halt switches (`_executeMint` checks both; `mintFor` checks neither).
+    // Default off, so existing suites are unaffected.
+    bool public paused;
+    mapping(uint256 => bool) public disabledIndex;
+
+    error MockITokenMinterV2__Paused();
+    error MockITokenMinterV2__Disabled(uint256 index);
+
+    function setPaused(bool p) external {
+        paused = p;
+    }
+
+    function setDispatcherDisabled(uint256 index, bool d) external {
+        disabledIndex[index] = d;
+    }
+
     // ---- ITokenMinterV2 (only the surfaces BatchNFTMinter touches) ----
 
     function mint(uint256 index, address recipient) external override returns (bool) {
+        if (paused) revert MockITokenMinterV2__Paused();
+        if (disabledIndex[index]) revert MockITokenMinterV2__Disabled(index);
         mintCallCount += 1;
         if (_revertEnabled && mintCallCount == _revertAtCall) {
             revert MockITokenMinterV2__ForcedRevert();
@@ -127,14 +145,14 @@ contract MockITokenMinterV2 is ITokenMinterV2 {
     /// @notice `INFTMinterV2.configs` shape. `BatchNFTMinter` casts
     ///         `address(tokenMinter)` to `INFTMinterV2` and reads the
     ///         dispatcher address from here. Price/growth mirror the mock's
-    ///         own `Config` storage; `disabled` is always false.
+    ///         own `Config` storage; `disabled` mirrors `setDispatcherDisabled`.
     function configs(uint256 index)
         external
         view
         returns (address dispatcher, uint256 price, uint256 growthBasisPoints, bool disabled)
     {
         Config storage c = _configs[index];
-        return (_dispatcher[index], c.price, c.growthBasisPoints, false);
+        return (_dispatcher[index], c.price, c.growthBasisPoints, disabledIndex[index]);
     }
 
     function setStakedToken(MockERC1155 token) external {

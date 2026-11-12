@@ -146,11 +146,12 @@ abstract contract NudgeDiscountFixture is Test {
         (, total,, paidCost,,,) = batch.previewBatch();
     }
 
-    /// @dev Batch at the previewed total with `maxPayment = paidCost`.
+    /// @dev Batch at the previewed total and LIVE boost with `maxPayment = paidCost`.
     function _batch() internal returns (uint256 totalPaid, uint256 free, uint256 paid) {
         (uint256 total, uint256 paidCost) = _previewTotal();
+        (, uint8 boost,,) = batch.previewBoost();
         vm.prank(caller);
-        return batch.batchMint(total, recipient, paidCost, _zeros());
+        return batch.batchMint(total, boost, recipient, paidCost, _zeros());
     }
 }
 
@@ -215,34 +216,43 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         _assertExample(50, 100e6, 10, 10, 50e18);
     }
 
-    function test_Example_d25_pot10_oneFreeThreePaid() public {
-        _assertExample(25, 10e6, 1, 3, 5e18);
+    function test_Example_d75_pot30_threeFreeOnePaid() public {
+        // audit-27: the percent floor is 50, so the old d=25 example becomes d=75.
+        _assertExample(75, 30e6, 3, 1, 15e18);
     }
 
-    function test_Example_d100_pot20_allFree_noPaymentPulled() public {
-        _setDiscount(100);
+    /// @dev audit-27 L-04: the old d=100 all-free example is gone. At the new maximum, 99, every
+    ///      batch still has a paid mint, so the caller is pulled and the paid loop runs.
+    function test_Example_d99_pot20_stillOnePaidMint() public {
+        _setDiscount(99);
         _fundPot(20e6);
-        // A caller with NO approval at all: proves the pull is skipped entirely.
+        (uint256 free, uint256 total, uint256 paid, uint256 paidCost,,,) = batch.previewBatch();
+        assertEq(free, 2);
+        assertEq(total, 3, "ceil(200/99) = 3");
+        assertEq(paid, 1, "paid >= 1 at the maximum percent");
+        // A caller with NO approval cannot take the batch: the pull is NOT skipped.
         address stranger = makeAddr("stranger");
         vm.prank(stranger);
-        (uint256 totalPaid, uint256 free, uint256 paid) = batch.batchMint(2, recipient, 0, _zeros());
-        assertEq(free, 2);
-        assertEq(paid, 0);
-        assertEq(totalPaid, 0);
-        assertEq(nft.balanceOf(recipient, IDX), 2);
-        assertEq(batch.pendingBuyUSDC(), 20e6);
-        assertEq(batch.pendingStakerPhUSD(), 10e18);
-        assertEq(minter.mintCallCount(), 0, "no paid mint");
+        vm.expectRevert();
+        batch.batchMint(total, 0, recipient, paidCost, _zeros());
+        // The approved caller pays for the paid mint, and the paid mint runs first.
+        vm.prank(caller);
+        (uint256 totalPaid, uint256 f, uint256 p) = batch.batchMint(total, 0, recipient, paidCost, _zeros());
+        assertEq(f, 2);
+        assertEq(p, 1);
+        assertEq(totalPaid, P0);
+        assertEq(minter.mintCallCount(), 1, "one paid mint");
+        assertEq(nft.balanceOf(recipient, IDX), 3);
     }
 
-    function test_TotalRoundsUp_d30() public {
+    function test_TotalRoundsUp_d60() public {
         // Planner decision: ceil, so the effective discount never exceeds discountPercent.
-        _setDiscount(30);
+        _setDiscount(60);
         _fundPot(10e6);
         (uint256 free, uint256 total, uint256 paid,,,,) = batch.previewBatch();
         assertEq(free, 1);
-        assertEq(total, 4, "ceil(100/30) = 4, i.e. 25% off, not 33%");
-        assertEq(paid, 3);
+        assertEq(total, 2, "ceil(100/60) = 2, i.e. 50% off, not 60%");
+        assertEq(paid, 1);
     }
 
     // =====================================================================
@@ -253,7 +263,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         _fundPot(5e6);
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector);
-        batch.batchMint(1, recipient, type(uint256).max, _zeros());
+        batch.batchMint(1, 0, recipient, type(uint256).max, _zeros());
     }
 
     function test_Revert_DiscountPercentZero() public {
@@ -261,20 +271,20 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         _fundPot(100e6);
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector);
-        batch.batchMint(1, recipient, type(uint256).max, _zeros());
+        batch.batchMint(1, 0, recipient, type(uint256).max, _zeros());
     }
 
     function test_Revert_EmptyPot() public {
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector);
-        batch.batchMint(1, recipient, type(uint256).max, _zeros());
+        batch.batchMint(1, 0, recipient, type(uint256).max, _zeros());
     }
 
     function test_Revert_ExpectedTotalZero() public {
         _fundPot(10e6);
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__ZeroCount.selector);
-        batch.batchMint(0, recipient, type(uint256).max, _zeros());
+        batch.batchMint(0, 0, recipient, type(uint256).max, _zeros());
     }
 
     // =====================================================================
@@ -285,7 +295,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         _fundPot(10e6);
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__TotalMismatch.selector, 2, 3));
-        batch.batchMint(3, recipient, type(uint256).max, _zeros());
+        batch.batchMint(3, 0, recipient, type(uint256).max, _zeros());
     }
 
     function test_FrontRun_potGrowsPastStep_revertsTotalMismatch_noBalancesMoved() public {
@@ -297,7 +307,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         uint256 callerBefore = usds.balanceOf(caller);
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__TotalMismatch.selector, 4, 2));
-        batch.batchMint(quotedTotal, recipient, type(uint256).max, _zeros());
+        batch.batchMint(quotedTotal, 0, recipient, type(uint256).max, _zeros());
         assertEq(usds.balanceOf(caller), callerBefore);
         assertEq(batch.pendingBuyUSDC(), 0);
         assertEq(nft.balanceOf(recipient, IDX), 0);
@@ -313,14 +323,14 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         usds.mint(frontRunner, 100e18);
         vm.startPrank(frontRunner);
         usds.approve(address(batch), type(uint256).max);
-        batch.batchMint(quotedTotal, frontRunner, quotedCost, _zeros());
+        batch.batchMint(quotedTotal, 0, frontRunner, quotedCost, _zeros());
         vm.stopPrank();
 
         uint256 callerBefore = usds.balanceOf(caller);
         uint256 reserveBefore = batch.pendingBuyUSDC();
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector);
-        batch.batchMint(quotedTotal, recipient, type(uint256).max, _zeros());
+        batch.batchMint(quotedTotal, 0, recipient, type(uint256).max, _zeros());
         assertEq(usds.balanceOf(caller), callerBefore);
         assertEq(batch.pendingBuyUSDC(), reserveBefore);
         assertEq(nft.balanceOf(recipient, IDX), 0);
@@ -337,7 +347,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         uint256 callerBefore = usds.balanceOf(caller);
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__TotalMismatch.selector, 2, 4));
-        batch.batchMint(quotedTotal, recipient, type(uint256).max, _zeros());
+        batch.batchMint(quotedTotal, 0, recipient, type(uint256).max, _zeros());
         assertEq(usds.balanceOf(caller), callerBefore);
     }
 
@@ -352,7 +362,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         vm.expectRevert(
             abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__MaxPaymentExceeded.selector, P0, P0 - 1)
         );
-        batch.batchMint(2, recipient, P0 - 1, _zeros());
+        batch.batchMint(2, 0, recipient, P0 - 1, _zeros());
         assertEq(usds.balanceOf(caller), callerBefore);
         assertEq(batch.pendingBuyUSDC(), 0);
     }
@@ -375,7 +385,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         _fundPot(10e6);
         vm.prank(caller);
         vm.expectRevert();
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     // =====================================================================
@@ -397,7 +407,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         mins[0] = 7e18;
         mins[1] = 1234e18;
         vm.prank(caller);
-        batch.batchMint(2, recipient, P0, mins);
+        batch.batchMint(2, 0, recipient, P0, mins);
         assertEq(phUSD.balanceOf(recipient), 7e18);
         assertEq(kendu.balanceOf(recipient), 1234e18);
         assertEq(usdc.balanceOf(recipient), 0, "discount token is never paid out");
@@ -411,7 +421,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         vm.expectRevert(
             abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__ArrayLengthMismatch.selector, 2, 3)
         );
-        batch.batchMint(2, recipient, P0, new uint256[](3));
+        batch.batchMint(2, 0, recipient, P0, new uint256[](3));
     }
 
     function test_Revert_BonusFloor() public {
@@ -425,7 +435,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
                 BatchNFTMinterNudgeDiscount.BatchMint__RewardBelowMinimum.selector, address(kendu), 6e18, 5e18
             )
         );
-        batch.batchMint(2, recipient, P0, mins);
+        batch.batchMint(2, 0, recipient, P0, mins);
     }
 
     function test_BonusOrderFollowsSwapAndPop() public {
@@ -461,7 +471,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         assertEq(potUSD, 9.9e18);
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     function testFuzz_TinNeverOverGrants(uint256 tin, uint256 pot) public {
@@ -473,14 +483,16 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         uint256 gross = pot * CONV;
         assertEq(potUSD, gross - (gross * tin) / 1e18, "potUSD mirrors the PSM sell maths");
         assertLe(free * P0, potUSD, "free never exceeds what the pot can cover");
-        assertLt(potUSD, (free + 1) * P0, "free is the floor");
+        uint256 cap = batch.maxFreePerBatch();
+        if (free < cap) assertLt(potUSD, (free + 1) * P0, "free is the floor");
+        else assertEq(free, cap, "free is capped");
         if (free == 0) {
             vm.prank(caller);
             vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__NoDiscountAvailable.selector);
-            batch.batchMint(1, recipient, type(uint256).max, _zeros());
+            batch.batchMint(1, 0, recipient, type(uint256).max, _zeros());
         } else {
             vm.prank(caller);
-            (, uint256 f, uint256 p) = batch.batchMint(total, recipient, paidCost, _zeros());
+            (, uint256 f, uint256 p) = batch.batchMint(total, 0, recipient, paidCost, _zeros());
             assertEq(f, free);
             assertEq(p, paid);
         }
@@ -526,7 +538,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         // With no discount token, minting is disabled.
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__DiscountNotConfigured.selector);
-        batch.batchMint(1, recipient, P0, new uint256[](2));
+        batch.batchMint(1, 0, recipient, P0, new uint256[](2));
     }
 
     function test_Revert_GemMismatch() public {
@@ -540,7 +552,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
                 BatchNFTMinterNudgeDiscount.BatchMint__DiscountTokenNotGem.selector, address(usdc), address(kendu)
             )
         );
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     function test_Revert_DiscountNotConfigured_psmOrHookUnset() public {
@@ -549,7 +561,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         batch.setMintDebtHook(IMintDebtRatio(address(0)));
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__DiscountNotConfigured.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
 
         vm.startPrank(owner);
         batch.setMintDebtHook(IMintDebtRatio(address(hook)));
@@ -557,7 +569,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         vm.stopPrank();
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__DiscountNotConfigured.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     // =====================================================================
@@ -574,8 +586,8 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
     function test_SetterEvents() public {
         vm.startPrank(owner);
         vm.expectEmit(address(batch));
-        emit DiscountPercentSet(40);
-        batch.setDiscountPercent(40);
+        emit DiscountPercentSet(60);
+        batch.setDiscountPercent(60);
         vm.expectEmit(address(batch));
         emit BurnPercentSet(60);
         batch.setBurnPercent(60);
@@ -653,13 +665,45 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
 
     function test_Revert_PercentTooHigh() public {
         vm.startPrank(owner);
+        // audit-27 L-04: 100 is no longer a legal discount.
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooHigh.selector, 100));
+        batch.setDiscountPercent(100);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooHigh.selector, 101));
         batch.setDiscountPercent(101);
         vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooHigh.selector, 101));
         batch.setBurnPercent(101);
-        batch.setDiscountPercent(100);
+        batch.setDiscountPercent(99);
+        assertEq(batch.discountPercent(), 99);
+        batch.setBurnPercent(100);
         batch.setBurnPercent(0);
         vm.stopPrank();
+    }
+
+    function test_Revert_PercentTooLow() public {
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooLow.selector, 1));
+        batch.setDiscountPercent(1);
+        vm.expectRevert(abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooLow.selector, 49));
+        batch.setDiscountPercent(49);
+        batch.setDiscountPercent(50);
+        assertEq(batch.discountPercent(), 50);
+        batch.setDiscountPercent(0);
+        assertEq(batch.discountPercent(), 0, "0 still disables");
+        vm.stopPrank();
+    }
+
+    function testFuzz_SetDiscountPercent_bounds(uint8 percent) public {
+        vm.prank(owner);
+        if (percent > 99) {
+            vm.expectRevert(
+                abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooHigh.selector, percent)
+            );
+        } else if (percent != 0 && percent < 50) {
+            vm.expectRevert(
+                abi.encodeWithSelector(BatchNFTMinterNudgeDiscount.BatchMint__PercentTooLow.selector, percent)
+            );
+        }
+        batch.setDiscountPercent(percent);
     }
 
     function test_Revert_SetSwapRoute_pairMismatch() public {
@@ -692,7 +736,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         uint256 cost = _ramp(P0, 2);
         uint256 callerBefore = usds.balanceOf(caller);
         vm.prank(caller);
-        (uint256 totalPaid,,) = batch.batchMint(4, recipient, cost + 500e18, _zeros());
+        (uint256 totalPaid,,) = batch.batchMint(4, 0, recipient, cost + 500e18, _zeros());
         assertEq(totalPaid, cost);
         assertEq(callerBefore - usds.balanceOf(caller), cost);
         assertEq(usds.balanceOf(address(batch)), 0, "no budget left behind");
@@ -704,7 +748,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
     // =====================================================================
 
     function test_PreviewParity_acrossPotsAndDiscounts() public {
-        uint8[4] memory ds = [uint8(50), 25, 100, 33];
+        uint8[4] memory ds = [uint8(50), 75, 99, 66];
         uint256[4] memory pots = [uint256(10e6), 37e6, 100e6, 15e6];
         for (uint256 i; i < 4; ++i) {
             _setDiscount(ds[i]);
@@ -713,7 +757,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
             uint256 owedBefore = batch.pendingStakerPhUSD();
             uint256 callerBefore = usds.balanceOf(caller);
             vm.prank(caller);
-            (uint256 totalPaid, uint256 f, uint256 p) = batch.batchMint(total, recipient, paidCost, _zeros());
+            (uint256 totalPaid, uint256 f, uint256 p) = batch.batchMint(total, 0, recipient, paidCost, _zeros());
             assertEq(f, free, "free parity");
             assertEq(p, paid, "paid parity");
             assertEq(f + p, total, "total parity");
@@ -784,7 +828,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         batch.pause();
         vm.prank(caller);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
 
         vm.prank(owner);
         vm.expectRevert("BatchNFTMinter: caller is not pauser");
@@ -843,7 +887,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         _fundPot(10e6);
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__ZeroRecipient.selector);
-        batch.batchMint(2, address(0), P0, _zeros());
+        batch.batchMint(2, 0, address(0), P0, _zeros());
     }
 
     function test_Revert_MinterNotConfigured() public {
@@ -852,7 +896,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         batch.setTokenMinter(ITokenMinterV2(address(0)));
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__MinterNotConfigured.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     function test_Revert_DispatcherNotConfigured() public {
@@ -861,13 +905,13 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         batch.setDispatcherIndex(0);
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__DispatcherNotConfigured.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
 
         vm.prank(owner);
         batch.setDispatcherIndex(99); // resolves to a zero dispatcher
         vm.prank(caller);
         vm.expectRevert(BatchNFTMinterNudgeDiscount.BatchMint__DispatcherNotConfigured.selector);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     /// @dev Pattern of `test_DonationDuringPullCannotInflateBudget`: a payment token whose pull
@@ -887,7 +931,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         hooked.mint(caller, a);
         vm.startPrank(caller);
         hooked.approve(address(batch), a);
-        (uint256 totalPaid,,) = batch.batchMint(4, recipient, a, _zeros());
+        (uint256 totalPaid,,) = batch.batchMint(4, 0, recipient, a, _zeros());
         vm.stopPrank();
 
         assertEq(totalPaid, cost);
@@ -911,12 +955,12 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
                 BatchNFTMinterNudgeDiscount.BatchMint__PaymentBudgetExhausted.selector, 0, P0, (P0 * 9500) / 10_000
             )
         );
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
 
         // Over-quoting works; the refund is bounded by what was credited.
         uint256 a = 20e18;
         uint256 callerBefore = taxed.balanceOf(caller);
-        (uint256 totalPaid,,) = batch.batchMint(2, recipient, a, _zeros());
+        (uint256 totalPaid,,) = batch.batchMint(2, 0, recipient, a, _zeros());
         vm.stopPrank();
         uint256 credited = (a * 9500) / 10_000;
         uint256 refund = credited - P0;
@@ -935,7 +979,7 @@ contract BatchNFTMinterNudgeDiscountTest is NudgeDiscountFixture {
         vm.expectEmit(address(batch));
         emit BatchMinted(recipient, 1, 1, P0, 15e6, 5e18);
         vm.prank(caller);
-        batch.batchMint(2, recipient, P0, _zeros());
+        batch.batchMint(2, 0, recipient, P0, _zeros());
     }
 
     // =====================================================================

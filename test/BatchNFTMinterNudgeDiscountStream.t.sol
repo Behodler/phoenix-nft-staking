@@ -69,7 +69,7 @@ contract BatchNFTMinterNudgeDiscountStreamTest is NudgeDiscountFixture {
         assertEq(free, (pending * CONV) / P0);
 
         vm.prank(caller);
-        (uint256 totalPaid, uint256 f, uint256 p) = batch.batchMint(total, recipient, paidCost, _zeros());
+        (uint256 totalPaid, uint256 f, uint256 p) = batch.batchMint(total, 0, recipient, paidCost, _zeros());
         assertEq(f, free, "free reflects the settled stream");
         assertEq(p, paid);
         assertEq(totalPaid, paidCost);
